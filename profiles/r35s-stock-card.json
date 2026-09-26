@@ -1,0 +1,57 @@
+{
+  "id": "r35s-stock-card",
+  "name": "R35S family — games card (stock Garlic Roms layout)",
+  "cfw": "Stock Garlic system",
+  "deviceFamily": "r35s-family",
+  "storageModes": [
+    "roms_card_only"
+  ],
+  "romSchema": {
+    "layout": "stock_r36s_roms",
+    "formatFs": "fat32",
+    "volumeLabel": "ROMS",
+    "biosFolder": "bios",
+    "systems": [
+      {
+        "id": "gba",
+        "folder": "gba",
+        "extensions": [
+          ".gba",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Game Boy Advance"
+      },
+      {
+        "id": "snes",
+        "folder": "snes",
+        "extensions": [
+          ".sfc",
+          ".smc",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Super Nintendo"
+      },
+      {
+        "id": "nes",
+        "folder": "nes",
+        "extensions": [
+          ".nes",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Entertainment System"
+      },
+      {
+        "id": "psx",
+        "folder": "psx",
+        "extensions": [
+          ".chd",
+          ".cue",
+          ".bin",
+          ".iso"
+        ],
+        "datNamePattern": "^Sony - PlayStation"
+      }
+    ]
+  },
+  "version": 2
+}

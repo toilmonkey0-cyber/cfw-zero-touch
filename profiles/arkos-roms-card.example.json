@@ -1,0 +1,56 @@
+{
+  "id": "arkos-roms-card",
+  "name": "ArkOS — ROMs card only (EASYROMS layout)",
+  "cfw": "ArkOS",
+  "deviceFamily": "any-dual-sd",
+  "storageModes": [
+    "roms_card_only"
+  ],
+  "romSchema": {
+    "layout": "arkos_easyroms_root",
+    "volumeLabel": "EASYROMS",
+    "biosFolder": "bios",
+    "systems": [
+      {
+        "id": "gba",
+        "folder": "gba",
+        "extensions": [
+          ".gba",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Game Boy Advance"
+      },
+      {
+        "id": "snes",
+        "folder": "snes",
+        "extensions": [
+          ".sfc",
+          ".smc",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Super Nintendo"
+      },
+      {
+        "id": "nes",
+        "folder": "nes",
+        "extensions": [
+          ".nes",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Entertainment System"
+      },
+      {
+        "id": "psx",
+        "folder": "psx",
+        "extensions": [
+          ".chd",
+          ".cue",
+          ".bin",
+          ".iso"
+        ],
+        "datNamePattern": "^Sony - PlayStation"
+      }
+    ]
+  },
+  "version": 2
+}

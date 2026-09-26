@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/cfw-zero-touch/profile.schema.json",
+  "title": "CFW Card Studio Profile",
+  "type": "object",
+  "required": ["id", "name", "cfw", "storageModes", "romSchema"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+    "version": { "type": "integer", "minimum": 1 },
+    "name": { "type": "string" },
+    "cfw": { "type": "string" },
+    "deviceFamily": { "type": "string" },
+    "image": {
+      "type": "object",
+      "required": ["url", "sha256"],
+      "properties": {
+        "url": { "type": "string", "format": "uri" },
+        "sha256": { "type": "string" },
+        "compressed": { "type": "string" },
+        "notes": { "type": "string" },
+        "parts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["url", "sha256"],
+            "properties": {
+              "url": { "type": "string", "format": "uri" },
+              "sha256": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "storageModes": {
+      "type": "array",
+      "items": { "enum": ["single_card", "roms_card_only", "flash_os_only"] }
+    },
+    "romSchema": {
+      "type": "object",
+      "required": ["layout", "systems"],
+      "properties": {
+        "layout": {
+          "enum": ["arkos_easyroms_root", "rocknix_roms_nested", "stock_r36s_roms"]
+        },
+        "formatFs": { "enum": ["fat32", "exfat"] },
+        "volumeLabel": { "type": "string" },
+        "systems": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "folder"],
+            "properties": {
+              "id": { "type": "string" },
+              "folder": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9 _.-]*$"
+              },
+              "extensions": { "type": "array", "items": { "type": "string" } },
+              "datNamePattern": { "type": "string", "pattern": "^[^\"\\r\\n]*$" }
+            }
+          }
+        },
+        "biosFolder": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9 _.-]*$"
+        }
+      }
+    },
+    "firstboot": {
+      "type": "object",
+      "description": "PC-side firstboot simulation recipe; omit for roms_card_only",
+      "properties": {
+        "strategy": { "enum": ["arkos_expand_exfat_disarm", "none"] },
+        "romsTarPathOnRootfs": { "type": "string" },
+        "disarm": {
+          "type": "object",
+          "properties": {
+            "replaceBootScripts": { "type": "array", "items": { "type": "string" } },
+            "disableUnits": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "dtb": {
+      "type": "object",
+      "properties": {
+        "required": { "type": "boolean" },
+        "selector": { "enum": ["manual_copy", "archr_style_overlay", "external_tool"] }
+      }
+    }
+  }
+}

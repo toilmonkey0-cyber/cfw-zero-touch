@@ -1,0 +1,71 @@
+{
+  "id": "darkos-rgb10x-os",
+  "name": "dArkOS — RGB10X OS card",
+  "cfw": "dArkOS",
+  "deviceFamily": "any-rk3326",
+  "storageModes": [
+    "single_card"
+  ],
+  "romSchema": {
+    "layout": "arkos_easyroms_root",
+    "volumeLabel": "EASYROMS",
+    "biosFolder": "bios",
+    "systems": [
+      {
+        "id": "gba",
+        "folder": "gba",
+        "extensions": [
+          ".gba",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Game Boy Advance"
+      },
+      {
+        "id": "snes",
+        "folder": "snes",
+        "extensions": [
+          ".sfc",
+          ".smc",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Super Nintendo"
+      },
+      {
+        "id": "nes",
+        "folder": "nes",
+        "extensions": [
+          ".nes",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Entertainment System"
+      },
+      {
+        "id": "psx",
+        "folder": "psx",
+        "extensions": [
+          ".chd",
+          ".cue",
+          ".pbp"
+        ],
+        "datNamePattern": "^Sony - PlayStation"
+      }
+    ]
+  },
+  "image": {
+    "url": "https://github.com/christianhaitian/dArkOS/releases/download/v08272026/dArkOS_RG351MP_trixie_09022026.img.7z.001",
+    "sha256": "7ef37bac840a7e490a1503466eb57db1a902e85644d9c4125ea27fee0605ad1b",
+    "compressed": "7z",
+    "notes": "This is the RG351MP dArkOS image, which is the build for the RGB10X. Boot the handheld once before copying games. That first boot formats EASYROMS.",
+    "parts": [
+      {
+        "url": "https://github.com/christianhaitian/dArkOS/releases/download/v08272026/dArkOS_RG351MP_trixie_09022026.img.7z.001",
+        "sha256": "eea319e6c59faf71c83b34ffadb0c9375bce18288f10e17e4613dc1a0057049f"
+      },
+      {
+        "url": "https://github.com/christianhaitian/dArkOS/releases/download/v08272026/dArkOS_RG351MP_trixie_09022026.img.7z.002",
+        "sha256": "eb349c353aa7ef9c787c05a632e66e3ef672b1474efb5dfaf56424faaa9a553b"
+      }
+    ]
+  },
+  "version": 2
+}

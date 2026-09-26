@@ -1,0 +1,94 @@
+:root {
+  color: #e7e1d6;
+  background: #1b1915;
+  font-family: "Segoe UI", sans-serif;
+  line-height: 1.45;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 32px 20px 64px;
+}
+
+.eyebrow {
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #c9a15b;
+  font-size: 12px;
+}
+
+h1, h2 {
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+
+.legal, .reason, .path {
+  color: #b7b0a4;
+}
+
+.error {
+  background: #3a2420;
+  border: 1px solid #a85a48;
+  padding: 10px 12px;
+  border-radius: 8px;
+}
+
+button, .card {
+  background: #2a2621;
+  color: inherit;
+  border: 1px solid #4a4338;
+  border-radius: 10px;
+  padding: 10px 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cards, .volumes, .systems, .files {
+  display: grid;
+  gap: 10px;
+  padding: 0;
+  list-style: none;
+}
+
+.card, .volumes li {
+  display: grid;
+  gap: 6px;
+}
+
+.card span, .volumes span, .systems span {
+  display: block;
+  color: #b7b0a4;
+  font-size: 14px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+input[type="text"], input:not([type]) {
+  display: block;
+  margin-top: 6px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid #4a4338;
+  background: #12110e;
+  color: inherit;
+}
+
+ol {
+  padding-left: 18px;
+}

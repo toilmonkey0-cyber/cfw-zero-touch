@@ -1,0 +1,48 @@
+[package]
+name = "cfw-zero-touch"
+version = "0.1.0"
+description = "Desktop wizard that prepares a handheld CFW ROMs card on the PC"
+authors = ["Aaron"]
+edition = "2021"
+default-run = "cfw-zero-touch"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "cfw-zero-touch"
+path = "src/main.rs"
+
+[[bin]]
+name = "cfw-flash"
+path = "src/bin/cfw-flash.rs"
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "cfw_zero_touch_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jsonschema = { version = "0.57.0", default-features = false }
+tauri-plugin-dialog = { version = "2.7.3", default-features = false }
+windows = { version = "0.62.2", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+flate2 = "1.1.10"
+sha2 = "0.11.0"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

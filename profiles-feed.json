@@ -1,0 +1,419 @@
+{
+  "feedVersion": 1,
+  "app": {
+    "version": "0.1.0",
+    "releaseUrl": "https://github.com/toilmonkey0-cyber/cfw-zero-touch/releases"
+  },
+  "profiles": [
+    {
+      "id": "arkos-roms-card",
+      "name": "ArkOS — ROMs card only (EASYROMS layout)",
+      "cfw": "ArkOS",
+      "deviceFamily": "any-dual-sd",
+      "storageModes": [
+        "roms_card_only"
+      ],
+      "romSchema": {
+        "layout": "arkos_easyroms_root",
+        "volumeLabel": "EASYROMS",
+        "biosFolder": "bios",
+        "systems": [
+          {
+            "id": "gba",
+            "folder": "gba",
+            "extensions": [
+              ".gba",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Game Boy Advance"
+          },
+          {
+            "id": "snes",
+            "folder": "snes",
+            "extensions": [
+              ".sfc",
+              ".smc",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Super Nintendo"
+          },
+          {
+            "id": "nes",
+            "folder": "nes",
+            "extensions": [
+              ".nes",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Entertainment System"
+          },
+          {
+            "id": "psx",
+            "folder": "psx",
+            "extensions": [
+              ".chd",
+              ".cue",
+              ".bin",
+              ".iso"
+            ],
+            "datNamePattern": "^Sony - PlayStation"
+          }
+        ]
+      },
+      "version": 2
+    },
+    {
+      "id": "darkos-rgb10x-os",
+      "name": "dArkOS — RGB10X OS card",
+      "cfw": "dArkOS",
+      "deviceFamily": "any-rk3326",
+      "storageModes": [
+        "single_card"
+      ],
+      "romSchema": {
+        "layout": "arkos_easyroms_root",
+        "volumeLabel": "EASYROMS",
+        "biosFolder": "bios",
+        "systems": [
+          {
+            "id": "gba",
+            "folder": "gba",
+            "extensions": [
+              ".gba",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Game Boy Advance"
+          },
+          {
+            "id": "snes",
+            "folder": "snes",
+            "extensions": [
+              ".sfc",
+              ".smc",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Super Nintendo"
+          },
+          {
+            "id": "nes",
+            "folder": "nes",
+            "extensions": [
+              ".nes",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Entertainment System"
+          },
+          {
+            "id": "psx",
+            "folder": "psx",
+            "extensions": [
+              ".chd",
+              ".cue",
+              ".pbp"
+            ],
+            "datNamePattern": "^Sony - PlayStation"
+          }
+        ]
+      },
+      "image": {
+        "url": "https://github.com/christianhaitian/dArkOS/releases/download/v08272026/dArkOS_RG351MP_trixie_09022026.img.7z.001",
+        "sha256": "7ef37bac840a7e490a1503466eb57db1a902e85644d9c4125ea27fee0605ad1b",
+        "compressed": "7z",
+        "notes": "This is the RG351MP dArkOS image, which is the build for the RGB10X. Boot the handheld once before copying games. That first boot formats EASYROMS.",
+        "parts": [
+          {
+            "url": "https://github.com/christianhaitian/dArkOS/releases/download/v08272026/dArkOS_RG351MP_trixie_09022026.img.7z.001",
+            "sha256": "eea319e6c59faf71c83b34ffadb0c9375bce18288f10e17e4613dc1a0057049f"
+          },
+          {
+            "url": "https://github.com/christianhaitian/dArkOS/releases/download/v08272026/dArkOS_RG351MP_trixie_09022026.img.7z.002",
+            "sha256": "eb349c353aa7ef9c787c05a632e66e3ef672b1474efb5dfaf56424faaa9a553b"
+          }
+        ]
+      },
+      "version": 2
+    },
+    {
+      "id": "r35s-stock-card",
+      "name": "R35S family — games card (stock Garlic Roms layout)",
+      "cfw": "Stock Garlic system",
+      "deviceFamily": "r35s-family",
+      "storageModes": [
+        "roms_card_only"
+      ],
+      "romSchema": {
+        "layout": "stock_r36s_roms",
+        "formatFs": "fat32",
+        "volumeLabel": "ROMS",
+        "biosFolder": "bios",
+        "systems": [
+          {
+            "id": "gba",
+            "folder": "gba",
+            "extensions": [
+              ".gba",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Game Boy Advance"
+          },
+          {
+            "id": "snes",
+            "folder": "snes",
+            "extensions": [
+              ".sfc",
+              ".smc",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Super Nintendo"
+          },
+          {
+            "id": "nes",
+            "folder": "nes",
+            "extensions": [
+              ".nes",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Entertainment System"
+          },
+          {
+            "id": "psx",
+            "folder": "psx",
+            "extensions": [
+              ".chd",
+              ".cue",
+              ".bin",
+              ".iso"
+            ],
+            "datNamePattern": "^Sony - PlayStation"
+          }
+        ]
+      },
+      "version": 2
+    },
+    {
+      "id": "r36s-clone-card",
+      "name": "R36S clone — games card (internal firmware)",
+      "cfw": "Stock internal firmware",
+      "deviceFamily": "r36s-clone",
+      "storageModes": [
+        "roms_card_only"
+      ],
+      "romSchema": {
+        "layout": "arkos_easyroms_root",
+        "formatFs": "fat32",
+        "volumeLabel": "ROMS",
+        "biosFolder": "bios",
+        "systems": [
+          {
+            "id": "gba",
+            "folder": "gba",
+            "extensions": [
+              ".gba",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Game Boy Advance"
+          },
+          {
+            "id": "snes",
+            "folder": "snes",
+            "extensions": [
+              ".sfc",
+              ".smc",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Super Nintendo"
+          },
+          {
+            "id": "nes",
+            "folder": "nes",
+            "extensions": [
+              ".nes",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Entertainment System"
+          },
+          {
+            "id": "megadrive",
+            "folder": "megadrive",
+            "extensions": [
+              ".md",
+              ".gen",
+              ".bin",
+              ".zip"
+            ],
+            "datNamePattern": "^Sega - Mega Drive"
+          },
+          {
+            "id": "gb",
+            "folder": "gb",
+            "extensions": [
+              ".gb",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Game Boy(?! Advance| Color)"
+          },
+          {
+            "id": "gbc",
+            "folder": "gbc",
+            "extensions": [
+              ".gbc",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Game Boy Color"
+          },
+          {
+            "id": "neogeo",
+            "folder": "neogeo",
+            "extensions": [
+              ".zip"
+            ],
+            "datNamePattern": "^SNK - Neo Geo"
+          },
+          {
+            "id": "pcengine",
+            "folder": "pcengine",
+            "extensions": [
+              ".pce",
+              ".cue",
+              ".zip"
+            ],
+            "datNamePattern": "^NEC - PC Engine"
+          },
+          {
+            "id": "gamegear",
+            "folder": "gamegear",
+            "extensions": [
+              ".gg",
+              ".zip"
+            ],
+            "datNamePattern": "^Sega - Game Gear"
+          },
+          {
+            "id": "mastersystem",
+            "folder": "mastersystem",
+            "extensions": [
+              ".sms",
+              ".ms",
+              ".zip"
+            ],
+            "datNamePattern": "^Sega - Master System"
+          },
+          {
+            "id": "arcade",
+            "folder": "arcade",
+            "extensions": [
+              ".zip"
+            ]
+          },
+          {
+            "id": "psx",
+            "folder": "psx",
+            "extensions": [
+              ".chd",
+              ".cue",
+              ".bin",
+              ".iso"
+            ],
+            "datNamePattern": "^Sony - PlayStation"
+          }
+        ]
+      },
+      "version": 2
+    },
+    {
+      "id": "rocknix-rgb10x-os",
+      "name": "ROCKNIX — RGB10X OS card",
+      "cfw": "ROCKNIX",
+      "deviceFamily": "any-rk3326",
+      "storageModes": [
+        "single_card"
+      ],
+      "romSchema": {
+        "layout": "rocknix_roms_nested",
+        "volumeLabel": "SHARE",
+        "biosFolder": "bios",
+        "systems": [
+          {
+            "id": "gba",
+            "folder": "gba",
+            "extensions": [
+              ".gba",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Game Boy Advance"
+          }
+        ]
+      },
+      "image": {
+        "url": "https://github.com/ROCKNIX/distribution/releases/download/20260901/ROCKNIX-RK3326.aarch64-20260901-b.img.gz",
+        "sha256": "f2b35e9feeef1a2ba2a40298614c1e9d67349ffd98e8498449e8815107ab82cc",
+        "compressed": "gz"
+      },
+      "version": 2
+    },
+    {
+      "id": "rocknix-roms-card",
+      "name": "ROCKNIX — ROMs card only",
+      "cfw": "ROCKNIX",
+      "deviceFamily": "any-dual-sd",
+      "storageModes": [
+        "roms_card_only"
+      ],
+      "romSchema": {
+        "layout": "rocknix_roms_nested",
+        "volumeLabel": "SHARE",
+        "biosFolder": "bios",
+        "systems": [
+          {
+            "id": "gba",
+            "folder": "gba",
+            "extensions": [
+              ".gba",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Game Boy Advance"
+          },
+          {
+            "id": "snes",
+            "folder": "snes",
+            "extensions": [
+              ".sfc",
+              ".smc",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Super Nintendo"
+          },
+          {
+            "id": "nes",
+            "folder": "nes",
+            "extensions": [
+              ".nes",
+              ".zip"
+            ],
+            "datNamePattern": "^Nintendo - Entertainment System"
+          },
+          {
+            "id": "megadrive",
+            "folder": "megadrive",
+            "extensions": [
+              ".md",
+              ".bin",
+              ".zip"
+            ],
+            "datNamePattern": "^Sega - Mega Drive"
+          },
+          {
+            "id": "psx",
+            "folder": "psx",
+            "extensions": [
+              ".chd",
+              ".cue",
+              ".pbp"
+            ],
+            "datNamePattern": "^Sony - PlayStation"
+          }
+        ]
+      },
+      "version": 2
+    }
+  ]
+}

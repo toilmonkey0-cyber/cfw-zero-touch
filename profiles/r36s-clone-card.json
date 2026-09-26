@@ -1,0 +1,130 @@
+{
+  "id": "r36s-clone-card",
+  "name": "R36S clone — games card (internal firmware)",
+  "cfw": "Stock internal firmware",
+  "deviceFamily": "r36s-clone",
+  "storageModes": [
+    "roms_card_only"
+  ],
+  "romSchema": {
+    "layout": "arkos_easyroms_root",
+    "formatFs": "fat32",
+    "volumeLabel": "ROMS",
+    "biosFolder": "bios",
+    "systems": [
+      {
+        "id": "gba",
+        "folder": "gba",
+        "extensions": [
+          ".gba",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Game Boy Advance"
+      },
+      {
+        "id": "snes",
+        "folder": "snes",
+        "extensions": [
+          ".sfc",
+          ".smc",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Super Nintendo"
+      },
+      {
+        "id": "nes",
+        "folder": "nes",
+        "extensions": [
+          ".nes",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Entertainment System"
+      },
+      {
+        "id": "megadrive",
+        "folder": "megadrive",
+        "extensions": [
+          ".md",
+          ".gen",
+          ".bin",
+          ".zip"
+        ],
+        "datNamePattern": "^Sega - Mega Drive"
+      },
+      {
+        "id": "gb",
+        "folder": "gb",
+        "extensions": [
+          ".gb",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Game Boy(?! Advance| Color)"
+      },
+      {
+        "id": "gbc",
+        "folder": "gbc",
+        "extensions": [
+          ".gbc",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Game Boy Color"
+      },
+      {
+        "id": "neogeo",
+        "folder": "neogeo",
+        "extensions": [
+          ".zip"
+        ],
+        "datNamePattern": "^SNK - Neo Geo"
+      },
+      {
+        "id": "pcengine",
+        "folder": "pcengine",
+        "extensions": [
+          ".pce",
+          ".cue",
+          ".zip"
+        ],
+        "datNamePattern": "^NEC - PC Engine"
+      },
+      {
+        "id": "gamegear",
+        "folder": "gamegear",
+        "extensions": [
+          ".gg",
+          ".zip"
+        ],
+        "datNamePattern": "^Sega - Game Gear"
+      },
+      {
+        "id": "mastersystem",
+        "folder": "mastersystem",
+        "extensions": [
+          ".sms",
+          ".ms",
+          ".zip"
+        ],
+        "datNamePattern": "^Sega - Master System"
+      },
+      {
+        "id": "arcade",
+        "folder": "arcade",
+        "extensions": [
+          ".zip"
+        ]
+      },
+      {
+        "id": "psx",
+        "folder": "psx",
+        "extensions": [
+          ".chd",
+          ".cue",
+          ".bin",
+          ".iso"
+        ],
+        "datNamePattern": "^Sony - PlayStation"
+      }
+    ]
+  },
+  "version": 2
+}

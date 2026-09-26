@@ -1,0 +1,31 @@
+{
+  "id": "rocknix-rgb10x-os",
+  "name": "ROCKNIX — RGB10X OS card",
+  "cfw": "ROCKNIX",
+  "deviceFamily": "any-rk3326",
+  "storageModes": [
+    "single_card"
+  ],
+  "romSchema": {
+    "layout": "rocknix_roms_nested",
+    "volumeLabel": "SHARE",
+    "biosFolder": "bios",
+    "systems": [
+      {
+        "id": "gba",
+        "folder": "gba",
+        "extensions": [
+          ".gba",
+          ".zip"
+        ],
+        "datNamePattern": "^Nintendo - Game Boy Advance"
+      }
+    ]
+  },
+  "image": {
+    "url": "https://github.com/ROCKNIX/distribution/releases/download/20260901/ROCKNIX-RK3326.aarch64-20260901-b.img.gz",
+    "sha256": "f2b35e9feeef1a2ba2a40298614c1e9d67349ffd98e8498449e8815107ab82cc",
+    "compressed": "gz"
+  },
+  "version": 2
+}

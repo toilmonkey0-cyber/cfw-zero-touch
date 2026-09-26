@@ -1,0 +1,23 @@
+# Node
+node_modules/
+dist/
+.pnpm-store/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Agent scratch for this plan (git history is the record)
+.superpowers/
+
+# Frontend
+dist-ssr
+*.local
+.vscode/*
+!.vscode/extensions.json
+.idea
