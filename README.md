@@ -20,6 +20,9 @@ This tool will never ship ROMs or BIOS files. You point it at files you already 
 DAT files for the optional igir sort (1G1R, region filter, checksum verification)
 are also yours to supply — for example from No-Intro's datomatic. igir itself runs
 from your PATH or through npx (Node.js).
+The optional local-AI tier (Needle) is software, not content: its engine and
+weights are Apache-2.0/open artifacts downloaded only with your consent and
+verified against compiled-in SHA-256 pins — see `THIRD_PARTY_NOTICES.md`.
 A local diagnostics log (`%LOCALAPPDATA%\cfw-card-studio\diagnostics.log`) records
 what the app does, including errors; it never leaves your PC.
 On launch the app checks the profile feed at `raw.githubusercontent.com` (and

@@ -5,6 +5,7 @@ pub mod flash;
 pub mod folder_map;
 pub mod format_gate;
 pub mod igir;
+pub mod needle;
 pub mod prepare;
 pub mod profiles;
 pub mod romcopy;
@@ -837,6 +838,46 @@ fn diagnostics_path() -> String {
     diag::log_path().display().to_string()
 }
 
+/// Presence and pin-verification of every Needle artifact row. Advisory
+/// only: the app behaves identically when nothing is acquired.
+#[tauri::command]
+fn needle_status() -> Vec<needle::acquire::ArtifactStatus> {
+    needle::acquire::artifact_status()
+}
+
+/// Downloads one runtime artifact (`weights` | `serve-engine`) into the
+/// needle cache after verifying it against the compiled-in SHA-256 pin.
+/// Build inputs and unknown ids are rejected here, at the IPC boundary.
+#[tauri::command]
+fn needle_acquire(app: tauri::AppHandle, artifact_id: String) -> Result<String, String> {
+    let artifact = needle::acquire::runtime_artifact(&artifact_id)?;
+    diag::log("info", "needle_download_start", artifact.id);
+    let _ = app.emit(
+        "needle-progress",
+        format!("Downloading {} ({})…", artifact.id, artifact.file_name),
+    );
+    let url = artifact.url;
+    match needle::acquire::ensure_artifact(artifact, |dest| download_image(url, dest)) {
+        Ok(path) => {
+            let _ = app.emit("needle-progress", format!("{} ready", artifact.id));
+            diag::log(
+                "info",
+                "needle_download_done",
+                &format!("{} bytes={}", artifact.id, artifact.size),
+            );
+            Ok(path.display().to_string())
+        }
+        Err(error) => {
+            diag::log(
+                "WARN",
+                "needle_download_failed",
+                &format!("{}: {}", artifact.id, error),
+            );
+            Err(error)
+        }
+    }
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StageProgress {
@@ -1052,7 +1093,9 @@ pub fn run() {
             apply_profile_feed,
             app_version,
             stage_library,
-            diagnostics_path
+            diagnostics_path,
+            needle_status,
+            needle_acquire
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
