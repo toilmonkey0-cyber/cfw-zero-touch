@@ -483,6 +483,7 @@ fn classify_with_engine(
             &profile.id,
             library,
             &profile.rom_schema.systems,
+            profile.rom_schema.bios_folder.as_deref(),
             weights_tag,
             &mut embed,
         )?;
@@ -490,6 +491,7 @@ fn classify_with_engine(
             library,
             &profile.rom_schema.systems,
             include,
+            profile.rom_schema.bios_folder.as_deref(),
             &index,
             rebuilt,
             regions,

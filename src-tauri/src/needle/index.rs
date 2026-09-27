@@ -29,8 +29,11 @@ use super::tags;
 use crate::profiles::SystemFolder;
 use crate::store;
 
-pub const INDEX_MAGIC: &[u8; 8] = b"CFWNIDX1";
-pub const INDEX_FORMAT_VERSION: u32 = 1;
+pub const INDEX_MAGIC: &[u8; 8] = b"CFWNIDX2";
+// v2: bios-folder payload excluded from entries (v1 indexes may carry
+// bios/sample stems as bogus nearest-title matches; version forces a
+// one-time rebuild).
+pub const INDEX_FORMAT_VERSION: u32 = 2;
 /// Upper bound on entries accepted from disk (hostile-cache defense).
 pub const MAX_INDEX_ENTRIES: u64 = 200_000;
 /// Upper bound on the embedding dimension accepted from disk.
@@ -479,6 +482,7 @@ pub fn ensure_index(
     profile_id: &str,
     library: &Path,
     systems: &[SystemFolder],
+    bios_folder: Option<&str>,
     weights_tag: &str,
     embed: &mut EmbedFn,
 ) -> Result<(LibraryIndex, bool), String> {
@@ -501,6 +505,14 @@ pub fn ensure_index(
     let mut entries = Vec::new();
     let mut dim = 0usize;
     for file in &files {
+        // Bios payload never indexes: its stems (sample packs named
+        // after games, bios blobs) would pollute nearest-title lookups.
+        let under_bios = file.relative.iter().next().is_some_and(|first| {
+            bios_folder.is_some() && first.to_string_lossy().eq_ignore_ascii_case("bios")
+        });
+        if under_bios {
+            continue;
+        }
         let Some(system_id) = router.route(&file.relative) else {
             continue; // tier-3 query candidate, not an index entry
         };

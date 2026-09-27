@@ -437,6 +437,7 @@ fn index_build_includes_deterministic_files_and_excludes_queries() {
         "test-profile",
         &root,
         &systems,
+        None,
         "weights-v1",
         &mut synthetic_embed,
     )
@@ -478,20 +479,20 @@ fn reuse_skips_embedding_when_fingerprints_match() {
         calls.set(calls.get() + 1);
         synthetic_embed(stem)
     };
-    let (_, first) = index::ensure_index("p", &root, &systems, "w1", &mut counting).unwrap();
+    let (_, first) = index::ensure_index("p", &root, &systems, None, "w1", &mut counting).unwrap();
     assert!(first);
     let before = calls.get();
-    let (_, second) = index::ensure_index("p", &root, &systems, "w1", &mut counting).unwrap();
+    let (_, second) = index::ensure_index("p", &root, &systems, None, "w1", &mut counting).unwrap();
     assert!(!second, "all fingerprints match: no rebuild");
     assert_eq!(calls.get(), before, "reuse must not embed again");
 
     // Library change (new file) forces a rebuild.
     fs::write(root.join("gba/New Game.gba"), b"gba").unwrap();
-    let (_, third) = index::ensure_index("p", &root, &systems, "w1", &mut counting).unwrap();
+    let (_, third) = index::ensure_index("p", &root, &systems, None, "w1", &mut counting).unwrap();
     assert!(third, "library fingerprint change rebuilds");
 
     // Weights change forces a rebuild.
-    let (_, fourth) = index::ensure_index("p", &root, &systems, "w2", &mut counting).unwrap();
+    let (_, fourth) = index::ensure_index("p", &root, &systems, None, "w2", &mut counting).unwrap();
     assert!(fourth, "weights fingerprint change rebuilds");
     std::env::remove_var("CFW_STUDIO_DATA");
 }
@@ -511,17 +512,38 @@ fn routing_change_rebuilds_and_profiles_coexist() {
     let _guard = STORE_ENV_LOCK.lock();
     std::env::set_var("CFW_STUDIO_DATA", &store);
 
-    let (_, a) =
-        index::ensure_index("r35s-stock-card", &root, &r35s, "w1", &mut synthetic_embed).unwrap();
+    let (_, a) = index::ensure_index(
+        "r35s-stock-card",
+        &root,
+        &r35s,
+        None,
+        "w1",
+        &mut synthetic_embed,
+    )
+    .unwrap();
     assert!(a);
     // Same library, same weights, DIFFERENT routing: rebuild (this is the
     // two-profiles-one-library rule; the second profile also lives at its
     // own path).
-    let (_, b) =
-        index::ensure_index("r36s-clone-card", &root, &r36s, "w1", &mut synthetic_embed).unwrap();
+    let (_, b) = index::ensure_index(
+        "r36s-clone-card",
+        &root,
+        &r36s,
+        None,
+        "w1",
+        &mut synthetic_embed,
+    )
+    .unwrap();
     assert!(b, "routing fingerprint differs across profiles");
-    let (_, a2) =
-        index::ensure_index("r35s-stock-card", &root, &r35s, "w1", &mut synthetic_embed).unwrap();
+    let (_, a2) = index::ensure_index(
+        "r35s-stock-card",
+        &root,
+        &r35s,
+        None,
+        "w1",
+        &mut synthetic_embed,
+    )
+    .unwrap();
     assert!(!a2, "first profile's index is still reusable");
     // Both files coexist under needle/index/.
     assert!(index::index_path("r35s-stock-card").unwrap().is_file());
@@ -674,6 +696,7 @@ fn controlled_embed(stem: &str) -> Result<Vec<f32>, String> {
         "zelda" => Ok(vec![0.0, 0.0, 1.0, 0.0]),
         "mystery game" => Ok(vec![0.8, 0.0, 0.6, 0.0]),
         "clone wars" => Ok(vec![0.999, 0.0447, 0.0, 0.0]),
+        "astrob" => Ok(vec![0.999, 0.0447, 0.0, 0.0]),
         _ => Ok(vec![0.25, 0.25, 0.25, 0.25]),
     }
 }
@@ -713,12 +736,14 @@ fn classify_fixture(name: &str) -> sort::Classification {
     std::env::set_var("CFW_STUDIO_DATA", &store);
     let systems = smart_systems();
     let mut embed = controlled_embed;
-    let (index, _rebuilt) = index::ensure_index("test", &root, &systems, "w1", &mut embed).unwrap();
+    let (index, _rebuilt) =
+        index::ensure_index("test", &root, &systems, None, "w1", &mut embed).unwrap();
     let mut progress = |_, _| {};
     let classification = sort::classify(
         &root,
         &systems,
         &[],
+        None,
         &index,
         false,
         &[tags::Region::Usa],
@@ -728,6 +753,101 @@ fn classify_fixture(name: &str) -> sort::Classification {
     .unwrap();
     std::env::remove_var("CFW_STUDIO_DATA");
     classification
+}
+
+#[test]
+fn bios_folder_payload_never_routes_as_games() {
+    // The library bios tree is card bios payload, never game content:
+    // sample packs are NAMED after games (astrob.zip scores ~0.999 vs
+    // "advance wars") and .sms bios blobs own a unique extension, so
+    // without the exclusion tier 2/3 happily scatter them into system
+    // folders as fake games (found live on the R36S card QA).
+    let root = scratch("bios-routing");
+    for (sub, file) in [
+        ("gba", "Advance Wars (U).gba"),
+        ("nes", "Zelda.nes"),
+        ("mastersystem", "Alex Kidd (USA).sms"),
+        ("bios/mame2003-plus/samples", "astrob.zip"),
+        ("bios", "bios_E.sms"),
+    ] {
+        fs::create_dir_all(root.join(sub)).unwrap();
+        fs::write(root.join(sub).join(file), b"bytes").unwrap();
+    }
+    let systems = vec![
+        system("gba", "gba", &[".gba", ".zip"]),
+        system("nes", "nes", &[".nes", ".zip"]),
+        system("mastersystem", "mastersystem", &[".sms", ".zip"]),
+    ];
+    let store = scratch("bios-routing-store");
+    let _guard = STORE_ENV_LOCK.lock();
+    std::env::set_var("CFW_STUDIO_DATA", &store);
+    let mut embed = controlled_embed;
+    let (index, _rebuilt) =
+        index::ensure_index("bios", &root, &systems, None, "w1", &mut embed).unwrap();
+    let mut progress = |_, _| {};
+    let classification = sort::classify(
+        &root,
+        &systems,
+        &[],
+        Some("bios"),
+        &index,
+        false,
+        &[tags::Region::Usa],
+        &mut embed,
+        &mut progress,
+    )
+    .unwrap();
+    std::env::remove_var("CFW_STUDIO_DATA");
+
+    let touched = |rows: &[String]| {
+        rows.iter()
+            .filter(|relative| relative.starts_with("bios/"))
+            .count()
+    };
+    let routed: Vec<String> = classification
+        .routes
+        .iter()
+        .map(|row| row.relative.clone())
+        .collect();
+    let reviewed: Vec<String> = classification
+        .needs_review
+        .iter()
+        .map(|row| row.relative.clone())
+        .collect();
+    assert_eq!(touched(&routed), 0, "no bios file may route: {routed:?}");
+    assert_eq!(
+        touched(&reviewed),
+        0,
+        "no bios file may review: {reviewed:?}"
+    );
+    assert!(routed.contains(&"mastersystem/Alex Kidd (USA).sms".to_string()));
+
+    // The planner still ships the bios tree to the card's bios folder.
+    let applied = std::collections::HashMap::new();
+    let dest_root = scratch("bios-routing-dest");
+    let plan = sort::plan_smart(
+        &root,
+        &dest_root,
+        "arkos_easyroms_root",
+        &systems,
+        &classification,
+        &applied,
+        Some("bios"),
+    )
+    .unwrap();
+    let dests: Vec<&str> = plan
+        .items
+        .iter()
+        .map(|item| item.relative_dest.as_str())
+        .collect();
+    assert!(
+        dests.contains(&"bios/bios_E.sms"),
+        "bios payload still planned: {dests:?}"
+    );
+    assert!(
+        dests.contains(&"bios/mame2003-plus/samples/astrob.zip"),
+        "sample packs still planned: {dests:?}"
+    );
 }
 
 #[test]
@@ -838,12 +958,13 @@ fn duplicates_within_winning_region_collapse_deterministically() {
     std::env::set_var("CFW_STUDIO_DATA", &store);
     let systems = smart_systems();
     let mut embed = controlled_embed;
-    let (index, _) = index::ensure_index("dupes", &root, &systems, "w1", &mut embed).unwrap();
+    let (index, _) = index::ensure_index("dupes", &root, &systems, None, "w1", &mut embed).unwrap();
     let mut progress = |_, _| {};
     let classification = sort::classify(
         &root,
         &systems,
         &[],
+        None,
         &index,
         false,
         &[tags::Region::Usa],
@@ -942,12 +1063,13 @@ fn plan_smart_builds_destinations_resolutions_and_bios() {
     std::env::set_var("CFW_STUDIO_DATA", &store);
     let systems = smart_systems();
     let mut embed = controlled_embed;
-    let (index, _) = index::ensure_index("plan", &root, &systems, "w1", &mut embed).unwrap();
+    let (index, _) = index::ensure_index("plan", &root, &systems, None, "w1", &mut embed).unwrap();
     let mut progress = |_, _| {};
     let classification = sort::classify(
         &root,
         &systems,
         &[],
+        None,
         &index,
         false,
         &[tags::Region::Usa],

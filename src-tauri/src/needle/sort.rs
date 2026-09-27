@@ -164,12 +164,17 @@ struct Pending {
 }
 
 /// Runs the three routing tiers over the library. `progress` receives
-/// (done, total) as files are classified.
+/// (done, total) as files are classified. Files under the library's
+/// bios folder are card bios payload (plan_smart ships them to the
+/// card's bios folder) and never classify as games: sample packs are
+/// named after games and unique bios extensions can route, so leaving
+/// them in would scatter fake games into system folders.
 #[allow(clippy::too_many_arguments)]
 pub fn classify(
     library: &Path,
     systems_all: &[SystemFolder],
     include: &[String],
+    bios_folder: Option<&str>,
     index: &LibraryIndex,
     index_rebuilt: bool,
     regions: &[Region],
@@ -193,6 +198,15 @@ pub fn classify(
 
     for (position, file) in files.iter().enumerate() {
         progress(position + 1, total);
+        // Same find_named_dir rule plan_smart uses for the bios source:
+        // a top-level `bios` folder (case-insensitive) when the profile
+        // has a bios folder at all.
+        let under_bios = file.relative.iter().next().is_some_and(|first| {
+            bios_folder.is_some() && first.to_string_lossy().eq_ignore_ascii_case("bios")
+        });
+        if under_bios {
+            continue;
+        }
         let ext = extension_of(&file.relative);
         // Files whose extension no included system accepts are not ROMs
         // for this profile (today's extension filter, unchanged).
