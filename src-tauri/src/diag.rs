@@ -32,7 +32,10 @@ pub fn log(level: &str, event: &str, detail: &str) {
 }
 
 fn rotate_if_oversized(path: &Path) {
-    if fs::metadata(path).map(|meta| meta.len() >= MAX_BYTES).unwrap_or(false) {
+    if fs::metadata(path)
+        .map(|meta| meta.len() >= MAX_BYTES)
+        .unwrap_or(false)
+    {
         let _ = fs::rename(path, path.with_extension("old"));
     }
 }
@@ -58,6 +61,10 @@ pub fn timestamp_from_unix(secs: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    let (hh, mm, ss) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }

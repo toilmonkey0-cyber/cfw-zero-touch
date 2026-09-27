@@ -122,7 +122,11 @@ fn scratch_dir() -> PathBuf {
 #[test]
 fn an_invalid_feed_writes_nothing() {
     let store = scratch_dir();
-    fs::write(store.join("a.json"), serde_json::to_string(&local("a", 1)).unwrap()).unwrap();
+    fs::write(
+        store.join("a.json"),
+        serde_json::to_string(&local("a", 1)).unwrap(),
+    )
+    .unwrap();
     let mut broken = profile_json("a", 2);
     broken
         .as_object_mut()
@@ -153,10 +157,9 @@ fn apply_writes_updates_to_the_existing_filename_and_additions_as_id_json() {
     let report = apply_feed(&store, &feed, &[local("a", 1)]).unwrap();
 
     assert_eq!(report.applied, 2);
-    let updated: Profile = serde_json::from_str(
-        &fs::read_to_string(store.join("a-card.example.json")).unwrap(),
-    )
-    .unwrap();
+    let updated: Profile =
+        serde_json::from_str(&fs::read_to_string(store.join("a-card.example.json")).unwrap())
+            .unwrap();
     assert_eq!(updated.version, 2);
     let added: Profile =
         serde_json::from_str(&fs::read_to_string(store.join("new.json")).unwrap()).unwrap();
@@ -168,13 +171,25 @@ fn apply_writes_updates_to_the_existing_filename_and_additions_as_id_json() {
 fn apply_skips_equal_and_older_entries_without_writing() {
     let store = scratch_dir();
     let versioned: Profile = serde_json::from_value(profile_json("a", 5)).unwrap();
-    fs::write(store.join("a.json"), serde_json::to_string(&versioned).unwrap()).unwrap();
+    fs::write(
+        store.join("a.json"),
+        serde_json::to_string(&versioned).unwrap(),
+    )
+    .unwrap();
 
-    let feed = parse_feed(&feed_text(1, "0.1.0", &[profile_json("a", 5)]), &validator()).unwrap();
-    let report = apply_feed(&store, &feed, &[versioned.clone()]).unwrap();
+    let feed = parse_feed(
+        &feed_text(1, "0.1.0", &[profile_json("a", 5)]),
+        &validator(),
+    )
+    .unwrap();
+    let report = apply_feed(&store, &feed, std::slice::from_ref(&versioned)).unwrap();
     assert_eq!((report.applied, report.skipped), (0, 1));
 
-    let feed = parse_feed(&feed_text(1, "0.1.0", &[profile_json("a", 4)]), &validator()).unwrap();
+    let feed = parse_feed(
+        &feed_text(1, "0.1.0", &[profile_json("a", 4)]),
+        &validator(),
+    )
+    .unwrap();
     let report = apply_feed(&store, &feed, &[versioned]).unwrap();
     assert_eq!((report.applied, report.skipped), (0, 1));
 
@@ -211,7 +226,11 @@ fn checked_in_feed_matches_shipped_profiles() {
             .iter()
             .find(|candidate| candidate.id == profile.id)
             .unwrap_or_else(|| panic!("{} is missing from profiles-feed.json", profile.id));
-        assert_eq!(remote, profile, "{} differs between feed and profiles/", profile.id);
+        assert_eq!(
+            remote, profile,
+            "{} differs between feed and profiles/",
+            profile.id
+        );
         assert!(remote.version >= 1);
     }
     assert!(!feed.app.version.is_empty());
@@ -220,7 +239,11 @@ fn checked_in_feed_matches_shipped_profiles() {
 #[test]
 fn applied_profiles_reload_through_the_schema() {
     let store = scratch_dir();
-    let feed = parse_feed(&feed_text(1, "0.1.0", &[profile_json("a", 2)]), &validator()).unwrap();
+    let feed = parse_feed(
+        &feed_text(1, "0.1.0", &[profile_json("a", 2)]),
+        &validator(),
+    )
+    .unwrap();
     apply_feed(&store, &feed, &[local("a", 1)]).unwrap();
     let schema = repo().join("specs").join("profile.schema.json");
     let reloaded = cfw_zero_touch_lib::profiles::load_profiles(&store, &schema)

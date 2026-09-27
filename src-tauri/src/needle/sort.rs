@@ -165,6 +165,7 @@ struct Pending {
 
 /// Runs the three routing tiers over the library. `progress` receives
 /// (done, total) as files are classified.
+#[allow(clippy::too_many_arguments)]
 pub fn classify(
     library: &Path,
     systems_all: &[SystemFolder],

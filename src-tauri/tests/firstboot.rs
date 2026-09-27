@@ -39,7 +39,10 @@ fn disarm_removes_the_wipe_scripts_and_leaves_roms() {
     assert!(!boot.join("expandtoexfat.sh").exists());
     assert!(!boot.join("firstboot.sh").exists());
     assert!(boot.join("doneit").exists());
-    assert_eq!(fs::read(boot.join("roms").join("gba").join("game.gba")).unwrap(), b"keep-me");
+    assert_eq!(
+        fs::read(boot.join("roms").join("gba").join("game.gba")).unwrap(),
+        b"keep-me"
+    );
     user_roms_are_safe(&boot).unwrap();
     let _ = fs::remove_dir_all(boot.parent().unwrap());
 }
@@ -51,7 +54,10 @@ fn disarm_refuses_a_boot_folder_without_the_wipe_script() {
     fs::remove_file(boot.join("firstboot.sh")).unwrap();
     let error = disarm_easyroms_firstboot(&boot).unwrap_err();
     assert!(error.to_lowercase().contains("expandtoexfat"));
-    assert_eq!(fs::read(boot.join("roms").join("gba").join("game.gba")).unwrap(), b"keep-me");
+    assert_eq!(
+        fs::read(boot.join("roms").join("gba").join("game.gba")).unwrap(),
+        b"keep-me"
+    );
     let _ = fs::remove_dir_all(boot.parent().unwrap());
 }
 

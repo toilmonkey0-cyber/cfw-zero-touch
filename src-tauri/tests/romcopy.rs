@@ -1,12 +1,16 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cfw_zero_touch_lib::profiles::SystemFolder;
 use cfw_zero_touch_lib::romcopy::{execute_copy, plan_copy, CopyAction};
 
 fn scratch(name: &str) -> PathBuf {
+    // Unique even when two parallel test threads scratch the same name
+    // within one nanosecond (they share the pid).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "cfw-{name}-{}-{}",
+        "cfw-{name}-{}-{}-{seq}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -44,7 +48,15 @@ fn plan_keeps_matching_extensions_and_drops_the_rest() {
     fs::write(library.join("bios").join("gba_bios.bin"), b"bios").unwrap();
     let card = scratch("card");
 
-    let plan = plan_copy(&library, &card, "arkos_easyroms_root", &systems(), &[], Some("bios")).unwrap();
+    let plan = plan_copy(
+        &library,
+        &card,
+        "arkos_easyroms_root",
+        &systems(),
+        &[],
+        Some("bios"),
+    )
+    .unwrap();
     let dests: Vec<_> = plan
         .items
         .iter()
@@ -66,7 +78,15 @@ fn include_list_limits_which_systems_are_copied() {
     fs::write(library.join("snes").join("game.sfc"), b"snes").unwrap();
     let card = scratch("card");
 
-    let plan = plan_copy(&library, &card, "arkos_easyroms_root", &systems(), &["snes".into()], None).unwrap();
+    let plan = plan_copy(
+        &library,
+        &card,
+        "arkos_easyroms_root",
+        &systems(),
+        &["snes".into()],
+        None,
+    )
+    .unwrap();
     assert_eq!(plan.items.len(), 1);
     assert_eq!(plan.items[0].relative_dest, "snes/game.sfc");
     let _ = fs::remove_dir_all(&library);
@@ -82,7 +102,15 @@ fn unchanged_file_is_skipped_and_dry_run_writes_nothing() {
     fs::create_dir_all(card.join("gba")).unwrap();
     fs::write(card.join("gba").join("game.gba"), b"rom-bytes").unwrap();
 
-    let plan = plan_copy(&library, &card, "arkos_easyroms_root", &systems(), &["gba".into()], None).unwrap();
+    let plan = plan_copy(
+        &library,
+        &card,
+        "arkos_easyroms_root",
+        &systems(),
+        &["gba".into()],
+        None,
+    )
+    .unwrap();
     assert_eq!(plan.items.len(), 1);
     assert_eq!(plan.items[0].action, CopyAction::SkipUnchanged);
 
@@ -94,7 +122,15 @@ fn unchanged_file_is_skipped_and_dry_run_writes_nothing() {
     );
 
     fs::write(library.join("gba").join("new.gba"), b"fresh").unwrap();
-    let plan = plan_copy(&library, &card, "arkos_easyroms_root", &systems(), &["gba".into()], None).unwrap();
+    let plan = plan_copy(
+        &library,
+        &card,
+        "arkos_easyroms_root",
+        &systems(),
+        &["gba".into()],
+        None,
+    )
+    .unwrap();
     let report = execute_copy(&plan, &card, true).unwrap();
     assert_eq!(report.copied, 1);
     assert!(!card.join("gba").join("new.gba").exists());
@@ -117,7 +153,15 @@ fn failed_copy_leaves_no_truncated_destination() {
     fs::write(library.join("gba").join("game.gba"), b"full-rom-bytes").unwrap();
     let card = scratch("card");
 
-    let plan = plan_copy(&library, &card, "arkos_easyroms_root", &systems(), &["gba".into()], None).unwrap();
+    let plan = plan_copy(
+        &library,
+        &card,
+        "arkos_easyroms_root",
+        &systems(),
+        &["gba".into()],
+        None,
+    )
+    .unwrap();
     // A directory where the temp file belongs makes the write fail the way an
     // interrupted or locked copy does.
     fs::create_dir_all(card.join("gba").join("game.gba.cfwpart")).unwrap();
@@ -143,11 +187,22 @@ fn successful_copy_replaces_and_leaves_no_temp_files() {
     // A stale temp file from an earlier interrupted run must not block the retry.
     fs::write(card.join("gba").join("game.gba.cfwpart"), b"stale").unwrap();
 
-    let plan = plan_copy(&library, &card, "arkos_easyroms_root", &systems(), &["gba".into()], None).unwrap();
+    let plan = plan_copy(
+        &library,
+        &card,
+        "arkos_easyroms_root",
+        &systems(),
+        &["gba".into()],
+        None,
+    )
+    .unwrap();
     let report = execute_copy(&plan, &card, false).unwrap();
 
     assert_eq!(report.copied, 1);
-    assert_eq!(fs::read(card.join("gba").join("game.gba")).unwrap(), b"new-rom-bytes");
+    assert_eq!(
+        fs::read(card.join("gba").join("game.gba")).unwrap(),
+        b"new-rom-bytes"
+    );
     let leftovers: Vec<_> = walk(&card)
         .into_iter()
         .filter(|path| {
@@ -155,14 +210,17 @@ fn successful_copy_replaces_and_leaves_no_temp_files() {
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("cfwpart"))
         })
         .collect();
-    assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
     let _ = fs::remove_dir_all(&library);
     let _ = fs::remove_dir_all(&card);
 }
 
-fn walk(root: &PathBuf) -> Vec<PathBuf> {
+fn walk(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let mut stack = vec![root.clone()];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).unwrap().flatten() {
             let path = entry.path();
@@ -194,7 +252,11 @@ fn rocknix_copy_nests_games_and_bios_under_roms() {
         Some("bios"),
     )
     .unwrap();
-    let dests: Vec<_> = plan.items.iter().map(|item| item.relative_dest.clone()).collect();
+    let dests: Vec<_> = plan
+        .items
+        .iter()
+        .map(|item| item.relative_dest.clone())
+        .collect();
 
     assert_eq!(dests, vec!["roms/gba/test.gba", "roms/bios/qa-bios.bin"]);
     let _ = fs::remove_dir_all(&library);
@@ -254,7 +316,11 @@ fn stock_r36s_copy_uses_stock_folder_names() {
         Some("bios"),
     )
     .unwrap();
-    let dests: Vec<_> = plan.items.iter().map(|item| item.relative_dest.clone()).collect();
+    let dests: Vec<_> = plan
+        .items
+        .iter()
+        .map(|item| item.relative_dest.clone())
+        .collect();
 
     assert_eq!(dests, vec!["Roms/GBA/test.gba", "BIOS/qa-bios.bin"]);
     let _ = fs::remove_dir_all(&library);
@@ -284,7 +350,15 @@ fn stock_r36s_copy_rejects_unmapped_system_folders() {
 fn empty_library_match_sets_a_warning() {
     let library = scratch("lib");
     let card = scratch("card");
-    let plan = plan_copy(&library, &card, "arkos_easyroms_root", &systems(), &[], None).unwrap();
+    let plan = plan_copy(
+        &library,
+        &card,
+        "arkos_easyroms_root",
+        &systems(),
+        &[],
+        None,
+    )
+    .unwrap();
     assert!(plan.items.is_empty());
     assert!(plan
         .warning

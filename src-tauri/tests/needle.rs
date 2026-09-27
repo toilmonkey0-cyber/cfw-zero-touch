@@ -7,8 +7,12 @@ use cfw_zero_touch_lib::needle::embed_client::{self, EmbedHelper};
 use cfw_zero_touch_lib::needle::manifest::{self, ArtifactRole};
 
 fn scratch(name: &str) -> PathBuf {
+    // Unique even when two parallel test threads scratch the same name
+    // within one nanosecond (they share the pid).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "cfw-needle-{name}-{}-{}",
+        "cfw-needle-{name}-{}-{}-{seq}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -250,7 +254,7 @@ fn stems_are_validated_before_reaching_the_helper() {
 #[test]
 fn float_lines_parse_and_bad_input_is_rejected() {
     let parsed = embed_client::parse_floats("0.5 -0.25 1.00000004e-3").unwrap();
-    assert_eq!(parsed, vec![0.5, -0.25, 1.00000004e-3]);
+    assert_eq!(parsed, vec![0.5, -0.25, 1e-3]);
     assert!(embed_client::parse_floats("").unwrap().is_empty());
     assert!(embed_client::parse_floats("0.5 nan-inf").is_err());
     assert!(embed_client::parse_floats("not-a-float").is_err());
@@ -1523,10 +1527,7 @@ fn scan_card_lists_mapped_system_files_only() {
     fs::create_dir_all(card.join("unmapped")).unwrap();
     fs::write(card.join("unmapped/stray.gba"), b"x").unwrap();
     let residents = dedupe::scan_card(&card, "arkos_easyroms_root", &dedupe_systems());
-    let dests: Vec<&str> = residents
-        .iter()
-        .map(|r| r.relative_dest.as_str())
-        .collect();
+    let dests: Vec<&str> = residents.iter().map(|r| r.relative_dest.as_str()).collect();
     assert!(dests.contains(&"gba/Advance Wars (U).gba"));
     assert!(
         !dests.iter().any(|d| d.contains("unmapped")),
@@ -1563,8 +1564,7 @@ fn plan_incoming_maps_destinations_back_to_systems() {
         ],
         warning: None,
     };
-    let incoming =
-        dedupe::plan_incoming(&plan, "rocknix_roms_nested", &dedupe_systems());
+    let incoming = dedupe::plan_incoming(&plan, "rocknix_roms_nested", &dedupe_systems());
     assert_eq!(incoming.len(), 1, "copy items in a mapped system only");
     assert_eq!(incoming[0].system_id, "gba");
     assert_eq!(incoming[0].relative_dest, "roms/gba/Game.gba");
@@ -1603,10 +1603,7 @@ fn apply_keep_choices_defaults_to_skip_and_never_touches_residents() {
         dedupe::apply_keep_choices(plan, &groups, &std::collections::HashSet::new());
     assert_eq!(removed, 1);
     assert_eq!(filtered.items.len(), 1);
-    assert_eq!(
-        filtered.items[0].relative_dest,
-        "gba/Golden Sun (USA).gba"
-    );
+    assert_eq!(filtered.items[0].relative_dest, "gba/Golden Sun (USA).gba");
 
     // Explicit keep restores the grouped file.
     let plan = CopyPlan {

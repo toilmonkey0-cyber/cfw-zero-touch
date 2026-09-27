@@ -27,11 +27,7 @@ pub fn stage_plans(
 ) -> Vec<StagePlan> {
     let mut plans = Vec::new();
     for system in systems {
-        if !include.is_empty()
-            && !include
-                .iter()
-                .any(|id| id.eq_ignore_ascii_case(&system.id))
-        {
+        if !include.is_empty() && !include.iter().any(|id| id.eq_ignore_ascii_case(&system.id)) {
             continue;
         }
         // Load-time validation (profiles::is_safe_folder) already rejects
@@ -43,7 +39,11 @@ pub fn stage_plans(
         let mut args = vec![
             "copy".to_string(),
             "--input".to_string(),
-            format!("{}/{}/**", igir_path(library), igir_path(Path::new(&system.folder))),
+            format!(
+                "{}/{}/**",
+                igir_path(library),
+                igir_path(Path::new(&system.folder))
+            ),
             "--output".to_string(),
             format!("{}/", igir_path(&staging.join(&system.folder))),
             "--overwrite-invalid".to_string(),

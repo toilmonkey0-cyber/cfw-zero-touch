@@ -41,10 +41,16 @@ pub fn folders_for(profile: &Profile) -> Result<Vec<String>, String> {
     }
     let mut folders = Vec::new();
     for system in &profile.rom_schema.systems {
-        push_unique(&mut folders, &storage_folder(&profile.rom_schema.layout, &system.folder)?);
+        push_unique(
+            &mut folders,
+            &storage_folder(&profile.rom_schema.layout, &system.folder)?,
+        );
     }
     if let Some(bios) = &profile.rom_schema.bios_folder {
-        push_unique(&mut folders, &storage_folder(&profile.rom_schema.layout, bios)?);
+        push_unique(
+            &mut folders,
+            &storage_folder(&profile.rom_schema.layout, bios)?,
+        );
     }
     Ok(folders)
 }

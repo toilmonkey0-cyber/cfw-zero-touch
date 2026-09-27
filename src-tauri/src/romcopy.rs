@@ -138,7 +138,10 @@ pub fn execute_copy(
                     })?;
                 }
                 fs::rename(&temp, &destination).map_err(|error| {
-                    format!("could not finish copying {}: {error}", item.source.display())
+                    format!(
+                        "could not finish copying {}: {error}",
+                        item.source.display()
+                    )
                 })?;
                 report.bytes_copied += item.bytes;
             }

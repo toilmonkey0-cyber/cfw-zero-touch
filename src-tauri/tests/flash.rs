@@ -77,7 +77,7 @@ fn sector_writer_only_emits_full_sectors() {
     struct Guard(Vec<u8>);
     impl std::io::Write for Guard {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if buf.len() % 512 != 0 {
+            if !buf.len().is_multiple_of(512) {
                 return Err(std::io::Error::other("unaligned"));
             }
             self.0.extend_from_slice(buf);
@@ -129,10 +129,15 @@ fn matching_cache_is_reused_without_downloading() {
     std::fs::write(dir.join(name), b"abc").unwrap();
     let hash = sha256_bytes(b"abc");
     let mut fetched = false;
-    let path = ensure_image(&[dir.clone()], &format!("https://example.com/{name}"), &hash, |_| {
-        fetched = true;
-        Ok(())
-    })
+    let path = ensure_image(
+        std::slice::from_ref(&dir),
+        &format!("https://example.com/{name}"),
+        &hash,
+        |_| {
+            fetched = true;
+            Ok(())
+        },
+    )
     .unwrap();
     assert!(!fetched);
     assert_eq!(path, dir.join(name));
@@ -145,10 +150,15 @@ fn missing_cache_downloads_and_checks_the_hash() {
     std::fs::create_dir_all(&dir).unwrap();
     let name = "ROCKNIX-test.img.gz";
     let hash = sha256_bytes(b"abc");
-    let path = ensure_image(&[dir.clone()], &format!("https://example.com/{name}"), &hash, |dest| {
-        std::fs::write(dest, b"abc").unwrap();
-        Ok(())
-    })
+    let path = ensure_image(
+        std::slice::from_ref(&dir),
+        &format!("https://example.com/{name}"),
+        &hash,
+        |dest| {
+            std::fs::write(dest, b"abc").unwrap();
+            Ok(())
+        },
+    )
     .unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"abc");
     let _ = std::fs::remove_dir_all(&dir);
@@ -161,10 +171,15 @@ fn wrong_cached_hash_is_replaced() {
     let name = "ROCKNIX-test.img.gz";
     std::fs::write(dir.join(name), b"stale").unwrap();
     let hash = sha256_bytes(b"fresh");
-    let path = ensure_image(&[dir.clone()], &format!("https://example.com/{name}"), &hash, |dest| {
-        std::fs::write(dest, b"fresh").unwrap();
-        Ok(())
-    })
+    let path = ensure_image(
+        std::slice::from_ref(&dir),
+        &format!("https://example.com/{name}"),
+        &hash,
+        |dest| {
+            std::fs::write(dest, b"fresh").unwrap();
+            Ok(())
+        },
+    )
     .unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
     let _ = std::fs::remove_dir_all(&dir);

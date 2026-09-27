@@ -48,7 +48,10 @@ pub struct FeedDiff {
 pub fn parse_feed(text: &str, validator: &jsonschema::Validator) -> Result<ProfileFeed, String> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|error| format!("feed is not JSON: {error}"))?;
-    let feed_version = value.get("feedVersion").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let feed_version = value
+        .get("feedVersion")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     if feed_version != FEED_VERSION {
         return Err(format!(
             "unsupported feed version {feed_version}; this app understands version {FEED_VERSION}"

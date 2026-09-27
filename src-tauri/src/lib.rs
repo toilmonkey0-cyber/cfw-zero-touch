@@ -43,7 +43,11 @@ fn seed_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
 fn schema_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(root) = std::env::var("CFW_STUDIO_ROOT") {
-        candidates.push(PathBuf::from(root).join("specs").join("profile.schema.json"));
+        candidates.push(
+            PathBuf::from(root)
+                .join("specs")
+                .join("profile.schema.json"),
+        );
     }
     candidates.push(repo_root().join("specs").join("profile.schema.json"));
     if let Ok(resource) = app.path().resource_dir() {
@@ -122,7 +126,10 @@ fn lettered_partitions() -> Result<Vec<LetteredPartition>, String> {
         else {
             continue;
         };
-        let disk = row.get("DiskNumber").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
+        let disk = row
+            .get("DiskNumber")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as u32;
         partitions.push(LetteredPartition { letter, disk });
     }
     Ok(partitions)
@@ -132,7 +139,10 @@ fn lettered_partitions() -> Result<Vec<LetteredPartition>, String> {
 ///
 /// Only flashed single-card ArkOS/dArkOS profiles carry the firstboot wipe;
 /// ROMs-only cards have no BOOT partition and are always safe to fill.
-fn check_card_safety(profile: &Profile, volume: &VolumeInfo) -> Result<firstboot::CardSafety, String> {
+fn check_card_safety(
+    profile: &Profile,
+    volume: &VolumeInfo,
+) -> Result<firstboot::CardSafety, String> {
     let gate_applies =
         profile.image.is_some() && profile.rom_schema.layout == "arkos_easyroms_root";
     if !gate_applies {
@@ -141,7 +151,10 @@ fn check_card_safety(profile: &Profile, volume: &VolumeInfo) -> Result<firstboot
     let partitions = lettered_partitions()?;
     let Some(disk) = partitions
         .iter()
-        .find(|row| row.letter.eq_ignore_ascii_case(&volume.letter.chars().next().unwrap_or('?')))
+        .find(|row| {
+            row.letter
+                .eq_ignore_ascii_case(&volume.letter.chars().next().unwrap_or('?'))
+        })
         .map(|row| row.disk)
     else {
         return Ok(firstboot::CardSafety::Unknown(format!(
@@ -160,8 +173,8 @@ fn check_card_safety(profile: &Profile, volume: &VolumeInfo) -> Result<firstboot
                 .map(|volume| (row.letter, volume.label.clone()))
         })
         .collect();
-    let boot_root = firstboot::boot_letter(&disk_volumes)
-        .map(|letter| PathBuf::from(format!("{letter}:\\")));
+    let boot_root =
+        firstboot::boot_letter(&disk_volumes).map(|letter| PathBuf::from(format!("{letter}:\\")));
     Ok(firstboot::card_safety(&disk_volumes, boot_root.as_deref()))
 }
 
@@ -183,11 +196,19 @@ fn firstboot_state(
     let (state, reason) = match check_card_safety(&profile, &volume)? {
         firstboot::CardSafety::Safe => ("safe".into(), String::new()),
         firstboot::CardSafety::Armed(reason) => {
-            diag::log("WARN", "firstboot_refused", &format!("volume={}: {reason}", volume.letter));
+            diag::log(
+                "WARN",
+                "firstboot_refused",
+                &format!("volume={}: {reason}", volume.letter),
+            );
             ("armed".into(), reason)
         }
         firstboot::CardSafety::Unknown(reason) => {
-            diag::log("WARN", "firstboot_unverified", &format!("volume={}: {reason}", volume.letter));
+            diag::log(
+                "WARN",
+                "firstboot_unverified",
+                &format!("volume={}: {reason}", volume.letter),
+            );
             ("unknown".into(), reason)
         }
     };
@@ -298,11 +319,7 @@ fn prepare_card(
         .clone()
         .unwrap_or_else(|| "EASYROMS".into());
     let volume = require_volume(&volume_id)?;
-    let file_system = profile
-        .rom_schema
-        .format_fs
-        .as_deref()
-        .unwrap_or("exFAT");
+    let file_system = profile.rom_schema.format_fs.as_deref().unwrap_or("exFAT");
     let mut shell = prepare::ElevatedPowerShell;
     diag::log(
         "INFO",
@@ -568,8 +585,11 @@ fn dedupe_plan(
         &profile.rom_schema.layout,
         &profile.rom_schema.systems,
     );
-    let incoming =
-        needle::dedupe::plan_incoming(&plan, &profile.rom_schema.layout, &profile.rom_schema.systems);
+    let incoming = needle::dedupe::plan_incoming(
+        &plan,
+        &profile.rom_schema.layout,
+        &profile.rom_schema.systems,
+    );
     if residents.is_empty() || incoming.is_empty() {
         return Ok(plan_view(plan));
     }
@@ -625,13 +645,7 @@ fn plan_roms(
     // embeddings, so it previews no groups). Grouped items default to
     // skip unless listed in dedupe.keep; residents are never modified.
     if smart.is_some() {
-        let with_groups = dedupe_plan(
-            &app,
-            &profile,
-            &card_root(&volume),
-            plan,
-            dedupe.as_ref(),
-        )?;
+        let with_groups = dedupe_plan(&app, &profile, &card_root(&volume), plan, dedupe.as_ref())?;
         return Ok(with_groups);
     }
     Ok(plan_view(plan))
@@ -691,18 +705,20 @@ fn copy_roms(
             &profile.rom_schema.layout,
             &profile.rom_schema.systems,
         );
-        let incoming =
-            needle::dedupe::plan_incoming(&plan, &profile.rom_schema.layout, &profile.rom_schema.systems);
+        let incoming = needle::dedupe::plan_incoming(
+            &plan,
+            &profile.rom_schema.layout,
+            &profile.rom_schema.systems,
+        );
         if !residents.is_empty() && !incoming.is_empty() {
             let helper = resolve_embed_helper()
                 .ok_or_else(|| "smart sort engine is not installed".to_string())?;
-            let weights =
-                resolve_weights().ok_or_else(|| "smart sort engine is not installed".to_string())?;
+            let weights = resolve_weights()
+                .ok_or_else(|| "smart sort engine is not installed".to_string())?;
             let filtered = needle::embed_client::with_helper(&helper, &weights, |session| {
                 let mut embed = |stem: &str| session.embed(stem);
                 let groups = needle::dedupe::group_duplicates(&residents, &incoming, &mut embed);
-                let (filtered, removed) =
-                    needle::dedupe::apply_keep_choices(plan, &groups, &keep);
+                let (filtered, removed) = needle::dedupe::apply_keep_choices(plan, &groups, &keep);
                 diag::log(
                     "info",
                     "needle_copy_dedupe",
@@ -890,7 +906,10 @@ fn image_cache_dirs() -> Vec<PathBuf> {
     directories
 }
 
-fn prepare_split_7z(app: &tauri::AppHandle, image: &profiles::ImageSource) -> Result<PathBuf, String> {
+fn prepare_split_7z(
+    app: &tauri::AppHandle,
+    image: &profiles::ImageSource,
+) -> Result<PathBuf, String> {
     let first = image
         .parts
         .first()
@@ -900,9 +919,10 @@ fn prepare_split_7z(app: &tauri::AppHandle, image: &profiles::ImageSource) -> Re
     for directory in &directories {
         let candidate = directory.join(&image_name);
         if candidate.is_file() {
-            let hash = flash::sha256_reader(std::fs::File::open(&candidate).map_err(|error| {
-                format!("could not read {}: {error}", candidate.display())
-            })?)?;
+            let hash =
+                flash::sha256_reader(std::fs::File::open(&candidate).map_err(|error| {
+                    format!("could not read {}: {error}", candidate.display())
+                })?)?;
             if hash.eq_ignore_ascii_case(&image.sha256) {
                 return Ok(candidate);
             }
@@ -972,7 +992,8 @@ fn download_image(url: &str, dest: &std::path::Path) -> Result<(), String> {
 }
 
 fn flash_tool() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|error| format!("could not find this app: {error}"))?;
+    let exe =
+        std::env::current_exe().map_err(|error| format!("could not find this app: {error}"))?;
     let tool = exe
         .parent()
         .ok_or("app path has no folder")?
@@ -998,9 +1019,7 @@ fn flash_os(
         return Err("refusing to flash disk 0".into());
     }
     let profile = profile_by_id(&app, &profile_id)?;
-    let image = profile
-        .image
-        .ok_or("this profile has no OS image")?;
+    let image = profile.image.ok_or("this profile has no OS image")?;
     let _ = app.emit("flash-progress", "Checking the OS image…");
     let image_path = if image.compressed.as_deref() == Some("7z") {
         prepare_split_7z(&app, &image)?
@@ -1040,7 +1059,8 @@ fn flash_os(
         sha = image.sha256.replace('\'', ""),
         log = log.display().to_string().replace('\'', "''"),
     );
-    std::fs::write(&script_path, script).map_err(|error| format!("could not write the launcher: {error}"))?;
+    std::fs::write(&script_path, script)
+        .map_err(|error| format!("could not write the launcher: {error}"))?;
     let launcher = format!(
         "Start-Process -FilePath powershell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
         script_path.display().to_string().replace('\'', "''")
@@ -1066,7 +1086,11 @@ fn flash_os(
         );
         return Err(reason);
     }
-    diag::log("INFO", "flash_done", &format!("disk={disk_number} profile={profile_id}"));
+    diag::log(
+        "INFO",
+        "flash_done",
+        &format!("disk={disk_number} profile={profile_id}"),
+    );
     Ok(text)
 }
 
@@ -1106,7 +1130,8 @@ fn check_profile_feed(app: tauri::AppHandle) -> Result<FeedCheckView, String> {
             diag::log(
                 "INFO",
                 "feed_check",
-                &format!("status={status} updates={} additions={}",
+                &format!(
+                    "status={status} updates={} additions={}",
                     diff.updates.len(),
                     diff.additions.len()
                 ),
@@ -1120,7 +1145,11 @@ fn check_profile_feed(app: tauri::AppHandle) -> Result<FeedCheckView, String> {
             })
         }
         Err(reason) => {
-            diag::log("INFO", "feed_check", &format!("status=error reason={reason}"));
+            diag::log(
+                "INFO",
+                "feed_check",
+                &format!("status=error reason={reason}"),
+            );
             Ok(FeedCheckView {
                 status: "error".into(),
                 reason,
@@ -1366,7 +1395,10 @@ fn resolve_igir() -> Result<Vec<String>, String> {
     if on_path("npx") {
         return Ok(vec!["npx".into(), "--yes".into(), "igir@latest".into()]);
     }
-    Err("igir sorting needs either igir on PATH or Node.js installed so igir can run through npx".into())
+    Err(
+        "igir sorting needs either igir on PATH or Node.js installed so igir can run through npx"
+            .into(),
+    )
 }
 
 fn run_igir(
@@ -1389,7 +1421,10 @@ fn run_igir(
         let app = app.clone();
         let system_folder = system_folder.to_string();
         std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
                 let _ = app.emit(
                     "stage-progress",
                     StageProgress {
@@ -1480,7 +1515,11 @@ fn stage_library(
             raw_copied_systems.push(plan.system_folder.clone());
         }
         if let Err(error) = run_igir(&app, &base, &plan.system_folder, &plan.args) {
-            diag::log("ERROR", "stage_failed", &format!("profile={profile_id}: {error}"));
+            diag::log(
+                "ERROR",
+                "stage_failed",
+                &format!("profile={profile_id}: {error}"),
+            );
             return Err(error);
         }
     }

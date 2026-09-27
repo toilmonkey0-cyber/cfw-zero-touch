@@ -4,8 +4,12 @@ use std::path::PathBuf;
 use cfw_zero_touch_lib::store::{ensure_seeded, profile_store_dir, store_root};
 
 fn scratch(name: &str) -> PathBuf {
+    // Unique even when two parallel test threads scratch the same name
+    // within one nanosecond (they share the pid).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "cfw-{name}-{}-{}",
+        "cfw-{name}-{}-{}-{seq}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

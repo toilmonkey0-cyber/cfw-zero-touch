@@ -46,7 +46,10 @@ fn log_appends_timestamped_lines_under_the_store_root() {
         lines[0].starts_with("20") && lines[0].ends_with(" INFO event_one detail one"),
         "{lines:?}"
     );
-    assert!(lines[1].ends_with(" WARN event_two detail two"), "{lines:?}");
+    assert!(
+        lines[1].ends_with(" WARN event_two detail two"),
+        "{lines:?}"
+    );
     assert!(log_path().starts_with(&root), "{:?}", log_path());
     let _ = fs::remove_dir_all(&root);
     std::env::remove_var("CFW_STUDIO_DATA");

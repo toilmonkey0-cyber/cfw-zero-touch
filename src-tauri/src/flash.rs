@@ -58,16 +58,14 @@ fn is_image_file_name(name: &str) -> bool {
     name.ends_with(".img.gz")
         || name.ends_with(".img")
         || name.ends_with(".7z")
-        || name
-            .rsplit_once(".7z.")
-            .is_some_and(|(_, index)| !index.is_empty() && index.chars().all(|ch| ch.is_ascii_digit()))
+        || name.rsplit_once(".7z.").is_some_and(|(_, index)| {
+            !index.is_empty() && index.chars().all(|ch| ch.is_ascii_digit())
+        })
 }
 
 pub fn extracted_image_name(part_name: &str) -> Result<String, String> {
     let without_index = part_name.strip_suffix(".001").unwrap_or(part_name);
-    let image = without_index
-        .strip_suffix(".7z")
-        .unwrap_or(without_index);
+    let image = without_index.strip_suffix(".7z").unwrap_or(without_index);
     if image.ends_with(".img") && image != part_name {
         Ok(image.to_string())
     } else {
@@ -103,12 +101,14 @@ pub fn ensure_image(
     if final_path.exists() {
         let _ = fs::remove_file(&final_path);
     }
-    fs::rename(&partial, &final_path).map_err(|error| format!("could not save the image: {error}"))?;
+    fs::rename(&partial, &final_path)
+        .map_err(|error| format!("could not save the image: {error}"))?;
     Ok(final_path)
 }
 
 fn file_matches(path: &Path, expected_sha256: &str) -> Result<bool, String> {
-    let file = File::open(path).map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let file =
+        File::open(path).map_err(|error| format!("could not open {}: {error}", path.display()))?;
     let actual = sha256_reader(file)?;
     Ok(actual.eq_ignore_ascii_case(expected_sha256))
 }
@@ -227,7 +227,10 @@ pub fn authorize_flash(disk: &FlashDisk, plan: &FlashPlan) -> Result<(), FlashBl
     if disk.size_bytes != plan.displayed_bytes {
         return Err(FlashBlock::Size);
     }
-    if !plan.actual_sha256.eq_ignore_ascii_case(&plan.expected_sha256) {
+    if !plan
+        .actual_sha256
+        .eq_ignore_ascii_case(&plan.expected_sha256)
+    {
         return Err(FlashBlock::Checksum);
     }
     Ok(())

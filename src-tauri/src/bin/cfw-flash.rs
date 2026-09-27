@@ -92,7 +92,10 @@ fn read_disk(number: u32) -> Result<FlashDisk, String> {
         return Err(String::from_utf8_lossy(&output.stderr).to_string());
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let line = text.lines().find(|line| line.contains('|')).ok_or("no disk info")?;
+    let line = text
+        .lines()
+        .find(|line| line.contains('|'))
+        .ok_or("no disk info")?;
     let mut parts = line.trim().split('|');
     let number: u32 = parts
         .next()

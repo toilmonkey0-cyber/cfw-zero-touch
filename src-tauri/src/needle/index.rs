@@ -80,16 +80,16 @@ impl DeterministicRouter {
             }
             // Routing fingerprint input: the tuples actually used.
             hasher.update(system.id.as_bytes());
-            hasher.update(&[0]);
+            hasher.update([0]);
             hasher.update(system.folder.as_bytes());
-            hasher.update(&[0]);
+            hasher.update([0]);
             let mut exts: Vec<&String> = system.extensions.iter().collect();
             exts.sort();
             for ext in exts {
                 hasher.update(ext.as_bytes());
-                hasher.update(&[0]);
+                hasher.update([0]);
             }
-            hasher.update(&[0]);
+            hasher.update([0]);
         }
         let extensions = ext_claims
             .into_iter()
@@ -211,13 +211,13 @@ pub fn scan_library(root: &Path) -> Result<Vec<LibraryFile>, String> {
 fn library_fingerprint(root: &Path, files: &[LibraryFile]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(root.to_string_lossy().to_lowercase().as_bytes());
-    hasher.update(&[0]);
-    hasher.update(&files.len().to_le_bytes());
+    hasher.update([0]);
+    hasher.update(files.len().to_le_bytes());
     for file in files {
         hasher.update(file.relative.to_string_lossy().as_bytes());
-        hasher.update(&[0]);
-        hasher.update(&file.size.to_le_bytes());
-        hasher.update(&file.modified_ms.to_le_bytes());
+        hasher.update([0]);
+        hasher.update(file.size.to_le_bytes());
+        hasher.update(file.modified_ms.to_le_bytes());
     }
     hasher.finalize().into()
 }

@@ -52,9 +52,15 @@ fn example_arkos_profile_validates_and_loads() {
         .iter()
         .find(|profile| profile.id == "darkos-rgb10x-os")
         .expect("dArkOS RGB10X profile");
-    assert_eq!(darkos.image.as_ref().map(|image| image.parts.len()), Some(2));
     assert_eq!(
-        darkos.image.as_ref().and_then(|image| image.compressed.as_deref()),
+        darkos.image.as_ref().map(|image| image.parts.len()),
+        Some(2)
+    );
+    assert_eq!(
+        darkos
+            .image
+            .as_ref()
+            .and_then(|image| image.compressed.as_deref()),
         Some("7z")
     );
 
@@ -99,8 +105,12 @@ fn malformed_profile_is_rejected() {
 }
 
 fn scratch(name: &str) -> PathBuf {
+    // Unique even when two parallel test threads scratch the same name
+    // within one nanosecond (they share the pid).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "cfw-{name}-{}-{}",
+        "cfw-{name}-{}-{}-{seq}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

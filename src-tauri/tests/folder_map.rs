@@ -56,7 +56,12 @@ fn stock_r36s_layout_maps_games_under_roms_and_bios_at_the_root() {
     let folders = cfw_zero_touch_lib::folder_map::folders_for(&profile(
         "stock_r36s_roms",
         Some("bios"),
-        &[("gba", "gba"), ("snes", "snes"), ("nes", "nes"), ("psx", "psx")],
+        &[
+            ("gba", "gba"),
+            ("snes", "snes"),
+            ("nes", "nes"),
+            ("psx", "psx"),
+        ],
     ))
     .expect("known layout");
 

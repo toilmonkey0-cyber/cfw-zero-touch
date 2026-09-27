@@ -1,12 +1,16 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cfw_zero_touch_lib::igir::stage_plans;
 use cfw_zero_touch_lib::profiles::SystemFolder;
 
 fn scratch(name: &str) -> PathBuf {
+    // Unique even when two parallel test threads scratch the same name
+    // within one nanosecond (they share the pid).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "cfw-{name}-{}-{}",
+        "cfw-{name}-{}-{}-{seq}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -57,7 +61,10 @@ fn dat_mode_adds_region_single_and_pattern_flags() {
         vec![
             "copy".to_string(),
             "--input".to_string(),
-            format!("{}/gba/**", library.display().to_string().replace('\\', "/")),
+            format!(
+                "{}/gba/**",
+                library.display().to_string().replace('\\', "/")
+            ),
             "--output".to_string(),
             format!("{}/gba/", staging.display().to_string().replace('\\', "/")),
             "--overwrite-invalid".to_string(),
@@ -220,9 +227,17 @@ fn one_game_per_region_stages_against_a_self_made_dat() {
     let base = if on_path("igir.exe") {
         vec!["igir".to_string()]
     } else if on_path("npx.cmd") {
-        vec!["npx.cmd".to_string(), "--yes".to_string(), "igir@latest".to_string()]
+        vec![
+            "npx.cmd".to_string(),
+            "--yes".to_string(),
+            "igir@latest".to_string(),
+        ]
     } else {
-        vec!["npx".to_string(), "--yes".to_string(), "igir@latest".to_string()]
+        vec![
+            "npx".to_string(),
+            "--yes".to_string(),
+            "igir@latest".to_string(),
+        ]
     };
     for plan in &plans {
         let mut command = std::process::Command::new(&base[0]);
@@ -249,9 +264,9 @@ fn one_game_per_region_stages_against_a_self_made_dat() {
     let _ = fs::remove_dir_all(&root);
 }
 
-fn count_files(root: &PathBuf) -> usize {
+fn count_files(root: &Path) -> usize {
     let mut count = 0;
-    let mut stack = vec![root.clone()];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).unwrap().flatten() {
             let path = entry.path();

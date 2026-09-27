@@ -60,7 +60,10 @@ pub fn is_safe_folder(name: &str) -> bool {
         && name != "."
         && name != ".."
         && !name.contains(['\\', '/', ':'])
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-' | '.'))
@@ -105,7 +108,11 @@ pub struct RomSchema {
     pub volume_label: Option<String>,
     #[serde(default)]
     pub systems: Vec<SystemFolder>,
-    #[serde(rename = "biosFolder", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "biosFolder",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub bios_folder: Option<String>,
 }
 
