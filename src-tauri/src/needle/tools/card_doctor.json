@@ -1,0 +1,44 @@
+[
+  {
+    "name": "explain_card",
+    "description": "Explain what a detected handheld SD card is and what the user should do next. Use it when asked to explain a card state or a refused operation. Do not use it for anything else.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "card_family": {
+          "type": "string",
+          "enum": [
+            "arkos_easyroms",
+            "rocknix_share",
+            "r36s_clone",
+            "r35s_stock",
+            "darkos_easyroms",
+            "unknown"
+          ],
+          "description": "The detected card family"
+        },
+        "observation": {
+          "type": "string",
+          "description": "One or two sentences describing what is on the card, drawn from the supplied CardFacts"
+        },
+        "next_step": {
+          "type": "string",
+          "description": "The single most useful next action for the user: a button label or short instruction"
+        },
+        "suggested_profile_id": {
+          "type": "string",
+          "enum": [
+            "arkos-roms-card",
+            "rocknix-roms-card",
+            "rocknix-rgb10x-os",
+            "r36s-clone-card",
+            "r35s-stock-card",
+            "darkos-rgb10x-os"
+          ],
+          "description": "The shipped Card Studio profile matching this card, or bear none for arkos-roms-card when unsure"
+        }
+      },
+      "required": ["card_family", "observation", "next_step", "suggested_profile_id"]
+    }
+  }
+]

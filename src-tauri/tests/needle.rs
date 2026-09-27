@@ -1000,3 +1000,255 @@ fn plan_smart_builds_destinations_resolutions_and_bios() {
     .unwrap_err();
     assert!(err.contains("need review"), "got: {err}");
 }
+
+// ------------------------------------------------------------------
+// PR 6: serve client protocol (mock-server, no live engine)
+// ------------------------------------------------------------------
+use cfw_zero_touch_lib::needle::client::{ClientError, ServeClient};
+use cfw_zero_touch_lib::needle::serve;
+
+/// A hand-rolled HTTP/1.1 mock server: one scripted responder serving
+/// connection after connection until `max_requests`, on an OS-picked
+/// port. The responder sees the full request text (headers + body) and
+/// returns a `(status, body)` pair, so mocks can refuse as well as answer.
+fn mock_server(
+    max_requests: usize,
+    respond: impl Fn(&str) -> (u16, String) + Send + 'static,
+) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        listener.set_nonblocking(true).ok();
+        let start = std::time::Instant::now();
+        let mut served = 0usize;
+        while served < max_requests && start.elapsed() < std::time::Duration::from_secs(20) {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    // ureq reads responses to completion on the connection,
+                    // so wait for the full request bytes (headers, plus any
+                    // body) with a stack instead of a single short read.
+                    let mut held = Vec::new();
+                    let mut complete = false;
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_secs(5) && !complete {
+                        let mut chunk = [0u8; 4096];
+                        match socket.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                held.extend_from_slice(&chunk[..n]);
+                                if let Some(end) = find_headers_end(&held) {
+                                    let content_length = content_length_of(&held[..end]);
+                                    if held.len() - end >= content_length {
+                                        complete = true;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if !complete {
+                        continue;
+                    }
+                    let request = String::from_utf8_lossy(&held).to_string();
+                    let (status, body) = respond(&request);
+                    let response = format!(
+                        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status_phrase(status),
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes());
+                    served += 1;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+    });
+    (addr, handle)
+}
+
+/// Numeric HTTP status carried alongside a mock answer body, so mocks
+/// can refuse (429) as well as answer (200).
+pub struct MockAnswer(pub u16, pub String);
+
+fn status_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        429 => "Too Many Requests",
+        _ => "Error",
+    }
+}
+
+/// Byte index just past the first `\r\n\r\n`, if present.
+fn find_headers_end(held: &[u8]) -> Option<usize> {
+    held.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+}
+
+/// Case-insensitive `Content-Length` value in the headers, defaulting to 0.
+fn content_length_of(headers: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(headers).to_lowercase();
+    text.lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+const CLASSIFY_CALL: &str = r#"{
+  "function_calls": [
+    {"name": "explain_card", "arguments": {"card_family": "r35s_stock", "observation": "a stock card", "next_step": "copy", "suggested_profile_id": "r35s-stock-card"}}
+  ],
+  "suppressed_calls": [],
+  "confidence": 0.9,
+  "reasoning": ""
+}"#;
+
+#[test]
+fn client_speaks_reset_then_complete_and_returns_the_call() {
+    let (addr, server) = mock_server(2, |request| {
+        if request.starts_with("POST /reset") {
+            return (200u16, "{}".into());
+        }
+        assert!(
+            request.starts_with("POST /complete"),
+            "unexpected: {request}"
+        );
+        assert!(
+            request.contains(r#""input""#),
+            "complete carries the input: {request}"
+        );
+        (200u16, CLASSIFY_CALL.into())
+    });
+
+    let client = ServeClient::with_base_url(format!("http://{addr}"), 2);
+    let turn = client.ask("CardFacts: label ROMS").expect("one good turn");
+    assert_eq!(turn.call.name, "explain_card");
+    assert!(!turn.withheld);
+    assert_eq!(turn.confidence, Some(0.9));
+    assert_eq!(
+        turn.call.arguments["suggested_profile_id"],
+        "r35s-stock-card"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn client_prefers_grounded_calls_and_discounts_withheld_ones() {
+    let both = r#"{
+      "function_calls": [
+        {"name": "explain_card", "arguments": {"a": 1}}
+      ],
+      "suppressed_calls": [
+        {"name": "explain_card", "arguments": {"a": 2}}
+      ],
+      "confidence": 0.6,
+      "reasoning": ""
+    }"#;
+    let (addr, server) = mock_server(2, move |request| {
+        if request.starts_with("POST /reset") {
+            return (200u16, "{}".into());
+        }
+        (200u16, both.into())
+    });
+    let turn = ServeClient::with_base_url(format!("http://{addr}"), 1)
+        .ask("facts")
+        .unwrap();
+    assert!(!turn.withheld, "grounded calls win over withheld ones");
+    assert_eq!(turn.call.arguments["a"], 1);
+    server.join().unwrap();
+
+    let only_suppressed = r#"{
+      "function_calls": [],
+      "suppressed_calls": [
+        {"name": "explain_card", "arguments": {"a": 9}}
+      ],
+      "confidence": 0.55,
+      "reasoning": ""
+    }"#;
+    let (addr, server) = mock_server(2, move |request| {
+        if request.starts_with("POST /reset") {
+            return (200u16, "{}".into());
+        }
+        (200u16, only_suppressed.into())
+    });
+    let turn = ServeClient::with_base_url(format!("http://{addr}"), 1)
+        .ask("facts")
+        .unwrap();
+    assert!(turn.withheld);
+    assert_eq!(turn.call.arguments["a"], 9);
+    server.join().unwrap();
+}
+
+#[test]
+fn client_returns_nocall_on_empty_calls() {
+    let (addr, server) = mock_server(2, |request| {
+        if request.starts_with("POST /reset") {
+            return (200u16, "{}".into());
+        }
+        (
+            200u16,
+            r#"{"function_calls": [], "suppressed_calls": [], "confidence": 0.9}"#.into(),
+        )
+    });
+    let err = ServeClient::with_base_url(format!("http://{addr}"), 1)
+        .ask("junk")
+        .unwrap_err();
+    assert!(matches!(err, ClientError::NoCall), "got: {err:?}");
+    server.join().unwrap();
+}
+
+#[test]
+fn client_treats_error_status_as_api_error_without_retry() {
+    // 429 is an API error, not a transport failure: no retry. The mock
+    // refuses the FIRST request (the reset itself) with a valid turn
+    // envelope that carries no calls; the turn parser reports NoCall and
+    // the served-request counter proves no second attempt is ever made.
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = served.clone();
+    let (addr, server) = mock_server(8, move |request| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if request.starts_with("POST /reset") {
+            return (
+                429u16,
+                r#"{
+  "function_calls": [],
+  "suppressed_calls": [],
+  "confidence": 0.0,
+  "reasoning": "refused"
+}"#
+                .into(),
+            );
+        }
+        (200u16, "{}".into())
+    });
+    let err = ServeClient::with_base_url(format!("http://{addr}"), 3)
+        .ask("reset then refused")
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ClientError::Api {
+                status_code: 429,
+                ..
+            }
+        ),
+        "the refusal surfaces with its real status: {err:?}"
+    );
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a refused turn must not be retried"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn pick_free_port_returns_connectable_ports() {
+    let port = serve::pick_free_port().unwrap();
+    assert!(port != 0);
+    // The picked port is immediately bindable (i.e. free).
+    let again = std::net::TcpListener::bind(("127.0.0.1", port));
+    assert!(again.is_ok(), "picked port should be free right now");
+}

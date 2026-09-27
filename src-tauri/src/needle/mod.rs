@@ -10,8 +10,10 @@
 //! network on its own.
 
 pub mod acquire;
+pub mod client;
 pub mod embed_client;
 pub mod index;
 pub mod manifest;
+pub mod serve;
 pub mod sort;
 pub mod tags;
