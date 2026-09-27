@@ -562,3 +562,263 @@ fn clean_stem_matches_spike_fixtures() {
     assert_eq!(tags::clean_stem("sega-saturn/Wipeout (PAL).gdi"), "wipeout");
 }
 
+
+// ------------------------------------------------------------------
+// PR 4: smart-sort planner (offline, injected embeddings)
+// ------------------------------------------------------------------
+use cfw_zero_touch_lib::needle::sort;
+
+/// Controlled embedding: stems map to hand-picked vectors so similarity
+/// is exact � "clone wars" sits at ~0.999 vs "advance wars" (auto-route),
+/// "mystery game" at 0.8 (review with a suggestion), everything else
+/// defaults to a diagonal-ish vector far from all indexed stems.
+fn controlled_embed(stem: &str) -> Result<Vec<f32>, String> {
+    match stem {
+        "advance wars" => Ok(vec![1.0, 0.0, 0.0, 0.0]),
+        "golden sun" => Ok(vec![0.0, 1.0, 0.0, 0.0]),
+        "zelda" => Ok(vec![0.0, 0.0, 1.0, 0.0]),
+        "mystery game" => Ok(vec![0.8, 0.0, 0.6, 0.0]),
+        "clone wars" => Ok(vec![0.999, 0.0447, 0.0, 0.0]),
+        _ => Ok(vec![0.25, 0.25, 0.25, 0.25]),
+    }
+}
+
+fn smart_library_fixture(name: &str) -> PathBuf {
+    let root = scratch(name);
+    for (sub, file) in [
+        ("gba", "Advance Wars (U).gba"),
+        ("gba", "Advance Wars (Europe).gba"),
+        ("gba", "Golden Sun (USA).gba"),
+        ("gba", "Final Fantasy (USA) (Disc 1).gba"),
+        ("gba", "Final Fantasy (USA) (Disc 2).gba"),
+        ("gba", "Final Fantasy (Japan) (Disc 1).gba"),
+        ("nes", "Zelda.nes"),
+    ] {
+        fs::create_dir_all(root.join(sub)).unwrap();
+        fs::write(root.join(sub).join(file), b"rom-bytes").unwrap();
+    }
+    fs::create_dir_all(root.join("loose")).unwrap();
+    fs::write(root.join("loose/Mystery Game (Japan).zip"), b"zip").unwrap();
+    fs::write(root.join("loose/Clone Wars.zip"), b"zip").unwrap();
+    fs::write(root.join("loose/notes.txt"), b"not a rom").unwrap();
+    root
+}
+
+fn smart_systems() -> Vec<SystemFolder> {
+    vec![
+        system("gba", "gba", &[".gba", ".zip"]),
+        system("nes", "nes", &[".nes", ".zip"]),
+    ]
+}
+
+fn classify_fixture(name: &str) -> sort::Classification {
+    let root = smart_library_fixture(name);
+    let store = scratch(&format!("{name}-store"));
+    let _guard = STORE_ENV_LOCK.lock();
+    std::env::set_var("CFW_STUDIO_DATA", &store);
+    let systems = smart_systems();
+    let mut embed = controlled_embed;
+    let (index, _rebuilt) = index::ensure_index("test", &root, &systems, "w1", &mut embed).unwrap();
+    let mut progress = |_, _| {};
+    let classification =
+        sort::classify(&root, &systems, &[], &index, false, &[tags::Region::Usa], &mut embed, &mut progress).unwrap();
+    std::env::remove_var("CFW_STUDIO_DATA");
+    classification
+}
+
+#[test]
+fn classify_uses_all_three_tiers_and_flags_cold_start() {
+    let classification = classify_fixture("tiers");
+    let route = |relative: &str| {
+        classification
+            .routes
+            .iter()
+            .find(|row| row.relative == relative)
+            .unwrap_or_else(|| panic!("no route row for {relative}: {:?}", classification.routes))
+    };
+
+    let zelda = route("nes/Zelda.nes");
+    assert_eq!((zelda.system_id.as_str(), zelda.tier), ("nes", sort::Tier::Folder));
+
+    let clone = route("loose/Clone Wars.zip");
+    assert_eq!((clone.system_id.as_str(), clone.tier), ("gba", sort::Tier::Embedding));
+
+    // Unknown extensions never enter the classification.
+    assert!(classification.routes.iter().all(|row| row.relative != "loose/notes.txt"));
+    assert!(classification.needs_review.iter().all(|row| row.relative != "loose/notes.txt"));
+
+    // Mystery lands in review with the nearest title + similarity.
+    assert_eq!(classification.needs_review.len(), 1);
+    let review = &classification.needs_review[0];
+    assert_eq!(review.review_id, "r1");
+    assert_eq!(review.nearest_stem.as_deref(), Some("advance wars"));
+    assert!(review.similarity.unwrap() > 0.79 && review.similarity.unwrap() < 0.81);
+
+    // Seven indexed files (one per deterministically routed file) is
+    // below COLD_START_TITLES: honest degradation flag.
+    assert!(classification.cold_start);
+    assert_eq!(classification.index_stats.titles, 7);
+}
+
+
+
+#[test]
+fn variant_collapse_keeps_preferred_region_and_all_its_discs() {
+    let classification = classify_fixture("collapse");
+    let decision = |relative: &str| {
+        classification
+            .routes
+            .iter()
+            .find(|row| row.relative == relative)
+            .unwrap_or_else(|| panic!("missing {relative}"))
+            .variant
+            .clone()
+    };
+
+    // USA preference: keep (U), skip the Europe variant.
+    assert_eq!(decision("gba/Advance Wars (U).gba"), sort::VariantDecision::Keep);
+    assert!(matches!(decision("gba/Advance Wars (Europe).gba"), sort::VariantDecision::SkipRegion { .. }));
+
+    // Multi-disc integrity: both USA discs kept, the Japan disc skipped.
+    assert_eq!(decision("gba/Final Fantasy (USA) (Disc 1).gba"), sort::VariantDecision::Keep);
+    assert_eq!(decision("gba/Final Fantasy (USA) (Disc 2).gba"), sort::VariantDecision::Keep);
+    assert!(matches!(
+        decision("gba/Final Fantasy (Japan) (Disc 1).gba"),
+        sort::VariantDecision::SkipRegion { .. }
+    ));
+
+    // The auto-routed clone wars keeps (its group has one member).
+    assert_eq!(decision("loose/Clone Wars.zip"), sort::VariantDecision::Keep);
+
+    let ff_group = classification
+        .groups
+        .iter()
+        .find(|g| g.stem == "final fantasy")
+        .unwrap();
+    assert_eq!((ff_group.kept, ff_group.skipped_variants), (2, 1));
+}
+
+#[test]
+fn duplicates_within_winning_region_collapse_deterministically() {
+    let root = scratch("dupes");
+    fs::create_dir_all(root.join("gba")).unwrap();
+    fs::write(root.join("gba/Game (USA) [!].gba"), b"12345678").unwrap();
+    fs::write(root.join("gba/Game (USA).gba"), b"1234567890").unwrap();
+    let store = scratch("dupes-store");
+    let _guard = STORE_ENV_LOCK.lock();
+    std::env::set_var("CFW_STUDIO_DATA", &store);
+    let systems = smart_systems();
+    let mut embed = controlled_embed;
+    let (index, _) = index::ensure_index("dupes", &root, &systems, "w1", &mut embed).unwrap();
+    let mut progress = |_, _| {};
+    let classification =
+        sort::classify(&root, &systems, &[], &index, false, &[tags::Region::Usa], &mut embed, &mut progress).unwrap();
+    std::env::remove_var("CFW_STUDIO_DATA");
+
+    // Tie-break: shortest raw name wins ("Game (USA).gba").
+    let kept = classification.routes.iter().find(|r| r.variant == sort::VariantDecision::Keep).unwrap();
+    assert_eq!(kept.relative, "gba/Game (USA).gba");
+    let skipped = classification
+        .routes
+        .iter()
+        .find(|r| matches!(r.variant, sort::VariantDecision::SkipDuplicate { .. }))
+        .unwrap();
+    assert_eq!(skipped.relative, "gba/Game (USA) [!].gba");
+}
+
+#[test]
+fn review_ids_are_sequential_and_stable_across_runs() {
+    let first = classify_fixture("stable-a");
+    let second = classify_fixture("stable-b");
+    assert_eq!(first.needs_review, second.needs_review, "ids + rows identical across identical libraries");
+    assert_eq!(first.needs_review[0].review_id, "r1");
+}
+
+#[test]
+fn verify_resolutions_guards_size_and_validates_systems() {
+    let classification = classify_fixture("guard");
+    let systems = smart_systems();
+    let review = &classification.needs_review[0];
+
+    // Valid choice.
+    let mut ok = std::collections::HashMap::new();
+    ok.insert(review.review_id.clone(), sort::Resolution { system_id: Some("nes".into()), size: review.size });
+    let applied = sort::verify_resolutions(&classification, &systems, &ok).unwrap();
+    assert_eq!(applied.get("r1"), Some(&Some("nes".to_string())));
+
+    // Library changed since Preview (size differs): refuse.
+    let mut stale = std::collections::HashMap::new();
+    stale.insert("r1".into(), sort::Resolution { system_id: Some("nes".into()), size: review.size + 1 });
+    let err = sort::verify_resolutions(&classification, &systems, &stale).unwrap_err();
+    assert!(err.contains("preview again"), "got: {err}");
+
+    // Unknown system id is refused (enum-validated).
+    let mut hostile = std::collections::HashMap::new();
+    hostile.insert("r1".into(), sort::Resolution { system_id: Some("../evil".into()), size: review.size });
+    assert!(sort::verify_resolutions(&classification, &systems, &hostile).is_err());
+
+    // Unknown review id is refused.
+    let mut ghost = std::collections::HashMap::new();
+    ghost.insert("r99".into(), sort::Resolution { system_id: None, size: 1 });
+    assert!(sort::verify_resolutions(&classification, &systems, &ghost).is_err());
+}
+
+#[test]
+fn plan_smart_builds_destinations_resolutions_and_bios() {
+    let root = smart_library_fixture("plan");
+    fs::create_dir_all(root.join("BIOS")).unwrap();
+    fs::write(root.join("BIOS/scph.bin"), b"bios").unwrap();
+    let store = scratch("plan-store");
+    let _guard = STORE_ENV_LOCK.lock();
+    std::env::set_var("CFW_STUDIO_DATA", &store);
+    let systems = smart_systems();
+    let mut embed = controlled_embed;
+    let (index, _) = index::ensure_index("plan", &root, &systems, "w1", &mut embed).unwrap();
+    let mut progress = |_, _| {};
+    let classification =
+        sort::classify(&root, &systems, &[], &index, false, &[tags::Region::Usa], &mut embed, &mut progress).unwrap();
+    std::env::remove_var("CFW_STUDIO_DATA");
+
+    let review = &classification.needs_review[0];
+    let mut applied = std::collections::HashMap::new();
+    applied.insert(review.review_id.clone(), Some("nes".to_string()));
+
+    let dest_root = scratch("plan-dest");
+    let plan = sort::plan_smart(
+        &root,
+        &dest_root,
+        "rocknix_roms_nested",
+        &systems,
+        &classification,
+        &applied,
+        Some("bios"),
+    )
+    .unwrap();
+
+    let dests: Vec<&str> = plan.items.iter().map(|item| item.relative_dest.as_str()).collect();
+    // Tier-1 subpath preserved under the mapped prefix.
+    assert!(dests.contains(&"roms/nes/Zelda.nes"));
+    assert!(dests.contains(&"roms/gba/Final Fantasy (USA) (Disc 1).gba"));
+    // Tier-3 loose files land flat; the resolved review follows the user.
+    assert!(dests.contains(&"roms/gba/Clone Wars.zip"));
+    assert!(dests.contains(&"roms/nes/Mystery Game (Japan).zip"));
+    // Skipped variants are excluded.
+    assert!(!dests.iter().any(|d| d.contains("Europe")));
+    assert!(!dests.iter().any(|d| d.contains("Japan) (Disc 1).gba")));
+    // Bios mirrors plan_copy's handling (case-insensitive folder).
+    assert!(dests.contains(&"roms/bios/scph.bin"));
+
+    // Unresolved reviews block planning.
+    let empty = std::collections::HashMap::new();
+    let err = sort::plan_smart(
+        &root,
+        &dest_root,
+        "rocknix_roms_nested",
+        &systems,
+        &classification,
+        &empty,
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("need review"), "got: {err}");
+}

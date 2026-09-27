@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use profiles::Profile;
 use romcopy::CopyPlan;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use volume::{decide, VolumeDecision, VolumeInfo};
 
@@ -361,6 +361,175 @@ fn build_plan(
     )
 }
 
+// ---------------------------------------------------------------------
+// Smart sort (needle PR 4): classify + smart payload on plan/copy
+// ---------------------------------------------------------------------
+
+/// Optional smart-sort payload on plan_roms/copy_roms: region preference
+/// plus the user's review resolutions (opaque ids, preview-time sizes
+/// for the copy-time guard).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SmartPayload {
+    #[serde(default)]
+    regions: Vec<String>,
+    #[serde(default)]
+    resolutions: std::collections::HashMap<String, needle::sort::Resolution>,
+}
+
+fn parse_regions(raw: &[String]) -> Result<Vec<needle::tags::Region>, String> {
+    if raw.is_empty() {
+        return Ok(vec![needle::tags::Region::Usa]);
+    }
+    raw.iter()
+        .map(|region| match region.to_ascii_uppercase().as_str() {
+            "USA" => Ok(needle::tags::Region::Usa),
+            "EUR" | "EUROPE" => Ok(needle::tags::Region::Europe),
+            "JPN" | "JAPAN" => Ok(needle::tags::Region::Japan),
+            "WORLD" => Ok(needle::tags::Region::World),
+            other => Err(format!("unknown region preference {other:?}")),
+        })
+        .collect()
+}
+
+/// Resolves the cfw-embed helper: explicit override, beside the app,
+/// then the needle store cache.
+fn resolve_embed_helper() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("CFW_EMBED_EXE") {
+        let path = PathBuf::from(path.trim());
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("cfw-embed.exe")))?;
+    if beside.is_file() {
+        return Some(beside);
+    }
+    let cached = needle::acquire::cache_directories()
+        .iter()
+        .map(|dir| dir.join("cfw-embed.exe"))
+        .find(|path| path.is_file());
+    cached
+}
+
+/// Resolves verified weights from the needle cache (never downloads —
+/// downloads happen only through needle_acquire behind consent).
+fn resolve_weights() -> Option<PathBuf> {
+    let weights = needle::manifest::find("weights")?;
+    needle::acquire::cache_directories()
+        .iter()
+        .map(|dir| dir.join(weights.file_name))
+        .find(|path| {
+            path.is_file()
+                && std::fs::File::open(path)
+                    .ok()
+                    .and_then(|file| flash::sha256_reader(file).ok())
+                    .map(|hash| hash.eq_ignore_ascii_case(weights.sha256))
+                    .unwrap_or(false)
+        })
+}
+
+/// Runs classify + index ensure inside one helper session. Emits
+/// classify-progress and returns the classification.
+fn classify_with_engine(
+    app: &tauri::AppHandle,
+    profile: &Profile,
+    library: &Path,
+    include: &[String],
+    regions: &[needle::tags::Region],
+) -> Result<needle::sort::Classification, String> {
+    let helper = resolve_embed_helper()
+        .ok_or_else(|| "smart sort engine is not installed".to_string())?;
+    let weights = resolve_weights()
+        .ok_or_else(|| "smart sort engine is not installed".to_string())?;
+    let weights_tag = needle::manifest::find("weights")
+        .map(|weights| weights.sha256)
+        .unwrap_or("unknown");
+
+    needle::embed_client::with_helper(&helper, &weights, |session| {
+        let mut embed = |stem: &str| session.embed(stem);
+        let (index, rebuilt) = needle::index::ensure_index(
+            &profile.id,
+            library,
+            &profile.rom_schema.systems,
+            weights_tag,
+            &mut embed,
+        )?;
+        let classification = needle::sort::classify(
+            library,
+            &profile.rom_schema.systems,
+            include,
+            &index,
+            rebuilt,
+            regions,
+            &mut embed,
+            &mut |done, total| {
+                let _ = app.emit("classify-progress", format!("{done}/{total}"));
+            },
+        )?;
+        let routed = classification.routes.iter().filter(|r| r.variant == needle::sort::VariantDecision::Keep).count();
+        let review = classification.needs_review.len();
+        let skipped = classification.routes.len() - routed;
+        diag::log(
+            "info",
+            "needle_classify_done",
+            &format!("routed={routed} review={review} unmatched={skipped}"),
+        );
+        Ok(classification)
+    })
+}
+
+#[tauri::command]
+fn classify_library(
+    app: tauri::AppHandle,
+    profile_id: String,
+    library: String,
+    include: Vec<String>,
+    regions: Vec<String>,
+) -> Result<needle::sort::Classification, String> {
+    let profile = profile_by_id(&app, &profile_id)?;
+    let regions = parse_regions(&regions)?;
+    classify_with_engine(&app, &profile, Path::new(&library), &include, &regions)
+}
+
+/// Shared smart path for plan_roms/copy_roms: classify, verify
+/// resolutions against the fresh classification (the copy-time guard),
+/// and build the smart CopyPlan.
+fn smart_plan(
+    app: &tauri::AppHandle,
+    profile: &Profile,
+    volume: &VolumeInfo,
+    library: &Path,
+    include: &[String],
+    smart: &SmartPayload,
+) -> Result<CopyPlan, String> {
+    let regions = parse_regions(&smart.regions)?;
+    let classification = classify_with_engine(app, profile, library, include, &regions)?;
+    let applied = needle::sort::verify_resolutions(&classification, &profile.rom_schema.systems, &smart.resolutions)?;
+    let plan = needle::sort::plan_smart(
+        library,
+        &card_root(volume),
+        &profile.rom_schema.layout,
+        &profile.rom_schema.systems,
+        &classification,
+        &applied,
+        profile.rom_schema.bios_folder.as_deref(),
+    )?;
+    let variants = classification
+        .routes
+        .iter()
+        .filter(|r| r.variant != needle::sort::VariantDecision::Keep)
+        .count();
+    diag::log(
+        "info",
+        "needle_copy_smart",
+        &format!("files={} variants_skipped={variants}", plan.items.len()),
+    );
+    Ok(plan)
+}
+
 #[tauri::command]
 fn plan_roms(
     app: tauri::AppHandle,
@@ -368,10 +537,14 @@ fn plan_roms(
     volume_id: String,
     library: String,
     include: Vec<String>,
+    smart: Option<SmartPayload>,
 ) -> Result<PlanView, String> {
     let profile = profile_by_id(&app, &profile_id)?;
     let volume = require_volume(&volume_id)?;
-    let plan = build_plan(&profile, &volume, Path::new(&library), &include)?;
+    let plan = match &smart {
+        Some(smart) => smart_plan(&app, &profile, &volume, Path::new(&library), &include, smart)?,
+        None => build_plan(&profile, &volume, Path::new(&library), &include)?,
+    };
     Ok(plan_view(plan))
 }
 
@@ -383,6 +556,7 @@ fn copy_roms(
     library: String,
     include: Vec<String>,
     dry_run: bool,
+    smart: Option<SmartPayload>,
 ) -> Result<romcopy::CopyReport, String> {
     let profile = profile_by_id(&app, &profile_id)?;
     let volume = require_volume(&volume_id)?;
@@ -400,7 +574,13 @@ fn copy_roms(
             "refusing to copy onto this card: {reason}. Boot the handheld once until the game menu appears, shut it down from the menu, and put the card back."
         ));
     }
-    let plan = build_plan(&profile, &volume, Path::new(&library), &include)?;
+    // Smart copies re-classify here (embeddings are deterministic) and
+    // verify the review resolutions still match the library — the
+    // copy-time guard — before the unchanged moat takes over.
+    let plan = match &smart {
+        Some(smart) => smart_plan(&app, &profile, &volume, Path::new(&library), &include, smart)?,
+        None => build_plan(&profile, &volume, Path::new(&library), &include)?,
+    };
     diag::log(
         "INFO",
         "copy_start",
@@ -1095,7 +1275,8 @@ pub fn run() {
             stage_library,
             diagnostics_path,
             needle_status,
-            needle_acquire
+            needle_acquire,
+            classify_library
         ])
         .build(tauri::generate_context!())
         .expect("error while building the application")

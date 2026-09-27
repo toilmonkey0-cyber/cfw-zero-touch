@@ -104,7 +104,7 @@ pub fn clean_stem_of(path: &Path) -> String {
 // carry tags; the embedding tier exists for the ones that don't.
 // ---------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Region {
     Usa,
     Europe,

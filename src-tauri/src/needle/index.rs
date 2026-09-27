@@ -149,13 +149,17 @@ fn normalized_extension(ext: &str) -> String {
 // Library scan
 // ---------------------------------------------------------------------
 
-struct LibraryFile {
-    relative: PathBuf,
-    size: u64,
-    modified_ms: u64,
+pub struct LibraryFile {
+    pub relative: PathBuf,
+    pub size: u64,
+    pub modified_ms: u64,
 }
 
-fn walk_library(root: &Path) -> Result<Vec<LibraryFile>, String> {
+/// Deterministic library scan: every file with its library-relative
+/// path, size, and mtime, sorted by relative-path bytes (a total order
+/// — a relative path is unique within a library). Shared by index
+/// builds and classification.
+pub fn scan_library(root: &Path) -> Result<Vec<LibraryFile>, String> {
     let mut files = Vec::new();
     fn walk(dir: &Path, root: &Path, out: &mut Vec<LibraryFile>) -> Result<(), String> {
         let entries =
@@ -443,7 +447,7 @@ pub fn ensure_index(
     embed: &mut EmbedFn,
 ) -> Result<(LibraryIndex, bool), String> {
     let path = index_path(profile_id)?;
-    let files = walk_library(library)?;
+    let files = scan_library(library)?;
     let lib_fp = library_fingerprint(library, &files);
     let router = DeterministicRouter::from_systems(systems);
     let routing_fp = router.fingerprint();
