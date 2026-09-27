@@ -151,6 +151,31 @@ pub fn identify_family(facts: &CardFacts) -> CardFamily {
     if label == "easyroms" {
         return CardFamily::DarkosEasyroms;
     }
+    // App-filled clone card (and most post-setup clones): the r36s
+    // profile's flat lowercase system folders at the card root. Five or
+    // more known clone-system names is a fingerprint no stock layout
+    // shares (stock nests them under Roms/, caught above).
+    const CLONE_SYSTEM_FOLDERS: [&str; 12] = [
+        "gba",
+        "snes",
+        "nes",
+        "megadrive",
+        "gb",
+        "gbc",
+        "neogeo",
+        "pcengine",
+        "gamegear",
+        "mastersystem",
+        "arcade",
+        "psx",
+    ];
+    let flat_matches = lower_folders
+        .iter()
+        .filter(|f| CLONE_SYSTEM_FOLDERS.contains(&f.as_str()))
+        .count();
+    if flat_matches >= 5 {
+        return CardFamily::R36sClone;
+    }
     CardFamily::Unknown
 }
 
@@ -377,6 +402,23 @@ pub fn collect_facts(
             if entry.path().is_dir() {
                 if let Some(name) = entry.file_name().to_str() {
                     root_folders.push(name.to_string());
+                    // Stock layouts nest their system folders under a
+                    // top-level Roms dir; the second-level names are the
+                    // family fingerprints (roms/psp, roms/fc, ...), so
+                    // surface them as roms/<child> entries.
+                    if name.eq_ignore_ascii_case("roms") {
+                        if let Ok(children) = std::fs::read_dir(entry.path()) {
+                            for child in children.flatten() {
+                                if child.path().is_dir() && root_folders.len() < 64 {
+                                    if let Some(child_name) = child.file_name().to_str() {
+                                        root_folders.push(
+                                            format!("{name}/{child_name}").to_ascii_lowercase(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

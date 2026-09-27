@@ -197,7 +197,7 @@ fn collect_files(
     Ok(())
 }
 
-fn extension_matches(path: &Path, extensions: &[String]) -> bool {
+pub(crate) fn extension_matches(path: &Path, extensions: &[String]) -> bool {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())

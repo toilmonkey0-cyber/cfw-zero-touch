@@ -990,6 +990,80 @@ fn duplicates_within_winning_region_collapse_deterministically() {
 }
 
 #[test]
+fn plan_smart_marks_copy_when_the_dest_size_differs() {
+    // plan_copy skips only byte-size-equal destinations; the smart
+    // planner used to skip on bare existence, hiding stale files.
+    let root = smart_library_fixture("stale-dest");
+    let store = scratch("stale-dest-store");
+    let _guard = STORE_ENV_LOCK.lock();
+    std::env::set_var("CFW_STUDIO_DATA", &store);
+    let systems = smart_systems();
+    let mut embed = controlled_embed;
+    let (index, _) = index::ensure_index("stale", &root, &systems, None, "w1", &mut embed).unwrap();
+    let mut progress = |_, _| {};
+    let classification = sort::classify(
+        &root,
+        &systems,
+        &[],
+        None,
+        &index,
+        false,
+        &[tags::Region::Usa],
+        &mut embed,
+        &mut progress,
+    )
+    .unwrap();
+    std::env::remove_var("CFW_STUDIO_DATA");
+
+    // Skip every review row (loose files) - they are not under test.
+    let applied: std::collections::HashMap<String, Option<String>> = classification
+        .needs_review
+        .iter()
+        .map(|row| (row.review_id.clone(), None))
+        .collect();
+
+    let dest_root = scratch("stale-dest-card");
+    let dest = dest_root.join("roms/gba/Advance Wars (U).gba");
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+    fs::write(&dest, b"stale-bytes").unwrap(); // wrong size
+    let plan = sort::plan_smart(
+        &root,
+        &dest_root,
+        "rocknix_roms_nested",
+        &systems,
+        &classification,
+        &applied,
+        None,
+    )
+    .unwrap();
+    let item = plan
+        .items
+        .iter()
+        .find(|i| i.relative_dest == "roms/gba/Advance Wars (U).gba")
+        .unwrap();
+    assert_eq!(item.action, CopyAction::Copy, "stale dest re-copies");
+
+    fs::write(&dest, b"rom-bytes").unwrap(); // fixture files are b"rom-bytes"
+    let plan = sort::plan_smart(
+        &root,
+        &dest_root,
+        "rocknix_roms_nested",
+        &systems,
+        &classification,
+        &applied,
+        None,
+    )
+    .unwrap();
+    let item = plan
+        .items
+        .iter()
+        .find(|i| i.relative_dest == "roms/gba/Advance Wars (U).gba")
+        .unwrap();
+    assert_eq!(item.action, CopyAction::SkipUnchanged);
+}
+
+#[test]
 fn review_ids_are_sequential_and_stable_across_runs() {
     let first = classify_fixture("stable-a");
     let second = classify_fixture("stable-b");
@@ -1493,6 +1567,50 @@ fn family_identification_reads_layout_signatures() {
 }
 
 #[test]
+fn identify_family_reads_real_card_shapes() {
+    // Flat app-filled clone card (the r36s profile layout, label ROMS).
+    let mut facts = doctor_facts();
+    facts.volume_label = "ROMS".into();
+    facts.root_folders = [
+        "bios",
+        "gb",
+        "gba",
+        "gbc",
+        "megadrive",
+        "nes",
+        "pcengine",
+        "snes",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(doctor::identify_family(&facts), CardFamily::R36sClone);
+
+    // A flat ArkOS card is still easyroms — the label rule outranks the
+    // flat signature.
+    facts.volume_label = "EASYROMS".into();
+    assert_eq!(doctor::identify_family(&facts), CardFamily::DarkosEasyroms);
+
+    // Stock clone partition: collect_facts surfaces the second-level
+    // Roms/* names the fingerprints read.
+    let card = scratch("doctor-stock");
+    for sub in ["Roms/PSP", "Roms/NEOGEO", "bios"] {
+        fs::create_dir_all(card.join(sub)).unwrap();
+    }
+    let facts = doctor::collect_facts(
+        &facts_volume(),
+        "ready",
+        "",
+        vec![],
+        &CardSafety::Safe,
+        &card,
+    );
+    assert!(facts.root_folders.iter().any(|f| f == "roms/psp"));
+    assert!(facts.root_folders.iter().any(|f| f == "roms/neogeo"));
+    assert_eq!(doctor::identify_family(&facts), CardFamily::R36sClone);
+}
+
+#[test]
 fn engine_turns_are_vocabulary_validated() {
     let good = serde_json::json!({
         "card_family": "r35s_stock",
@@ -1755,6 +1873,39 @@ fn plan_incoming_maps_destinations_back_to_systems() {
     assert_eq!(incoming.len(), 1, "copy items in a mapped system only");
     assert_eq!(incoming[0].system_id, "gba");
     assert_eq!(incoming[0].relative_dest, "roms/gba/Game.gba");
+}
+
+#[test]
+fn scan_card_lists_only_game_files_the_system_accepts() {
+    // Live-QA case: a video sharing a stem with a game (pulsar.mp4 vs
+    // pulsar.zip) must never become a dedupe resident.
+    let card = scratch("dedupe-ext");
+    fs::create_dir_all(card.join("neogeo/downloaded_videos")).unwrap();
+    fs::write(card.join("neogeo/pulsar.zip"), b"rom").unwrap();
+    fs::write(card.join("neogeo/downloaded_videos/pulsar.mp4"), b"vid").unwrap();
+    fs::write(card.join("neogeo/notes.txt"), b"n").unwrap();
+    let systems = vec![system("neogeo", "neogeo", &[".zip"])];
+    let residents = dedupe::scan_card(&card, "arkos_easyroms_root", &systems);
+    let dests: Vec<&str> = residents.iter().map(|r| r.relative_dest.as_str()).collect();
+    assert_eq!(dests, vec!["neogeo/pulsar.zip"]);
+
+    // A card holding ONLY the video: no residents at all, so a
+    // same-stem incoming game groups nothing.
+    let video_only = scratch("dedupe-ext-video");
+    fs::create_dir_all(video_only.join("neogeo/downloaded_videos")).unwrap();
+    fs::write(
+        video_only.join("neogeo/downloaded_videos/pulsar.mp4"),
+        b"vid",
+    )
+    .unwrap();
+    let residents = dedupe::scan_card(&video_only, "arkos_easyroms_root", &systems);
+    assert!(
+        residents.is_empty(),
+        "videos never residents: {residents:?}"
+    );
+    let incoming = vec![incoming("neogeo", "neogeo/Pulsar (U).zip", 8)];
+    let mut embed = dedupe_embed;
+    assert!(dedupe::group_duplicates(&residents, &incoming, &mut embed).is_empty());
 }
 
 #[test]

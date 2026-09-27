@@ -506,8 +506,12 @@ pub fn plan_smart(
 
     // A destination that already exists on the card is skipped
     // (plan_copy's SkipUnchanged semantics; execute_copy decides bytes).
-    let action_for = |relative_dest: &str| {
-        if dest_root.join(relative_dest).is_file() {
+    // A destination that already exists byte-identical in size is
+    // skipped (plan_copy's SkipUnchanged semantics; execute_copy
+    // decides bytes).
+    let action_for = |relative_dest: &str, bytes: u64| {
+        let dest = dest_root.join(relative_dest);
+        if dest.is_file() && dest.metadata().map(|m| m.len()).unwrap_or(0) == bytes {
             CopyAction::SkipUnchanged
         } else {
             CopyAction::Copy
@@ -546,7 +550,7 @@ pub fn plan_smart(
         let relative_dest = safe_relative_dest(&prefix, &sub)?;
         items.push(CopyItem {
             source: library.join(&route.relative),
-            action: action_for(&relative_dest),
+            action: action_for(&relative_dest, route.size),
             relative_dest,
             bytes: route.size,
         });
@@ -578,7 +582,7 @@ pub fn plan_smart(
         let relative_dest = safe_relative_dest(&prefix, &sub)?;
         items.push(CopyItem {
             source: library.join(&row.relative),
-            action: action_for(&relative_dest),
+            action: action_for(&relative_dest, row.size),
             relative_dest,
             bytes: row.size,
         });
@@ -616,7 +620,10 @@ pub fn plan_smart(
                     let relative_dest = safe_relative_dest(&prefix, &sub)?;
                     items.push(CopyItem {
                         source: path,
-                        action: action_for(&relative_dest),
+                        action: action_for(
+                            &relative_dest,
+                            entry.metadata().map(|m| m.len()).unwrap_or(0),
+                        ),
                         relative_dest,
                         bytes: entry.metadata().map(|m| m.len()).unwrap_or(0),
                     });

@@ -165,9 +165,11 @@ pub fn group_duplicates(
     out
 }
 
-/// Scans the card's mapped system folders for resident files. Bios and
-/// unmapped folders are skipped. Missing folders are empty, never an
-/// error.
+/// Scans the card's mapped system folders for resident games. Only
+/// files the system accepts (its extension list, case-insensitive) are
+/// residents — videos, saves and notes that happen to share a folder
+/// never match incoming games by stem. Bios and unmapped folders are
+/// skipped. Missing folders are empty, never an error.
 pub fn scan_card(dest_root: &Path, layout: &str, systems: &[SystemFolder]) -> Vec<ResidentFile> {
     let mut residents = Vec::new();
     for system in systems {
@@ -188,6 +190,9 @@ pub fn scan_card(dest_root: &Path, layout: &str, systems: &[SystemFolder]) -> Ve
             }
             if !path.is_file() {
                 continue;
+            }
+            if !crate::romcopy::extension_matches(&path, &system.extensions) {
+                continue; // e.g. neogeo/downloaded_videos/pulsar.mp4
             }
             let stem =
                 super::tags::clean_stem(path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
