@@ -1427,6 +1427,51 @@ fn collect_facts_caps_root_folders_and_serializes_cleanly() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn junctioned_library_folders_scan_their_targets_not_the_links() {
+    // A ROM bridge built as NTFS junctions: roms/gba -> real/GBA. The
+    // scan must follow the links (finding the real ROMs once) instead
+    // of reading each junction as a stray no-extension file.
+    let real = scratch("junction-real");
+    fs::create_dir_all(real.join("GBA")).unwrap();
+    fs::write(real.join("GBA/Advance Wars (U).gba"), b"rom").unwrap();
+    let lib = scratch("junction-lib");
+    fs::create_dir_all(&lib).unwrap();
+    let mkjunction = |name: &str| {
+        std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                name,
+                real.join("GBA").as_os_str().to_string_lossy().as_ref(),
+            ])
+            .current_dir(&lib)
+            .output()
+            .unwrap_or_else(|error| panic!("could not run mklink: {error}"))
+    };
+    let status = mkjunction("gba");
+    assert!(status.status.success(), "mklink /J failed: {status:?}");
+
+    let files = index::scan_library(&lib).unwrap();
+    let rels: Vec<String> = files
+        .iter()
+        .map(|f| f.relative.to_string_lossy().replace('\\', "/"))
+        .collect();
+    assert_eq!(
+        rels,
+        vec!["gba/Advance Wars (U).gba".to_string()],
+        "the junction must resolve to its target file: {rels:?}"
+    );
+
+    // Two junctions to one target collapse to one scan of it.
+    let status = mkjunction("gba2");
+    assert!(status.status.success(), "mklink /J failed: {status:?}");
+    let files = index::scan_library(&lib).unwrap();
+    assert_eq!(files.len(), 1, "duplicate link target counted once");
+}
+
 #[test]
 fn marker_summary_lists_only_watched_boot_files() {
     let boot = scratch("doctor-boot");

@@ -159,18 +159,33 @@ pub struct LibraryFile {
 /// path, size, and mtime, sorted by relative-path bytes (a total order
 /// — a relative path is unique within a library). Shared by index
 /// builds and classification.
+///
+/// Junction/symlinked folders are followed (ROM bridges are routinely
+/// built as links); a canonical-path visited set guards link cycles and
+/// collapses two links pointing at the same target.
 pub fn scan_library(root: &Path) -> Result<Vec<LibraryFile>, String> {
     let mut files = Vec::new();
-    fn walk(dir: &Path, root: &Path, out: &mut Vec<LibraryFile>) -> Result<(), String> {
+    fn walk(
+        dir: &Path,
+        root: &Path,
+        out: &mut Vec<LibraryFile>,
+        visited: &mut std::collections::HashSet<PathBuf>,
+    ) -> Result<(), String> {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if !visited.insert(canonical) {
+            return Ok(()); // link cycle or an already-scanned target
+        }
         let entries = fs::read_dir(dir)
             .map_err(|error| format!("could not read {}: {error}", dir.display()))?;
         for entry in entries.flatten() {
             let path = entry.path();
-            let meta = entry
-                .metadata()
-                .map_err(|error| format!("could not stat {}: {error}", path.display()))?;
+            // Follows links (fs::metadata, unlike entry.metadata, resolves
+            // reparse points); a broken link is skipped, not fatal.
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
             if meta.is_dir() {
-                walk(&path, root, out)?;
+                walk(&path, root, out, visited)?;
                 continue;
             }
             if out.len() >= MAX_LIBRARY_FILES {
@@ -197,7 +212,8 @@ pub fn scan_library(root: &Path) -> Result<Vec<LibraryFile>, String> {
         }
         Ok(())
     }
-    walk(root, root, &mut files)?;
+    let mut visited = std::collections::HashSet::new();
+    walk(root, root, &mut files, &mut visited)?;
     // Deterministic order: relative path bytes.
     files.sort_by(|a, b| {
         a.relative
