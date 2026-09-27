@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use cfw_zero_touch_lib::flash;
 use cfw_zero_touch_lib::needle::acquire;
+use cfw_zero_touch_lib::needle::embed_client::{self, EmbedHelper};
 use cfw_zero_touch_lib::needle::manifest::{self, ArtifactRole};
 
 fn scratch(name: &str) -> PathBuf {
@@ -233,4 +234,70 @@ fn status_for_reports_presence_and_verification() {
     let e = by_id("serve-engine");
     assert!(e.present, "file with the right name is present");
     assert!(!e.verified, "wrong bytes are not verified");
+}
+
+#[test]
+fn stems_are_validated_before_reaching_the_helper() {
+    assert!(embed_client::validate_stem("Final Fantasy VII (USA)").is_ok());
+    assert!(embed_client::validate_stem("  spaces  ").is_ok());
+    assert!(embed_client::validate_stem("").is_err());
+    assert!(embed_client::validate_stem("line\nbreak").is_err());
+    assert!(embed_client::validate_stem("tab\there").is_err());
+    assert!(embed_client::validate_stem("nul\0byte").is_err());
+    assert!(embed_client::validate_stem(&"x".repeat(embed_client::MAX_STEM_BYTES + 1)).is_err());
+    assert!(embed_client::validate_stem(&"x".repeat(embed_client::MAX_STEM_BYTES)).is_ok());
+}
+
+#[test]
+fn float_lines_parse_and_bad_input_is_rejected() {
+    let parsed = embed_client::parse_floats("0.5 -0.25 1.00000004e-3").unwrap();
+    assert_eq!(parsed, vec![0.5, -0.25, 1.00000004e-3]);
+    assert!(embed_client::parse_floats("").unwrap().is_empty());
+    assert!(embed_client::parse_floats("0.5 nan-inf").is_err());
+    assert!(embed_client::parse_floats("not-a-float").is_err());
+}
+
+/// Real-helper integration test, run only when CFW_NEEDLE_TEST=1 and the
+/// helper + weights are provided:
+///   CFW_NEEDLE_TEST=1
+///   CFW_NEEDLE_EMBED_EXE=...\cfw-embed.exe
+///   CFW_NEEDLE_WEIGHTS=...\needle3.cact
+/// Mirrors the CFW_IGIR_TEST pattern: offline CI skips this entirely.
+#[test]
+fn real_helper_embeds_deterministically_within_budget() {
+    if std::env::var("CFW_NEEDLE_TEST").ok().as_deref() != Some("1") {
+        eprintln!("skipping: CFW_NEEDLE_TEST not set");
+        return;
+    }
+    let exe = std::env::var("CFW_NEEDLE_EMBED_EXE").expect("CFW_NEEDLE_EMBED_EXE required");
+    let weights = std::env::var("CFW_NEEDLE_WEIGHTS").expect("CFW_NEEDLE_WEIGHTS required");
+    let exe = PathBuf::from(exe);
+    let weights = PathBuf::from(weights);
+    assert!(exe.is_file(), "helper exe missing: {}", exe.display());
+    assert!(weights.is_file(), "weights missing: {}", weights.display());
+
+    let mut helper = EmbedHelper::spawn(&exe, &weights).expect("helper should spawn");
+    let dim = helper.ping().expect("ping");
+    assert_eq!(dim, 3072, "weights report the expected dimension");
+
+    let a1 = helper.embed("Final Fantasy VII (USA)").expect("embed 1");
+    let a2 = helper.embed("Final Fantasy VII (USA)").expect("embed 2");
+    assert_eq!(a1.len(), dim);
+    assert_eq!(a1, a2, "embedding must be deterministic (copy-time guard depends on it)");
+
+    let b = helper.embed("Panzer Dragoon Saga (USA)").expect("embed 3");
+    assert_ne!(a1, b, "different titles must embed differently");
+
+    let many = helper.embed_many(&["Chrono Cross", "Nights into Dreams"]).expect("embed_many");
+    assert_eq!(many.len(), 2);
+    assert!(many.iter().all(|v| v.len() == dim));
+
+    let start = std::time::Instant::now();
+    for i in 0..20 {
+        helper.embed(&format!("latency probe {i}")).expect("latency embed");
+    }
+    let per = start.elapsed() / 20;
+    assert!(per < std::time::Duration::from_millis(250), "embed too slow: {per:?}");
+
+    helper.kill();
 }

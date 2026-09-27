@@ -946,3 +946,45 @@ verified live.
   real RK3326 hardware; any card-writing helper work is a follow-up
   that goes through the full gate review (it writes to cards *outside*
   the PC moat, so it earns its own safety section).
+
+## Implementation amendment — PR 2a (2026-09-26)
+
+The PR 2a entry criterion (does the shipped `libneedle.a` link under the
+Windows toolchain?) was tested live. Outcomes, all verified against the
+pinned artifacts at revision `b274efcb`:
+
+1. **MSVC `link.exe` rejects the archive** — `LNK1143: no symbol for COMDAT
+   section` on `needle.cpp.obj`. The archive's COMDAT form is GCC/LLVM-style;
+   this is an object-format incompatibility, not a missing-library problem.
+2. **Rust `x86_64-pc-windows-gnu` cannot link it cleanly either** — the
+   engine needs LLVM libc++ (`std::__1` symbols) and the vendor targets
+   UCRT (needle.exe imports `api-ms-win-crt-*` only), while Rust's gnu
+   target links its own msvcrt-based `crt2.o`; the two CRTs collide.
+3. **llvm-mingw clang++ links it exactly as the vendor did** — this is the
+   PR 2a recipe: `tools/cfw-embed/cfw-embed.cpp`, a small C++ helper built
+   by `tools/cfw-embed/build.ps1` with a pinned llvm-mingw toolchain
+   (`-static`, static libc++/libunwind, no extra DLLs). Measured against
+   the real weights: dimension 3072, byte-identical determinism for
+   repeated embeds, ~4.4 ms per embed (~6 ms over pipes), helper survives
+   malformed ops, clean exit on stdin close.
+
+Deviations from the original PR 2a sketch, recorded here as the plan of
+record for 2b:
+
+- `cfw-embed` is C++ built by the llvm-mingw script (or a future CI job),
+  not a `src-tauri/src/bin/*.rs` cargo binary and not vendored through
+  `build.rs`. Consequently the design's "local build without them fails
+  with instructions" becomes: the helper is built out-of-tree; the app
+  resolves it at runtime (`CFW_EMBED_EXE`, beside the exe, store cache).
+- The app?helper wire format is the length-prefixed line protocol
+  documented in `src-tauri/src/needle/embed_client.rs`
+  (`PING`/`EMBED <len>`), not JSONL: a foreign-toolchain helper gets no
+  hand-rolled JSON parser. App?frontend stays JSON via Tauri.
+- A manifest row pinning a CI-built `cfw-embed.exe` download lands with
+  the CI job that first publishes it (follow-up to this PR); until then
+  the helper is developer-built via the script.
+- `embed_client.rs` ships in PR 2a as designed (spawn/protocol/lifecycle,
+  idle-kill after 5 min, `kill_all` wired to `RunEvent::Exit`), with
+  offline codec tests plus the `CFW_NEEDLE_TEST=1` real-helper test
+  (determinism, dimension, latency budget) mirroring the `CFW_IGIR_TEST`
+  pattern.

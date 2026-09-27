@@ -1097,6 +1097,12 @@ pub fn run() {
             needle_status,
             needle_acquire
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building the application")
+        .run(|_app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                // No helper process may outlive the app.
+                needle::embed_client::kill_all();
+            }
+        });
 }

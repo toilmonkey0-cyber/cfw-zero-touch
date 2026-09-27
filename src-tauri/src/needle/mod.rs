@@ -10,4 +10,5 @@
 //! network on its own.
 
 pub mod acquire;
+pub mod embed_client;
 pub mod manifest;

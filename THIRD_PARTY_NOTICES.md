@@ -26,3 +26,17 @@ serve engine are runtime downloads under `%LOCALAPPDATA%\cfw-card-studio\needle`
 Telemetry is disabled on everything the app spawns
 (`NEEDLE_TELEMETRY=0`, `DO_NOT_TRACK=1`), and inference itself never
 touches the network.
+
+## LLVM libc++ / libunwind and the llvm-mingw toolchain
+
+`cfw-embed` (built by `tools/cfw-embed/build.ps1`) statically links LLVM's
+libc++ and libunwind from the llvm-mingw toolchain
+(https://github.com/mstorsjo/llvm-mingw, releases under the Apache-2.0
+license; toolchain by Martin Storsjö and contributors).
+
+- **libc++ and libunwind** are covered by the Apache License 2.0 WITH
+  LLVM Exception — https://llvm.org/foundation/relicensing/ — copyright
+  © 2010-2026 the libc++ and libunwind authors (LLVM Project).
+- Static linkage embeds those runtime routines into `cfw-embed.exe`; the
+  object code remains under its license with this notice retained.
+
