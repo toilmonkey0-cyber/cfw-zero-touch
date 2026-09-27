@@ -11,6 +11,7 @@
 
 pub mod acquire;
 pub mod client;
+pub mod dedupe;
 pub mod doctor;
 pub mod embed_client;
 pub mod index;

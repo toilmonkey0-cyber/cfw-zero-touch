@@ -41,6 +41,12 @@ type PlanView = {
   warning: string | null;
   copyCount: number;
   skipCount: number;
+  duplicates: {
+    systemId: string;
+    resident: string;
+    incoming: { relativeDest: string; size: number; similarity: number }[];
+  }[];
+  duplicateSkipped: number;
 };
 
 type CopyReport = { copied: number; skipped: number; bytesCopied: number };
@@ -165,6 +171,7 @@ export default function App() {
   const [engineMessage, setEngineMessage] = useState("");
   const [classification, setClassification] = useState<Classification | null>(null);
   const [resolutions, setResolutions] = useState<Record<string, Resolution>>({});
+  const [dedupeKeep, setDedupeKeep] = useState<string[]>([]);
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [doctorBusy, setDoctorBusy] = useState(false);
   const [doctorEngine, setDoctorEngine] = useState(false);
@@ -463,6 +470,7 @@ export default function App() {
     setStageSummary("");
     setClassification(null);
     setResolutions({});
+    setDedupeKeep([]);
   }
 
   function setSortChoice(mode: SortMode) {
@@ -585,13 +593,29 @@ export default function App() {
         library,
         include: included,
         smart: { regions, resolutions },
+        dedupe: { keep: dedupeKeep },
       });
       setPlan(next);
+      // Grouped files default to skip; the preview keeps the user's
+      // per-group choices in dedupeKeep.
+      setDedupeKeep((current) =>
+        current.filter((dest) =>
+          next.duplicates.some((group) =>
+            group.incoming.some((item) => item.relativeDest === dest),
+          ),
+        ),
+      );
     } catch (cause) {
       setError(String(cause));
     } finally {
       setBusy(false);
     }
+  }
+
+  function toggleDedupeKeep(dest: string) {
+    setDedupeKeep((current) =>
+      current.includes(dest) ? current.filter((item) => item !== dest) : [...current, dest],
+    );
   }
 
   function setResolution(reviewId: string, systemId: string | null) {
@@ -624,7 +648,9 @@ export default function App() {
         library: stagedLibrary || library,
         include: included,
         dryRun: false,
-        ...(sortMode === "smart" ? { smart: { regions, resolutions } } : {}),
+        ...(sortMode === "smart"
+          ? { smart: { regions, resolutions }, dedupe: { keep: dedupeKeep } }
+          : {}),
       });
       setReport(next);
       setStep("done");
@@ -1077,7 +1103,58 @@ export default function App() {
           {plan && !plan.warning ? (
             <p>
               {plan.copyCount} to copy, {plan.skipCount} already on the card.
+              {plan.duplicateSkipped > 0
+                ? ` ${plan.duplicateSkipped} look${plan.duplicateSkipped === 1 ? "s" : ""} like games already on the card (skipped).`
+                : ""}
             </p>
+          ) : null}
+          {plan && plan.duplicates.length > 0 ? (
+            <div className="review">
+              <h3>
+                {plan.duplicates.reduce((total, group) => total + group.incoming.length, 0)} file
+                {plan.duplicates.reduce((total, group) => total + group.incoming.length, 0) === 1
+                  ? " looks"
+                  : "s look"}{" "}
+                like {plan.duplicates.length === 1 ? "a game" : "games"} already on the card
+              </h3>
+              <p>
+                Keep the checkbox ticked to copy a file anyway. Unticked files stay off the
+                card; nothing already on the card is touched.
+              </p>
+              <div className="row">
+                <button disabled={busy} onClick={() => void planWithSmart()}>
+                  Re-preview with these choices
+                </button>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Already on the card</th>
+                    <th>Incoming</th>
+                    <th>Match</th>
+                    <th>Copy anyway</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {plan.duplicates.map((group) =>
+                    group.incoming.map((item) => (
+                      <tr key={item.relativeDest}>
+                        <td className="path">{group.resident}</td>
+                        <td className="path">{item.relativeDest}</td>
+                        <td>{`${Math.round(item.similarity * 100)}%`}</td>
+                        <td>
+                          <input
+                            type="checkbox"
+                            checked={dedupeKeep.includes(item.relativeDest)}
+                            onChange={() => toggleDedupeKeep(item.relativeDest)}
+                          />
+                        </td>
+                      </tr>
+                    )),
+                  )}
+                </tbody>
+              </table>
+            </div>
           ) : null}
           {progress ? <p>{progress}</p> : null}
           {plan ? (

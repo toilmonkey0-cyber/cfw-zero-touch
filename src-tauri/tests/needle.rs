@@ -1434,3 +1434,258 @@ fn marker_summary_lists_only_watched_boot_files() {
     );
     assert!(doctor::marker_summary(None).is_empty());
 }
+
+// ------------------------------------------------------------------
+// PR 8: embedding dedupe in copy preview (offline, injected embeddings)
+// ------------------------------------------------------------------
+use cfw_zero_touch_lib::needle::dedupe::{self, IncomingFile, ResidentFile};
+use cfw_zero_touch_lib::romcopy::{CopyAction, CopyItem, CopyPlan};
+
+/// Same hand-picked vectors as the PR 4 fixture, plus the dedupe legs:
+// - "advance wars" vs "clone wars" sit at ~0.999 (same game, grouped);
+// - "mystery game" sits at 0.8 vs "advance wars" (review, never grouped);
+// - "golden sun" is orthogonal (different game, never grouped).
+fn dedupe_embed(stem: &str) -> Result<Vec<f32>, String> {
+    match stem {
+        "advance wars" => Ok(vec![1.0, 0.0, 0.0, 0.0]),
+        "clone wars" => Ok(vec![0.999, 0.0447, 0.0, 0.0]),
+        "golden sun" => Ok(vec![0.0, 1.0, 0.0, 0.0]),
+        "mystery game" => Ok(vec![0.8, 0.0, 0.6, 0.0]),
+        _ => Ok(vec![0.25, 0.25, 0.25, 0.25]),
+    }
+}
+
+fn dedupe_systems() -> Vec<SystemFolder> {
+    vec![
+        system("gba", "gba", &[".gba", ".zip"]),
+        system("nes", "nes", &[".nes", ".zip"]),
+    ]
+}
+
+fn resident(system: &str, dest: &str) -> ResidentFile {
+    ResidentFile {
+        system_id: system.into(),
+        stem: tags::clean_stem(dest.rsplit('/').next().unwrap_or(dest)),
+        relative_dest: dest.into(),
+    }
+}
+
+fn incoming(system: &str, dest: &str, size: u64) -> IncomingFile {
+    IncomingFile {
+        system_id: system.into(),
+        stem: tags::clean_stem(dest.rsplit('/').next().unwrap_or(dest)),
+        relative_dest: dest.into(),
+        size,
+    }
+}
+
+#[test]
+fn near_identical_stems_group_within_one_system() {
+    let residents = vec![resident("gba", "gba/Advance Wars (U).gba")];
+    let incoming = vec![incoming("gba", "gba/Advance Wars (USA) [!].gba", 8)];
+    let mut embed = dedupe_embed;
+    let groups = dedupe::group_duplicates(&residents, &incoming, &mut embed);
+    assert_eq!(groups.len(), 1, "same game, same system: one group");
+    assert_eq!(groups[0].system_id, "gba");
+    assert_eq!(groups[0].resident, "gba/Advance Wars (U).gba");
+    assert_eq!(groups[0].incoming.len(), 1);
+    assert!(
+        groups[0].incoming[0].similarity >= dedupe::DEDUPE_SIM,
+        "similarity: {}",
+        groups[0].incoming[0].similarity
+    );
+}
+
+#[test]
+fn unrelated_and_cross_system_stems_never_group() {
+    let residents = vec![
+        resident("gba", "gba/Advance Wars (U).gba"),
+        resident("gba", "gba/Golden Sun (USA).gba"),
+    ];
+    let incoming = vec![
+        incoming("gba", "gba/Mystery Game (Japan).zip", 3),
+        incoming("nes", "nes/Advance Wars (USA) [!].nes", 8),
+    ];
+    let mut embed = dedupe_embed;
+    let groups = dedupe::group_duplicates(&residents, &incoming, &mut embed);
+    assert!(
+        groups.is_empty(),
+        "0.8 similarity and cross-system pairs group nothing: {groups:?}"
+    );
+}
+
+#[test]
+fn scan_card_lists_mapped_system_files_only() {
+    let card = scratch("dedupe-card");
+    fs::create_dir_all(card.join("gba")).unwrap();
+    fs::write(card.join("gba/Advance Wars (U).gba"), b"resident").unwrap();
+    fs::write(card.join("gba/notes.txt"), b"resident").unwrap();
+    fs::create_dir_all(card.join("unmapped")).unwrap();
+    fs::write(card.join("unmapped/stray.gba"), b"x").unwrap();
+    let residents = dedupe::scan_card(&card, "arkos_easyroms_root", &dedupe_systems());
+    let dests: Vec<&str> = residents
+        .iter()
+        .map(|r| r.relative_dest.as_str())
+        .collect();
+    assert!(dests.contains(&"gba/Advance Wars (U).gba"));
+    assert!(
+        !dests.iter().any(|d| d.contains("unmapped")),
+        "unmapped folders are skipped: {dests:?}"
+    );
+    assert!(
+        residents.iter().all(|r| r.system_id == "gba"),
+        "mapped through the gba system: {residents:?}"
+    );
+}
+
+#[test]
+fn plan_incoming_maps_destinations_back_to_systems() {
+    let plan = CopyPlan {
+        items: vec![
+            CopyItem {
+                source: PathBuf::from("lib/gba/Game.gba"),
+                relative_dest: "roms/gba/Game.gba".into(),
+                bytes: 4,
+                action: CopyAction::Copy,
+            },
+            CopyItem {
+                source: PathBuf::from("lib/skip.gba"),
+                relative_dest: "roms/gba/Skip.gba".into(),
+                bytes: 4,
+                action: CopyAction::SkipUnchanged,
+            },
+            CopyItem {
+                source: PathBuf::from("lib/bios/scph.bin"),
+                relative_dest: "roms/bios/scph.bin".into(),
+                bytes: 4,
+                action: CopyAction::Copy,
+            },
+        ],
+        warning: None,
+    };
+    let incoming =
+        dedupe::plan_incoming(&plan, "rocknix_roms_nested", &dedupe_systems());
+    assert_eq!(incoming.len(), 1, "copy items in a mapped system only");
+    assert_eq!(incoming[0].system_id, "gba");
+    assert_eq!(incoming[0].relative_dest, "roms/gba/Game.gba");
+}
+
+#[test]
+fn apply_keep_choices_defaults_to_skip_and_never_touches_residents() {
+    let residents = vec![resident("gba", "gba/Advance Wars (U).gba")];
+    let incoming = vec![
+        incoming("gba", "gba/Advance Wars (USA) [!].gba", 8),
+        incoming("gba", "gba/Golden Sun (USA).gba", 7),
+    ];
+    let mut embed = dedupe_embed;
+    let groups = dedupe::group_duplicates(&residents, &incoming, &mut embed);
+    assert_eq!(groups.len(), 1, "only the renamed twin groups");
+
+    let plan = CopyPlan {
+        items: vec![
+            CopyItem {
+                source: PathBuf::from("lib/a"),
+                relative_dest: "gba/Advance Wars (USA) [!].gba".into(),
+                bytes: 8,
+                action: CopyAction::Copy,
+            },
+            CopyItem {
+                source: PathBuf::from("lib/b"),
+                relative_dest: "gba/Golden Sun (USA).gba".into(),
+                bytes: 7,
+                action: CopyAction::Copy,
+            },
+        ],
+        warning: None,
+    };
+    // Default: grouped incoming is skipped, the ungrouped game stays.
+    let (filtered, removed) =
+        dedupe::apply_keep_choices(plan, &groups, &std::collections::HashSet::new());
+    assert_eq!(removed, 1);
+    assert_eq!(filtered.items.len(), 1);
+    assert_eq!(
+        filtered.items[0].relative_dest,
+        "gba/Golden Sun (USA).gba"
+    );
+
+    // Explicit keep restores the grouped file.
+    let plan = CopyPlan {
+        items: vec![CopyItem {
+            source: PathBuf::from("lib/a"),
+            relative_dest: "gba/Advance Wars (USA) [!].gba".into(),
+            bytes: 8,
+            action: CopyAction::Copy,
+        }],
+        warning: None,
+    };
+    let mut keep = std::collections::HashSet::new();
+    keep.insert("gba/Advance Wars (USA) [!].gba".to_string());
+    let (kept, removed) = dedupe::apply_keep_choices(plan, &groups, &keep);
+    assert_eq!((kept.items.len(), removed), (1, 0));
+
+    // The resident file is scan output, never a plan item: nothing in
+    // this module can delete from the card — removal only filters the
+    // incoming plan.
+    assert!(
+        !groups[0].resident.contains("USA) [!]"),
+        "resident is the on-card file: {}",
+        groups[0].resident
+    );
+}
+
+#[test]
+fn embed_failures_degrade_to_no_groups_never_an_error() {
+    let residents = vec![resident("gba", "gba/Advance Wars (U).gba")];
+    let incoming = vec![incoming("gba", "gba/Advance Wars (USA) [!].gba", 8)];
+    let mut failing = |_: &str| -> Result<Vec<f32>, String> { Err("helper down".into()) };
+    let groups = dedupe::group_duplicates(&residents, &incoming, &mut failing);
+    assert!(groups.is_empty(), "no embeddings: no groups, no error");
+}
+
+#[test]
+fn end_to_end_card_scan_groups_against_plan_stems() {
+    // A card holding "Advance Wars (U).gba" plus a plan carrying its
+    // renamed twin and an unrelated game: one group, default skip
+    // removes only the twin.
+    let card = scratch("dedupe-e2e-card");
+    fs::create_dir_all(card.join("gba")).unwrap();
+    fs::write(card.join("gba/Advance Wars (U).gba"), b"resident").unwrap();
+    let residents = dedupe::scan_card(&card, "arkos_easyroms_root", &dedupe_systems());
+    let plan = CopyPlan {
+        items: vec![
+            CopyItem {
+                source: PathBuf::from("lib/twin"),
+                relative_dest: "gba/Advance Wars (USA) [!].gba".into(),
+                bytes: 8,
+                action: CopyAction::Copy,
+            },
+            CopyItem {
+                source: PathBuf::from("lib/other"),
+                relative_dest: "gba/Golden Sun (USA).gba".into(),
+                bytes: 7,
+                action: CopyAction::Copy,
+            },
+        ],
+        warning: None,
+    };
+    let incoming = dedupe::plan_incoming(&plan, "arkos_easyroms_root", &dedupe_systems());
+    assert_eq!(incoming.len(), 2);
+    let mut embed = dedupe_embed;
+    let groups = dedupe::group_duplicates(&residents, &incoming, &mut embed);
+    assert_eq!(groups.len(), 1);
+    let card_before: Vec<String> = index::scan_library(&card)
+        .unwrap()
+        .iter()
+        .map(|f| f.relative.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let (filtered, removed) =
+        dedupe::apply_keep_choices(plan, &groups, &std::collections::HashSet::new());
+    assert_eq!(removed, 1);
+    assert_eq!(filtered.items.len(), 1);
+    let card_after: Vec<String> = index::scan_library(&card)
+        .unwrap()
+        .iter()
+        .map(|f| f.relative.to_string_lossy().replace('\\', "/"))
+        .collect();
+    assert_eq!(card_before, card_after, "the card is untouched by dedupe");
+}

@@ -248,6 +248,8 @@ struct PlanView {
     warning: Option<String>,
     copy_count: usize,
     skip_count: usize,
+    duplicates: Vec<needle::dedupe::DuplicateGroup>,
+    duplicate_skipped: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -375,6 +377,16 @@ struct SmartPayload {
     regions: Vec<String>,
     #[serde(default)]
     resolutions: std::collections::HashMap<String, needle::sort::Resolution>,
+}
+
+/// Optional dedupe payload on plan_roms/copy_roms: per-group keep/skip
+/// choices keyed by incoming relative_dest. Absent groups default to
+/// skip incoming (residents are never touched).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DedupePayload {
+    #[serde(default)]
+    keep: Vec<String>,
 }
 
 fn parse_regions(raw: &[String]) -> Result<Vec<needle::tags::Region>, String> {
@@ -538,6 +550,53 @@ fn smart_plan(
     Ok(plan)
 }
 
+/// Dedupe overlay shared by plan and copy: scans the card, groups plan
+/// items against residents (smart path only — embeddings through the
+/// helper), and removes grouped items unless kept. Returns the plan
+/// view with groups for preview; copy applies the same removal and
+/// previews it through the view only.
+fn dedupe_plan(
+    app: &tauri::AppHandle,
+    profile: &Profile,
+    dest_root: &Path,
+    plan: CopyPlan,
+    dedupe: Option<&DedupePayload>,
+) -> Result<PlanView, String> {
+    let _ = app;
+    let residents = needle::dedupe::scan_card(
+        dest_root,
+        &profile.rom_schema.layout,
+        &profile.rom_schema.systems,
+    );
+    let incoming =
+        needle::dedupe::plan_incoming(&plan, &profile.rom_schema.layout, &profile.rom_schema.systems);
+    if residents.is_empty() || incoming.is_empty() {
+        return Ok(plan_view(plan));
+    }
+    let helper =
+        resolve_embed_helper().ok_or_else(|| "smart sort engine is not installed".to_string())?;
+    let weights =
+        resolve_weights().ok_or_else(|| "smart sort engine is not installed".to_string())?;
+    needle::embed_client::with_helper(&helper, &weights, |session| {
+        let mut embed = |stem: &str| session.embed(stem);
+        let groups = needle::dedupe::group_duplicates(&residents, &incoming, &mut embed);
+        let keep: std::collections::HashSet<String> = dedupe
+            .map(|d| d.keep.iter().cloned().collect())
+            .unwrap_or_default();
+        let (filtered, removed) = needle::dedupe::apply_keep_choices(plan, &groups, &keep);
+        diag::log(
+            "info",
+            "needle_plan_dedupe",
+            &format!(
+                "groups={} duplicate_incoming_skipped={removed}",
+                groups.len()
+            ),
+        );
+        Ok(plan_view_with_duplicates(filtered, groups, removed))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 fn plan_roms(
     app: tauri::AppHandle,
@@ -546,6 +605,7 @@ fn plan_roms(
     library: String,
     include: Vec<String>,
     smart: Option<SmartPayload>,
+    dedupe: Option<DedupePayload>,
 ) -> Result<PlanView, String> {
     let profile = profile_by_id(&app, &profile_id)?;
     let volume = require_volume(&volume_id)?;
@@ -560,9 +620,24 @@ fn plan_roms(
         )?,
         None => build_plan(&profile, &volume, Path::new(&library), &include)?,
     };
+    // Dedupe overlay: group plan items against what is already on the
+    // card (smart path embeds through the helper; the plain path has no
+    // embeddings, so it previews no groups). Grouped items default to
+    // skip unless listed in dedupe.keep; residents are never modified.
+    if smart.is_some() {
+        let with_groups = dedupe_plan(
+            &app,
+            &profile,
+            &card_root(&volume),
+            plan,
+            dedupe.as_ref(),
+        )?;
+        return Ok(with_groups);
+    }
     Ok(plan_view(plan))
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 fn copy_roms(
     app: tauri::AppHandle,
@@ -572,6 +647,7 @@ fn copy_roms(
     include: Vec<String>,
     dry_run: bool,
     smart: Option<SmartPayload>,
+    dedupe: Option<DedupePayload>,
 ) -> Result<romcopy::CopyReport, String> {
     let profile = profile_by_id(&app, &profile_id)?;
     let volume = require_volume(&volume_id)?;
@@ -591,8 +667,10 @@ fn copy_roms(
     }
     // Smart copies re-classify here (embeddings are deterministic) and
     // verify the review resolutions still match the library — the
-    // copy-time guard — before the unchanged moat takes over.
-    let plan = match &smart {
+    // copy-time guard — before the unchanged moat takes over. Dedupe
+    // then removes grouped incoming files (default skip) from the plan;
+    // residents are never touched.
+    let mut plan = match &smart {
         Some(smart) => smart_plan(
             &app,
             &profile,
@@ -603,6 +681,38 @@ fn copy_roms(
         )?,
         None => build_plan(&profile, &volume, Path::new(&library), &include)?,
     };
+    if smart.is_some() {
+        let keep: std::collections::HashSet<String> = dedupe
+            .as_ref()
+            .map(|d| d.keep.iter().cloned().collect())
+            .unwrap_or_default();
+        let residents = needle::dedupe::scan_card(
+            &card_root(&volume),
+            &profile.rom_schema.layout,
+            &profile.rom_schema.systems,
+        );
+        let incoming =
+            needle::dedupe::plan_incoming(&plan, &profile.rom_schema.layout, &profile.rom_schema.systems);
+        if !residents.is_empty() && !incoming.is_empty() {
+            let helper = resolve_embed_helper()
+                .ok_or_else(|| "smart sort engine is not installed".to_string())?;
+            let weights =
+                resolve_weights().ok_or_else(|| "smart sort engine is not installed".to_string())?;
+            let filtered = needle::embed_client::with_helper(&helper, &weights, |session| {
+                let mut embed = |stem: &str| session.embed(stem);
+                let groups = needle::dedupe::group_duplicates(&residents, &incoming, &mut embed);
+                let (filtered, removed) =
+                    needle::dedupe::apply_keep_choices(plan, &groups, &keep);
+                diag::log(
+                    "info",
+                    "needle_copy_dedupe",
+                    &format!("duplicate_incoming_skipped={removed}"),
+                );
+                Ok(filtered)
+            })?;
+            plan = filtered;
+        }
+    }
     diag::log(
         "INFO",
         "copy_start",
@@ -612,8 +722,8 @@ fn copy_roms(
             plan.items.len()
         ),
     );
-    let total = plan.items.len();
     let root = card_root(&volume);
+    let total = plan.items.len();
     let mut copied = 0;
     let mut skipped = 0;
     let mut bytes_copied = 0;
@@ -671,6 +781,16 @@ fn copy_roms(
 }
 
 fn plan_view(plan: CopyPlan) -> PlanView {
+    plan_view_with_duplicates(plan, Vec::new(), 0)
+}
+
+/// Renders a plan plus its dedupe overlay: the groups previewed and how
+/// many grouped incoming files were removed (default skip).
+fn plan_view_with_duplicates(
+    plan: CopyPlan,
+    duplicates: Vec<needle::dedupe::DuplicateGroup>,
+    duplicate_skipped: usize,
+) -> PlanView {
     let copy_count = plan
         .items
         .iter()
@@ -693,6 +813,8 @@ fn plan_view(plan: CopyPlan) -> PlanView {
         warning: plan.warning,
         copy_count,
         skip_count,
+        duplicates,
+        duplicate_skipped,
     }
 }
 
