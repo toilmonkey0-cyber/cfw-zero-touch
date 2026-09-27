@@ -64,9 +64,13 @@ impl Tier {
 pub enum VariantDecision {
     Keep,
     /// A higher-priority region won this title.
-    SkipRegion { winner: Region },
+    SkipRegion {
+        winner: Region,
+    },
     /// Same region and disc as the kept file.
-    SkipDuplicate { kept: String },
+    SkipDuplicate {
+        kept: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -293,12 +297,18 @@ pub fn classify(
 /// skip other regions' variants; within the winning region keep one file
 /// per disc slot with deterministic tie-breaks (shortest raw name, then
 /// larger file, then lexicographic).
-fn collapse_variants(routed: Vec<Pending>, regions: &[Region]) -> (Vec<RouteRow>, Vec<VariantGroup>) {
+fn collapse_variants(
+    routed: Vec<Pending>,
+    regions: &[Region],
+) -> (Vec<RouteRow>, Vec<VariantGroup>) {
     // Group by (system_id, clean stem of the file name).
     let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for (position, file) in routed.iter().enumerate() {
         let stem = tags::clean_stem(&file.relative);
-        groups.entry((file.system_id.clone(), stem)).or_default().push(position);
+        groups
+            .entry((file.system_id.clone(), stem))
+            .or_default()
+            .push(position);
     }
 
     let mut decisions: Vec<VariantDecision> = vec![VariantDecision::Keep; routed.len()];
@@ -317,7 +327,10 @@ fn collapse_variants(routed: Vec<Pending>, regions: &[Region]) -> (Vec<RouteRow>
         // no region tag fall back only when no preferred region exists.
         let mut winner: Option<Region> = None;
         for preferred in regions {
-            if members.iter().any(|&index| region_of(index) == Some(*preferred)) {
+            if members
+                .iter()
+                .any(|&index| region_of(index) == Some(*preferred))
+            {
                 winner = Some(*preferred);
                 break;
             }
@@ -407,7 +420,10 @@ pub fn verify_resolutions(
 ) -> Result<HashMap<String, Option<String>>, String> {
     let mut applied = HashMap::new();
     for (review_id, resolution) in resolutions {
-        let Some(row) = classification.needs_review.iter().find(|row| &row.review_id == review_id)
+        let Some(row) = classification
+            .needs_review
+            .iter()
+            .find(|row| &row.review_id == review_id)
         else {
             return Err(format!(
                 "review {review_id} does not match the current library — preview again"
@@ -421,7 +437,9 @@ pub fn verify_resolutions(
         }
         if let Some(system_id) = &resolution.system_id {
             if system_by_id(systems, system_id).is_none() {
-                return Err(format!("review {review_id} names unknown system {system_id}"));
+                return Err(format!(
+                    "review {review_id} names unknown system {system_id}"
+                ));
             }
         }
         applied.insert(review_id.clone(), resolution.system_id.clone());
@@ -530,10 +548,18 @@ pub fn plan_smart(
             continue; // user chose skip
         };
         let Some(system) = system_by_id(systems, system_id) else {
-            return Err(format!("review {} names unknown system {system_id}", row.review_id));
+            return Err(format!(
+                "review {} names unknown system {system_id}",
+                row.review_id
+            ));
         };
         let prefix = storage_folder(layout, &system.folder)?;
-        let sub = row.relative.rsplit('/').next().unwrap_or(&row.relative).to_string();
+        let sub = row
+            .relative
+            .rsplit('/')
+            .next()
+            .unwrap_or(&row.relative)
+            .to_string();
         let relative_dest = safe_relative_dest(&prefix, &sub)?;
         items.push(CopyItem {
             source: library.join(&row.relative),
@@ -545,21 +571,16 @@ pub fn plan_smart(
 
     if let Some(bios_folder) = bios_folder {
         // find_named_dir semantics: case-insensitive top-level match.
-        let bios_source = std::fs::read_dir(library)
-            .ok()
-            .and_then(|entries| {
-                entries
-                    .flatten()
-                    .map(|entry| entry.path())
-                    .find(|path| {
-                        path.is_dir()
-                            && path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .map(|n| n.eq_ignore_ascii_case("bios"))
-                                .unwrap_or(false)
-                    })
-            });
+        let bios_source = std::fs::read_dir(library).ok().and_then(|entries| {
+            entries.flatten().map(|entry| entry.path()).find(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.eq_ignore_ascii_case("bios"))
+                        .unwrap_or(false)
+            })
+        });
         if let Some(bios_source) = bios_source {
             let prefix = storage_folder(layout, bios_folder)?;
             let mut stack = vec![bios_source.clone()];

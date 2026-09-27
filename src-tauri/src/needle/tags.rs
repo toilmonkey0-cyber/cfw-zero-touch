@@ -12,9 +12,9 @@ use std::path::Path;
 /// Tokens that never carry identity: scene junk, disc/track markers,
 /// extension stems, region markers, revision noise.
 const JUNK_WORDS: &[&str] = &[
-    "rip", "proper", "repack", "track", "track1", "track01", "disc", "disk",
-    "bin", "cue", "iso", "img", "gdi", "chd", "7z", "zip", "usa", "us",
-    "europe", "eu", "japan", "jpn", "world", "ntsc", "pal", "rev", "v1",
+    "rip", "proper", "repack", "track", "track1", "track01", "disc", "disk", "bin", "cue", "iso",
+    "img", "gdi", "chd", "7z", "zip", "usa", "us", "europe", "eu", "japan", "jpn", "world", "ntsc",
+    "pal", "rev", "v1",
 ];
 
 /// Hard cap matching the embed-client stem cap.
@@ -235,8 +235,11 @@ pub fn parse_disc(name: &str) -> Option<DiscTag> {
             let mut total = None;
             let trimmed = after.trim_start_matches(['_', '-', ' ', '.', ')', ']', '}']);
             if let Some(of_rest) = trimmed.strip_prefix("of ") {
-                let total_digits: String =
-                    of_rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+                let total_digits: String = of_rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
                 if !total_digits.is_empty() && total_digits.len() <= 2 {
                     if let Ok(value) = total_digits.parse::<u8>() {
                         if (1..=99).contains(&value) {
@@ -269,12 +272,27 @@ mod tests {
 
     #[test]
     fn strips_tags_junk_and_separators() {
-        assert_eq!(clean_stem("Final Fantasy VII (USA) (Disc 2).cue"), "final fantasy vii");
+        assert_eq!(
+            clean_stem("Final Fantasy VII (USA) (Disc 2).cue"),
+            "final fantasy vii"
+        );
         assert_eq!(clean_stem("Sonic CD [J]"), "sonic cd");
-        assert_eq!(clean_stem("Metal Gear Solid (USA) (Disc 1)"), "metal gear solid");
-        assert_eq!(clean_stem("gran_turismo_scene_rip_psx_track1.bin"), "gran turismo scene psx");
-        assert_eq!(clean_stem("Panzer Dragoon Saga (USA) Disc 3 of 4.cue"), "panzer dragoon saga of");
-        assert_eq!(clean_stem("Nights.into Dreams (Europe).bin"), "nights into dreams");
+        assert_eq!(
+            clean_stem("Metal Gear Solid (USA) (Disc 1)"),
+            "metal gear solid"
+        );
+        assert_eq!(
+            clean_stem("gran_turismo_scene_rip_psx_track1.bin"),
+            "gran turismo scene psx"
+        );
+        assert_eq!(
+            clean_stem("Panzer Dragoon Saga (USA) Disc 3 of 4.cue"),
+            "panzer dragoon saga of"
+        );
+        assert_eq!(
+            clean_stem("Nights.into Dreams (Europe).bin"),
+            "nights into dreams"
+        );
         assert_eq!(clean_stem("Game (Rev A) [!] (v1.1)"), "game");
         assert_eq!(clean_stem("R-Type Delta (USA)"), "r type delta");
     }
@@ -339,8 +357,16 @@ mod tag_parsing_tests {
 
     #[test]
     fn region_negatives_do_not_match_substrings() {
-        assert_eq!(parse_region("Disgaea (En,Fr,De).cue"), None, "language tag is not a region");
-        assert_eq!(parse_region("Europa Universalis.cue"), None, "title word must not match");
+        assert_eq!(
+            parse_region("Disgaea (En,Fr,De).cue"),
+            None,
+            "language tag is not a region"
+        );
+        assert_eq!(
+            parse_region("Europa Universalis.cue"),
+            None,
+            "title word must not match"
+        );
         assert_eq!(parse_region("Metal Gear Solid.bin"), None);
     }
 
@@ -361,13 +387,25 @@ mod tag_parsing_tests {
             assert_eq!(parsed.total, total, "case: {name}");
         }
         assert_eq!(parse_disc("Metal Gear Solid.bin"), None);
-        assert_eq!(parse_disc("Game (Disc 0).cue"), None, "zero is not a disc number");
+        assert_eq!(
+            parse_disc("Game (Disc 0).cue"),
+            None,
+            "zero is not a disc number"
+        );
     }
 
     #[test]
     fn disc_words_do_not_match_inside_words_or_cd_i() {
-        assert_eq!(parse_disc("Discworld (USA).cue"), None, "no digits after disc");
-        assert_eq!(parse_disc("The Misadventures of Pip (CD-i).cue"), None, "CD-i is not a disc tag");
+        assert_eq!(
+            parse_disc("Discworld (USA).cue"),
+            None,
+            "no digits after disc"
+        );
+        assert_eq!(
+            parse_disc("The Misadventures of Pip (CD-i).cue"),
+            None,
+            "CD-i is not a disc tag"
+        );
         assert_eq!(parse_disc("Track 1 audio.bin"), None, "track is not disc");
         assert_eq!(parse_disc("Discmania (USA).cue"), None);
     }
@@ -377,6 +415,10 @@ mod tag_parsing_tests {
         assert_eq!(gdi_system_hint("Shenmue (USA).gdi"), Some("dreamcast"));
         assert_eq!(gdi_system_hint("GAME.GDI"), Some("dreamcast"));
         assert_eq!(gdi_system_hint("Game.cue"), None);
-        assert_eq!(gdi_system_hint("gdi-batch-readme.txt"), None, "must end with the extension");
+        assert_eq!(
+            gdi_system_hint("gdi-batch-readme.txt"),
+            None,
+            "must end with the extension"
+        );
     }
 }

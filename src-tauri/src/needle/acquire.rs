@@ -32,8 +32,7 @@ pub fn cache_directories() -> Vec<PathBuf> {
 /// IPC boundary for `needle_acquire`: build inputs and unknown ids are
 /// rejected, so no free-form string reaches the filesystem.
 pub fn runtime_artifact(id: &str) -> Result<&'static Artifact, String> {
-    let artifact =
-        manifest::find(id).ok_or_else(|| format!("unknown needle artifact: {id}"))?;
+    let artifact = manifest::find(id).ok_or_else(|| format!("unknown needle artifact: {id}"))?;
     if artifact.role != ArtifactRole::RuntimeDownload {
         return Err(format!(
             "{} is a build-time input and is never downloaded at runtime",

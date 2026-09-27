@@ -162,8 +162,8 @@ pub struct LibraryFile {
 pub fn scan_library(root: &Path) -> Result<Vec<LibraryFile>, String> {
     let mut files = Vec::new();
     fn walk(dir: &Path, root: &Path, out: &mut Vec<LibraryFile>) -> Result<(), String> {
-        let entries =
-            fs::read_dir(dir).map_err(|error| format!("could not read {}: {error}", dir.display()))?;
+        let entries = fs::read_dir(dir)
+            .map_err(|error| format!("could not read {}: {error}", dir.display()))?;
         for entry in entries.flatten() {
             let path = entry.path();
             let meta = entry
@@ -199,7 +199,12 @@ pub fn scan_library(root: &Path) -> Result<Vec<LibraryFile>, String> {
     }
     walk(root, root, &mut files)?;
     // Deterministic order: relative path bytes.
-    files.sort_by(|a, b| a.relative.as_os_str().as_encoded_bytes().cmp(b.relative.as_os_str().as_encoded_bytes()));
+    files.sort_by(|a, b| {
+        a.relative
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(b.relative.as_os_str().as_encoded_bytes())
+    });
     Ok(files)
 }
 
@@ -275,7 +280,10 @@ impl LibraryIndex {
 }
 
 fn norm(v: &[f32]) -> f64 {
-    v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt()
+    v.iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt()
 }
 
 // ---------------------------------------------------------------------
@@ -292,7 +300,10 @@ pub fn index_path(profile_id: &str) -> Result<PathBuf, String> {
     if !ok {
         return Err(format!("invalid profile id: {profile_id:?}"));
     }
-    Ok(store::store_root().join("needle").join("index").join(format!("{profile_id}.bin")))
+    Ok(store::store_root()
+        .join("needle")
+        .join("index")
+        .join(format!("{profile_id}.bin")))
 }
 
 fn encode(index: &LibraryIndex) -> Vec<u8> {
@@ -330,8 +341,7 @@ pub fn save(index: &LibraryIndex, path: &Path) -> Result<(), String> {
             .and_then(|_| file.flush())
             .map_err(|error| format!("could not write {}: {error}", tmp.display()))?;
     }
-    fs::rename(&tmp, path)
-        .map_err(|error| format!("could not save {}: {error}", path.display()))
+    fs::rename(&tmp, path).map_err(|error| format!("could not save {}: {error}", path.display()))
 }
 
 struct Reader<'a> {
@@ -354,7 +364,9 @@ impl<'a> Reader<'a> {
     }
     fn u64(&mut self) -> Result<u64, String> {
         let b = self.take(8)?;
-        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
 }
 
@@ -367,7 +379,10 @@ pub fn load(path: &Path) -> Result<LibraryIndex, String> {
     let mut data = Vec::new();
     file.read_to_end(&mut data)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let mut reader = Reader { data: &data, pos: 0 };
+    let mut reader = Reader {
+        data: &data,
+        pos: 0,
+    };
 
     if reader.take(8)? != INDEX_MAGIC {
         return Err("index file has a bad magic".into());
@@ -382,7 +397,9 @@ pub fn load(path: &Path) -> Result<LibraryIndex, String> {
     }
     let count = reader.u64()?;
     if count > MAX_INDEX_ENTRIES {
-        return Err(format!("index claims {count} entries (cap {MAX_INDEX_ENTRIES})"));
+        return Err(format!(
+            "index claims {count} entries (cap {MAX_INDEX_ENTRIES})"
+        ));
     }
     let library: [u8; 32] = reader.take(32)?.try_into().unwrap();
     let routing: [u8; 32] = reader.take(32)?.try_into().unwrap();

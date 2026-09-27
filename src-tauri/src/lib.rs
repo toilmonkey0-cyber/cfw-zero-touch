@@ -440,10 +440,10 @@ fn classify_with_engine(
     include: &[String],
     regions: &[needle::tags::Region],
 ) -> Result<needle::sort::Classification, String> {
-    let helper = resolve_embed_helper()
-        .ok_or_else(|| "smart sort engine is not installed".to_string())?;
-    let weights = resolve_weights()
-        .ok_or_else(|| "smart sort engine is not installed".to_string())?;
+    let helper =
+        resolve_embed_helper().ok_or_else(|| "smart sort engine is not installed".to_string())?;
+    let weights =
+        resolve_weights().ok_or_else(|| "smart sort engine is not installed".to_string())?;
     let weights_tag = needle::manifest::find("weights")
         .map(|weights| weights.sha256)
         .unwrap_or("unknown");
@@ -469,7 +469,11 @@ fn classify_with_engine(
                 let _ = app.emit("classify-progress", format!("{done}/{total}"));
             },
         )?;
-        let routed = classification.routes.iter().filter(|r| r.variant == needle::sort::VariantDecision::Keep).count();
+        let routed = classification
+            .routes
+            .iter()
+            .filter(|r| r.variant == needle::sort::VariantDecision::Keep)
+            .count();
         let review = classification.needs_review.len();
         let skipped = classification.routes.len() - routed;
         diag::log(
@@ -507,7 +511,11 @@ fn smart_plan(
 ) -> Result<CopyPlan, String> {
     let regions = parse_regions(&smart.regions)?;
     let classification = classify_with_engine(app, profile, library, include, &regions)?;
-    let applied = needle::sort::verify_resolutions(&classification, &profile.rom_schema.systems, &smart.resolutions)?;
+    let applied = needle::sort::verify_resolutions(
+        &classification,
+        &profile.rom_schema.systems,
+        &smart.resolutions,
+    )?;
     let plan = needle::sort::plan_smart(
         library,
         &card_root(volume),
@@ -542,7 +550,14 @@ fn plan_roms(
     let profile = profile_by_id(&app, &profile_id)?;
     let volume = require_volume(&volume_id)?;
     let plan = match &smart {
-        Some(smart) => smart_plan(&app, &profile, &volume, Path::new(&library), &include, smart)?,
+        Some(smart) => smart_plan(
+            &app,
+            &profile,
+            &volume,
+            Path::new(&library),
+            &include,
+            smart,
+        )?,
         None => build_plan(&profile, &volume, Path::new(&library), &include)?,
     };
     Ok(plan_view(plan))
@@ -578,7 +593,14 @@ fn copy_roms(
     // verify the review resolutions still match the library — the
     // copy-time guard — before the unchanged moat takes over.
     let plan = match &smart {
-        Some(smart) => smart_plan(&app, &profile, &volume, Path::new(&library), &include, smart)?,
+        Some(smart) => smart_plan(
+            &app,
+            &profile,
+            &volume,
+            Path::new(&library),
+            &include,
+            smart,
+        )?,
         None => build_plan(&profile, &volume, Path::new(&library), &include)?,
     };
     diag::log(
