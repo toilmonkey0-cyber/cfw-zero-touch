@@ -1,6 +1,6 @@
 [package]
 name = "cfw-zero-touch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Desktop wizard that prepares a handheld CFW ROMs card on the PC"
 authors = ["Aaron"]
 edition = "2021"
