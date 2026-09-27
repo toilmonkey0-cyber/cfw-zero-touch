@@ -84,9 +84,9 @@ fn card_root(volume: &VolumeInfo) -> PathBuf {
 
 /// One lettered partition of a disk, from `Get-Partition`.
 #[derive(Debug, Clone, Copy)]
-struct LetteredPartition {
-    letter: char,
-    disk: u32,
+pub struct LetteredPartition {
+    pub letter: char,
+    pub disk: u32,
 }
 
 fn lettered_partitions() -> Result<Vec<LetteredPartition>, String> {
@@ -156,7 +156,7 @@ fn check_card_safety(profile: &Profile, volume: &VolumeInfo) -> Result<firstboot
         .filter_map(|row| {
             volumes
                 .iter()
-                .find(|volume| volume.letter.chars().next() == Some(row.letter))
+                .find(|volume| volume.letter.starts_with(row.letter))
                 .map(|volume| (row.letter, volume.label.clone()))
         })
         .collect();
@@ -1040,6 +1040,134 @@ fn diagnostics_path() -> String {
     diag::log_path().display().to_string()
 }
 
+/// Doctor diagnosis of one selected card: deterministic templates plus an
+/// optional engine paraphrase. Display-only: the gates already decided;
+/// this explains their outcome and never changes it.
+#[tauri::command]
+fn diagnose_card(
+    app: tauri::AppHandle,
+    profile_id: String,
+    volume_id: String,
+    with_engine: bool,
+) -> Result<needle::doctor::DoctorReport, String> {
+    let profile = profile_by_id(&app, &profile_id)?;
+    let volume = require_volume(&volume_id)?;
+    let label = profile.rom_schema.volume_label.clone().unwrap_or_default();
+    let decision = decide(&volume, &label);
+    let (decision_name, decision_reason) = match &decision {
+        VolumeDecision::Ready { .. } => ("ready".to_string(), String::new()),
+        VolumeDecision::NeedsFormat { reason } => ("needs_format".to_string(), reason.clone()),
+        VolumeDecision::Rejected { reason } => ("rejected".to_string(), reason.clone()),
+    };
+    let safety = check_card_safety(&profile, &volume)
+        .map_err(|error| format!("could not judge first boot on {}: {error}", volume.letter))?;
+    let partitions = lettered_partitions().unwrap_or_default();
+    let this_disk = partitions
+        .iter()
+        .find(|row| {
+            row.letter
+                .eq_ignore_ascii_case(&volume.letter.chars().next().unwrap_or('?'))
+        })
+        .map(|row| row.disk);
+    let disk_volumes: Vec<needle::doctor::VolumeDisk> = match this_disk {
+        Some(disk) => {
+            let live = volume::list_volumes().unwrap_or_default();
+            partitions
+                .iter()
+                .filter(|row| row.disk == disk)
+                .map(|row| {
+                    let label = live
+                        .iter()
+                        .find(|v| v.letter.starts_with(row.letter))
+                        .map(|v| v.label.clone())
+                        .unwrap_or_default();
+                    needle::doctor::VolumeDisk {
+                        letter: row.letter.to_string(),
+                        label,
+                    }
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let facts = needle::doctor::collect_facts(
+        &volume,
+        &decision_name,
+        &decision_reason,
+        disk_volumes,
+        &safety,
+        &card_root(&volume),
+    );
+    let report = if with_engine {
+        match resolve_serve_paths() {
+            Some((engine_exe, weights_path)) => {
+                match needle::serve::ask_through_sidecar(
+                    &engine_exe,
+                    &weights_path,
+                    &doctor_input(&facts),
+                ) {
+                    Ok(turn) => report_with_turn(&facts, &turn.call.name, &turn.call.arguments),
+                    Err(error) => {
+                        diag::log("WARN", "doctor_failed", &format!("engine: {error}"));
+                        needle::doctor::diagnose(&facts, None)
+                    }
+                }
+            }
+            None => needle::doctor::diagnose(&facts, None),
+        }
+    } else {
+        needle::doctor::diagnose(&facts, None)
+    };
+    let outcome = if report.engine_text.is_some() || report.suggested_profile_id.is_some() {
+        "engine"
+    } else {
+        "template"
+    };
+    diag::log("info", "doctor_run", &format!("outcome={outcome}"));
+    Ok(report)
+}
+
+fn doctor_input(facts: &needle::doctor::CardFacts) -> String {
+    serde_json::to_string(facts)
+        .map(|json| format!("Explain this card. CardFacts: {json}"))
+        .unwrap_or_else(|_| "Explain this card.".to_string())
+}
+
+fn report_with_turn(
+    facts: &needle::doctor::CardFacts,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> needle::doctor::DoctorReport {
+    let parsed = needle::doctor::parse_engine_turn(name, arguments);
+    let mut report = needle::doctor::explain(facts);
+    if let Some((text, profile)) = parsed {
+        report.engine_text = text;
+        report.suggested_profile_id = profile;
+    }
+    report
+}
+
+fn resolve_serve_paths() -> Option<(PathBuf, PathBuf)> {
+    let engine_artifact = needle::manifest::find("serve-engine")?;
+    let weights_artifact = needle::manifest::find("weights")?;
+    let directories = needle::acquire::cache_directories();
+    let find = |artifact: &needle::manifest::Artifact| {
+        directories.iter().find_map(|dir| {
+            let candidate = dir.join(artifact.file_name);
+            if !candidate.is_file() {
+                return None;
+            }
+            let verified = std::fs::File::open(&candidate)
+                .ok()
+                .and_then(|file| flash::sha256_reader(file).ok())
+                .map(|hash| hash.eq_ignore_ascii_case(artifact.sha256))
+                .unwrap_or(false);
+            verified.then(|| candidate.clone())
+        })
+    };
+    Some((find(engine_artifact)?, find(weights_artifact)?))
+}
+
 /// Presence and pin-verification of every Needle artifact row. Advisory
 /// only: the app behaves identically when nothing is acquired.
 #[tauri::command]
@@ -1298,7 +1426,8 @@ pub fn run() {
             diagnostics_path,
             needle_status,
             needle_acquire,
-            classify_library
+            classify_library,
+            diagnose_card
         ])
         .build(tauri::generate_context!())
         .expect("error while building the application")
@@ -1306,6 +1435,7 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::Exit) {
                 // No helper process may outlive the app.
                 needle::embed_client::kill_all();
+                needle::serve::kill_all();
             }
         });
 }

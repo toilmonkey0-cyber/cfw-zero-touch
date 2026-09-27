@@ -1252,3 +1252,185 @@ fn pick_free_port_returns_connectable_ports() {
     let again = std::net::TcpListener::bind(("127.0.0.1", port));
     assert!(again.is_ok(), "picked port should be free right now");
 }
+
+// ------------------------------------------------------------------
+// PR 7: Card Doctor (facts, templates, vocabulary validation)
+// ------------------------------------------------------------------
+use cfw_zero_touch_lib::firstboot::CardSafety;
+use cfw_zero_touch_lib::needle::doctor::{self, CardFacts, CardFamily, VolumeDisk};
+use cfw_zero_touch_lib::volume::VolumeInfo;
+
+fn doctor_facts() -> CardFacts {
+    CardFacts {
+        volume_letter: "E".into(),
+        volume_label: "EASYROMS".into(),
+        file_system: "exFAT".into(),
+        total_bytes: 60_000_000_000,
+        is_empty: false,
+        decision: "ready".into(),
+        decision_reason: String::new(),
+        disk_volumes: vec![
+            VolumeDisk {
+                letter: "D".into(),
+                label: "BOOT".into(),
+            },
+            VolumeDisk {
+                letter: "E".into(),
+                label: "EASYROMS".into(),
+            },
+        ],
+        root_folders: vec!["gba".into(), "nes".into()],
+        firstboot_state: "safe".into(),
+        firstboot_reason: String::new(),
+    }
+}
+
+fn corrupted_garbage() -> CardFacts {
+    let mut facts = doctor_facts();
+    facts.firstboot_state = "corrupted".into();
+    facts.firstboot_reason = String::new();
+    facts
+}
+
+fn facts_volume() -> VolumeInfo {
+    VolumeInfo {
+        id: "E-TEST".into(),
+        letter: "E".into(),
+        label: "EASYROMS".into(),
+        file_system: "exFAT".into(),
+        total_bytes: 60_000_000_000,
+        is_empty: false,
+        is_removable: true,
+    }
+}
+
+#[test]
+fn doctor_armed_template_names_first_boot() {
+    let mut facts = doctor_facts();
+    facts.firstboot_state = "armed".into();
+    facts.firstboot_reason = "firstboot is still armed (expandtoexfat.sh)".into();
+    let report = doctor::explain(&facts);
+    assert_eq!(report.heading, "This card has not finished its first boot");
+    assert!(
+        report.steps[1].contains("game menu"),
+        "got: {:?}",
+        report.steps
+    );
+    assert!(report.engine_text.is_none() && report.suggested_profile_id.is_none());
+}
+
+#[test]
+fn doctor_unknown_template_names_boot_visibility() {
+    let mut facts = doctor_facts();
+    facts.firstboot_state = "unknown".into();
+    facts.firstboot_reason = "could not find which disk holds E:.".into();
+    let report = doctor::explain(&facts);
+    assert_eq!(
+        report.heading,
+        "The app cannot verify first boot on this card"
+    );
+}
+
+#[test]
+fn family_identification_reads_layout_signatures() {
+    let mut facts = doctor_facts();
+    facts.root_folders = vec!["Roms/FC".into(), "Easytitles".into(), "Emulators".into()];
+    assert_eq!(doctor::identify_family(&facts), CardFamily::R35sStock);
+    facts.root_folders = vec!["Roms/PSP".into(), "Roms/NEOGEO".into(), "bios".into()];
+    assert_eq!(doctor::identify_family(&facts), CardFamily::R36sClone);
+    facts.volume_label = "SHARE".into();
+    facts.root_folders = vec!["roms".into()];
+    assert_eq!(doctor::identify_family(&facts), CardFamily::RocknixShare);
+    facts.volume_label = "EASYROMS".into();
+    facts.root_folders = vec!["gba".into()];
+    assert_eq!(doctor::identify_family(&facts), CardFamily::DarkosEasyroms);
+}
+
+#[test]
+fn engine_turns_are_vocabulary_validated() {
+    let good = serde_json::json!({
+        "card_family": "r35s_stock",
+        "observation": "a stock card",
+        "next_step": "copy",
+        "suggested_profile_id": "r35s-stock-card",
+    });
+    let (text, profile) = doctor::parse_engine_turn("explain_card", &good).unwrap();
+    assert_eq!(text.as_deref(), Some("a stock card"));
+    assert_eq!(profile.as_deref(), Some("r35s-stock-card"));
+    assert!(doctor::parse_engine_turn("other_tool", &good).is_none());
+    let mut without_obs = good.clone();
+    without_obs.as_object_mut().unwrap().remove("observation");
+    let (text, profile) = doctor::parse_engine_turn("explain_card", &without_obs).unwrap();
+    assert!(text.is_none());
+    assert_eq!(profile.as_deref(), Some("r35s-stock-card"));
+    let mut custom_profile = good.clone();
+    custom_profile["suggested_profile_id"] = serde_json::json!("custom-handheld");
+    assert!(doctor::parse_engine_turn("explain_card", &custom_profile).is_none());
+}
+
+#[test]
+fn gates_are_byte_identical_with_engine_off_on_and_garbage() {
+    let mut facts = doctor_facts();
+    facts.firstboot_state = "armed".into();
+    facts.firstboot_reason = "firstboot is still armed (expandtoexfat.sh)".into();
+    let off = doctor::safety_of(&facts);
+    assert_eq!(
+        off,
+        CardSafety::Armed("firstboot is still armed (expandtoexfat.sh)".into())
+    );
+    let with_engine = doctor::diagnose(&facts, None);
+    assert_eq!(with_engine.steps[0], "The handheld would format EASYROMS and erase anything copied now. firstboot is still armed (expandtoexfat.sh)");
+    let garbage = corrupted_garbage();
+    assert_eq!(
+        doctor::safety_of(&garbage),
+        CardSafety::Unknown(String::new())
+    );
+    let report = doctor::explain(&garbage);
+    assert_eq!(
+        report.heading,
+        "The app cannot verify first boot on this card"
+    );
+}
+
+#[test]
+fn collect_facts_caps_root_folders_and_serializes_cleanly() {
+    let root = scratch("doctor-facts");
+    for i in 0..100 {
+        fs::create_dir_all(root.join(format!("folder{i:03}"))).unwrap();
+    }
+    fs::write(root.join("topfile.txt"), b"x").unwrap();
+    let volume = facts_volume();
+    let facts = doctor::collect_facts(
+        &volume,
+        "ready",
+        "",
+        vec![VolumeDisk {
+            letter: "E".into(),
+            label: "EASYROMS".into(),
+        }],
+        &CardSafety::Safe,
+        &root,
+    );
+    assert_eq!(facts.root_folders.len(), 64, "capped");
+    assert!(
+        facts.root_folders.windows(2).all(|pair| pair[0] <= pair[1]),
+        "sorted"
+    );
+    let json = serde_json::to_string(&facts).unwrap();
+    assert!(
+        !json.contains("topfile"),
+        "file names never enter the facts"
+    );
+}
+
+#[test]
+fn marker_summary_lists_only_watched_boot_files() {
+    let boot = scratch("doctor-boot");
+    fs::write(boot.join("expandtoexfat.sh"), b"x").unwrap();
+    fs::write(boot.join("readme.txt"), b"x").unwrap();
+    assert_eq!(
+        doctor::marker_summary(Some(&boot)),
+        vec!["expandtoexfat.sh".to_string()]
+    );
+    assert!(doctor::marker_summary(None).is_empty());
+}

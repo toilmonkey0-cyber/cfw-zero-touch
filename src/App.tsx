@@ -66,6 +66,13 @@ type StageReport = {
 
 type FirstbootState = { state: "safe" | "armed" | "unknown"; reason: string };
 
+type DoctorReport = {
+  heading: string;
+  steps: string[];
+  engineText: string | null;
+  suggestedProfileId: string | null;
+};
+
 type Step = "profile" | "card" | "library" | "flash" | "bootOnce" | "done";
 
 type SortMode = "none" | "smart" | "dat";
@@ -158,6 +165,9 @@ export default function App() {
   const [engineMessage, setEngineMessage] = useState("");
   const [classification, setClassification] = useState<Classification | null>(null);
   const [resolutions, setResolutions] = useState<Record<string, Resolution>>({});
+  const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const [doctorBusy, setDoctorBusy] = useState(false);
+  const [doctorEngine, setDoctorEngine] = useState(false);
 
   useEffect(() => {
     invoke<Profile[]>("list_profiles")
@@ -219,6 +229,31 @@ export default function App() {
   function engineReady(): boolean {
     const weights = needleStatus?.find((row) => row.id === "weights");
     return Boolean(weights?.present && weights?.verified);
+  }
+
+  function serveReady(): boolean {
+    const engine = needleStatus?.find((row) => row.id === "serve-engine");
+    return (
+      engineReady() && Boolean(engine?.present && engine?.verified)
+    );
+  }
+
+  async function explainCard(item: VolumeView) {
+    if (!profile) return;
+    setDoctorBusy(true);
+    setError("");
+    try {
+      const report = await invoke<DoctorReport>("diagnose_card", {
+        profileId: profile.id,
+        volumeId: item.id,
+        withEngine: doctorEngine && serveReady(),
+      });
+      setDoctor(report);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setDoctorBusy(false);
+    }
   }
 
   async function checkFeed(silent = false) {
@@ -300,6 +335,8 @@ export default function App() {
     setProfile(next);
     setIncluded(next.romSchema.systems.map((system) => system.id));
     setVolume(null);
+    setDoctor(null);
+    setDoctorEngine(false);
     setConfirmation("");
     setFlashLog("");
     if (next.image) {
@@ -759,6 +796,11 @@ export default function App() {
                     {item.reason ? <span className="reason">{item.reason}</span> : null}
                     {item.relabel ? <span>The volume label will be updated. Files stay put.</span> : null}
                   </div>
+                  <div className="row">
+                    <button disabled={busy || doctorBusy} onClick={() => void explainCard(item)}>
+                      {doctorBusy ? "Explaining…" : "Explain this card"}
+                    </button>
+                  </div>
                   {item.decision === "needs_format" ? (
                     <label>
                       Type FORMAT to erase {item.letter}: ({formatBytes(item.totalBytes)})
@@ -783,6 +825,44 @@ export default function App() {
               ))}
             </ul>
           )}
+          {doctor ? (
+            <div className="doctor">
+              <h3>What is on this card</h3>
+              <p>
+                <strong>{doctor.heading}</strong>
+              </p>
+              <ol>
+                {doctor.steps.map((line) => (
+                  <li key={line.slice(0, 64)}>{line}</li>
+                ))}
+              </ol>
+              {doctor.engineText ? <p>{doctor.engineText}</p> : null}
+              {doctor.suggestedProfileId ? (
+                <p className="path">Suggested layout: {doctor.suggestedProfileId}</p>
+              ) : null}
+              <div className="row">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={doctorEngine}
+                    onChange={() => setDoctorEngine(!doctorEngine)}
+                  />
+                  Use the local engine paraphrase when installed
+                </label>
+              </div>
+              {!serveReady() ? (
+                <p className="path">
+                  Engine paraphrase needs the smart-sort weights plus the serve engine
+                  (both checksum-verified downloads).
+                </p>
+              ) : null}
+              <div className="row">
+                <button disabled={busy || doctorBusy} onClick={() => setDoctor(null)}>
+                  Close explanation
+                </button>
+              </div>
+            </div>
+          ) : null}
         </section>
       ) : null}
 

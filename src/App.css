@@ -133,6 +133,18 @@ ol {
 .review thead th {
   background: #f6f7fa;
 }
+.doctor {
+  border: 1px solid #4a4338;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-top: 12px;
+}
+.doctor h3 {
+  margin: 0 0 6px;
+}
+.doctor ol {
+  margin: 6px 0;
+}
 .variants ul {
   margin: 0.3rem 0 0;
   padding-left: 1.2rem;
