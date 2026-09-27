@@ -415,9 +415,12 @@ pub fn load(path: &Path) -> Result<LibraryIndex, String> {
     let mut entries = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let bytes = reader.take(per_vector)?;
+        // per_vector is dim*4, so the remainder slice is always empty.
         let vector: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         let system_len = reader.u32()? as u64;
         if system_len == 0 || system_len > MAX_SYSTEM_ID_BYTES_ON_DISK {
