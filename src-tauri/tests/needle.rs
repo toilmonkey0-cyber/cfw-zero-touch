@@ -301,3 +301,264 @@ fn real_helper_embeds_deterministically_within_budget() {
 
     helper.kill();
 }
+
+// ------------------------------------------------------------------
+// PR 2b: library index (offline, synthetic vectors through EmbedFn)
+// ------------------------------------------------------------------
+use cfw_zero_touch_lib::needle::index::{
+    self, DeterministicRouter, LibraryIndex,
+};
+use cfw_zero_touch_lib::needle::tags;
+use cfw_zero_touch_lib::profiles::SystemFolder;
+
+fn system(id: &str, folder: &str, extensions: &[&str]) -> SystemFolder {
+    SystemFolder {
+        id: id.into(),
+        folder: folder.into(),
+        extensions: extensions.iter().map(|e| e.to_string()).collect(),
+        dat_name_pattern: None,
+    }
+}
+
+fn library_fixture(name: &str) -> PathBuf {
+    let root = scratch(name);
+    // Organized: routed by folder.
+    fs::create_dir_all(root.join("gba")).unwrap();
+    fs::write(root.join("gba/Advance Wars (U).gba"), b"gba-rom").unwrap();
+    fs::write(root.join("gba/Golden Sun (USA).gba"), b"gba-rom").unwrap();
+    fs::create_dir_all(root.join("nes")).unwrap();
+    fs::write(root.join("nes/Zelda.nes"), b"nes-rom").unwrap();
+    // Ambiguous: .zip claimed by gba and nes; routes nowhere.
+    fs::write(root.join("Mystery Game (Europe).zip"), b"zip").unwrap();
+    root
+}
+
+/// Deterministic synthetic embedding: a 4-dim vector keyed by the stem's
+/// first token, so identical stems embed identically and distinct stems
+/// differ. Enough for index semantics; real vectors come from cfw-embed.
+fn synthetic_embed(stem: &str) -> Result<Vec<f32>, String> {
+    let mut v = vec![0.0f32; 4];
+    let key = stem.chars().next().unwrap_or('?') as usize;
+    v[key % 4] = 1.0;
+    if stem.starts_with("advance") { v[1] = 0.5; }
+    Ok(v)
+}
+
+#[test]
+fn router_matches_folders_case_insensitively_and_ids() {
+    let systems = vec![system("gba", "GBA", &[".gba"]), system("nes", "Nintendo", &[".nes"])];
+    let router = DeterministicRouter::from_systems(&systems);
+    assert_eq!(router.route(Path::new("gba/Game.gba")), Some("gba"));
+    assert_eq!(router.route(Path::new("GBA/Game.gba")), Some("gba"));
+    assert_eq!(router.route(Path::new("Nintendo/Zelda.nes")), Some("nes"), "system.id also names a folder");
+}
+
+#[test]
+fn router_routes_extensions_only_with_a_unique_claimant() {
+    let systems = vec![
+        system("gba", "gba", &[".gba", ".zip"]),
+        system("nes", "nes", &[".nes", ".zip"]),
+        system("snes", "snes", &[".sfc"]),
+    ];
+    let router = DeterministicRouter::from_systems(&systems);
+    assert_eq!(router.route(Path::new("loose/Game.sfc")), Some("snes"), "unique extension routes");
+    assert_eq!(router.route(Path::new("loose/Game.zip")), None, "ambiguous extension does not");
+    assert_eq!(router.route(Path::new("loose/Game.unk")), None, "unknown extension does not");
+}
+
+#[test]
+fn bin_extension_differs_across_shipped_profile_shapes() {
+    // The design's motivating case: .bin is psx-unique in r35s-stock-card
+    // but claimed by psx AND megadrive in r36s-clone-card.
+    let r35s = vec![
+        system("psx", "psx", &[".bin", ".cue", ".chd"]),
+        system("snes", "snes", &[".sfc", ".smc"]),
+    ];
+    let r36s = vec![
+        system("psx", "psx", &[".bin", ".cue", ".chd"]),
+        system("megadrive", "megadrive", &[".bin", ".md", ".gen"]),
+    ];
+    let r35s_router = DeterministicRouter::from_systems(&r35s);
+    let r36s_router = DeterministicRouter::from_systems(&r36s);
+    assert_eq!(r35s_router.route(Path::new("x/Game.bin")), Some("psx"));
+    assert_eq!(r36s_router.route(Path::new("x/Game.bin")), None);
+    assert_ne!(r35s_router.fingerprint(), r36s_router.fingerprint());
+}
+
+#[test]
+fn index_build_includes_deterministic_files_and_excludes_queries() {
+    let root = library_fixture("build");
+    let systems = vec![system("gba", "gba", &[".gba"]), system("nes", "nes", &[".nes"])];
+    // Point the store at scratch so nothing touches the real store.
+    let store = scratch("build-store");
+    // SAFETY of env: tests within one binary run in parallel; use a
+    // unique store per test (env set once below via unsafe is the
+    // established pattern in this suite? No � instead give ensure_index
+    // an explicit path by monkey-patching? The store root is env-driven,
+    // so serialize env-touching tests with a lock.
+    let _guard = STORE_ENV_LOCK.lock();
+    std::env::set_var("CFW_STUDIO_DATA", &store);
+    let (index, rebuilt) = index::ensure_index("test-profile", &root, &systems, "weights-v1", &mut synthetic_embed).unwrap();
+    assert!(rebuilt);
+    let stems: Vec<&str> = index.entries.iter().map(|e| e.stem.as_str()).collect();
+    assert!(stems.contains(&"advance wars"), "folder-routed gba file indexed: {stems:?}");
+    assert!(stems.contains(&"zelda"));
+    assert!(!stems.iter().any(|s| s.contains("mystery")), "ambiguous zip excluded");
+    assert!(index.entries.iter().all(|e| e.vector.len() == 4));
+    // The persisted file exists with the tmp sibling gone.
+    let path = index::index_path("test-profile").unwrap();
+    assert!(path.is_file());
+    assert!(!path.with_extension("tmp").exists());
+    std::env::remove_var("CFW_STUDIO_DATA");
+}
+
+static STORE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn reuse_skips_embedding_when_fingerprints_match() {
+    let root = library_fixture("reuse");
+    let systems = vec![system("gba", "gba", &[".gba"]), system("nes", "nes", &[".nes"])];
+    let store = scratch("reuse-store");
+    let _guard = STORE_ENV_LOCK.lock();
+    std::env::set_var("CFW_STUDIO_DATA", &store);
+
+    let calls = std::cell::Cell::new(0usize);
+    let mut counting = |stem: &str| -> Result<Vec<f32>, String> {
+        calls.set(calls.get() + 1);
+        synthetic_embed(stem)
+    };
+    let (_, first) = index::ensure_index("p", &root, &systems, "w1", &mut counting).unwrap();
+    assert!(first);
+    let before = calls.get();
+    let (_, second) = index::ensure_index("p", &root, &systems, "w1", &mut counting).unwrap();
+    assert!(!second, "all fingerprints match: no rebuild");
+    assert_eq!(calls.get(), before, "reuse must not embed again");
+
+    // Library change (new file) forces a rebuild.
+    fs::write(root.join("gba/New Game.gba"), b"gba").unwrap();
+    let (_, third) = index::ensure_index("p", &root, &systems, "w1", &mut counting).unwrap();
+    assert!(third, "library fingerprint change rebuilds");
+
+    // Weights change forces a rebuild.
+    let (_, fourth) = index::ensure_index("p", &root, &systems, "w2", &mut counting).unwrap();
+    assert!(fourth, "weights fingerprint change rebuilds");
+    std::env::remove_var("CFW_STUDIO_DATA");
+}
+
+#[test]
+fn routing_change_rebuilds_and_profiles_coexist() {
+    let root = library_fixture("routing");
+    let r35s = vec![system("psx", "psx", &[".bin"]), system("gba", "gba", &[".gba"])];
+    let r36s = vec![
+        system("psx", "psx", &[".bin"]),
+        system("megadrive", "megadrive", &[".bin"]),
+    ];
+    let store = scratch("routing-store");
+    let _guard = STORE_ENV_LOCK.lock();
+    std::env::set_var("CFW_STUDIO_DATA", &store);
+
+    let (_, a) = index::ensure_index("r35s-stock-card", &root, &r35s, "w1", &mut synthetic_embed).unwrap();
+    assert!(a);
+    // Same library, same weights, DIFFERENT routing: rebuild (this is the
+    // two-profiles-one-library rule; the second profile also lives at its
+    // own path).
+    let (_, b) = index::ensure_index("r36s-clone-card", &root, &r36s, "w1", &mut synthetic_embed).unwrap();
+    assert!(b, "routing fingerprint differs across profiles");
+    let (_, a2) = index::ensure_index("r35s-stock-card", &root, &r35s, "w1", &mut synthetic_embed).unwrap();
+    assert!(!a2, "first profile's index is still reusable");
+    // Both files coexist under needle/index/.
+    assert!(index::index_path("r35s-stock-card").unwrap().is_file());
+    assert!(index::index_path("r36s-clone-card").unwrap().is_file());
+    std::env::remove_var("CFW_STUDIO_DATA");
+}
+
+#[test]
+fn persist_roundtrip_preserves_everything() {
+    let entries = vec![
+        index::IndexEntry { system_id: "gba".into(), stem: "advance wars".into(), vector: vec![1.0, 0.0, 0.5, -0.25] },
+        index::IndexEntry { system_id: "nes".into(), stem: "zelda".into(), vector: vec![0.0, 1.0, 0.0, 0.0] },
+    ];
+    let original = LibraryIndex { dim: 4, entries, library: [1; 32], routing: [2; 32], weights: [3; 32] };
+    let dir = scratch("roundtrip");
+    let path = dir.join("idx.bin");
+    index::save(&original, &path).unwrap();
+    let loaded = index::load(&path).unwrap();
+    assert_eq!(loaded, original);
+}
+
+#[test]
+fn corrupt_index_files_are_errors_never_panics() {
+    let dir = scratch("corrupt");
+    let good = LibraryIndex {
+        dim: 2,
+        entries: vec![index::IndexEntry { system_id: "gba".into(), stem: "x".into(), vector: vec![1.0, 0.0] }],
+        library: [0; 32], routing: [0; 32], weights: [0; 32],
+    };
+    let path = dir.join("good.bin");
+    index::save(&good, &path).unwrap();
+    let bytes = fs::read(&path).unwrap();
+
+    // Truncated at every prefix length: must error, never panic.
+    for cut in 0..bytes.len() {
+        let truncated = dir.join(format!("t{cut}.bin"));
+        fs::write(&truncated, &bytes[..cut]).unwrap();
+        assert!(index::load(&truncated).is_err(), "truncated at {cut} must error");
+    }
+    // Bad magic.
+    let mut magic = bytes.clone();
+    magic[0] = b'X';
+    let bad = dir.join("magic.bin");
+    fs::write(&bad, magic).unwrap();
+    assert!(index::load(&bad).is_err());
+    // Trailing bytes.
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    let bad = dir.join("trailing.bin");
+    fs::write(&bad, trailing).unwrap();
+    assert!(index::load(&bad).is_err());
+    // Hostile header: huge count claims.
+    let mut hostile = bytes.clone();
+    let count_offset = 8 + 4 + 4;
+    hostile[count_offset..count_offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    let bad = dir.join("hostile.bin");
+    fs::write(&bad, hostile).unwrap();
+    assert!(index::load(&bad).is_err(), "huge count must be rejected before allocation");
+}
+
+#[test]
+fn profile_ids_are_validated_before_becoming_paths() {
+    assert!(index::index_path("r35s-stock-card").is_ok());
+    assert!(index::index_path("p1").is_ok());
+    assert!(index::index_path("").is_err());
+    assert!(index::index_path("../evil").is_err());
+    assert!(index::index_path("UPPER").is_err());
+    assert!(index::index_path("a/b").is_err());
+    assert!(index::index_path(&"x".repeat(65)).is_err());
+}
+
+#[test]
+fn query_returns_nearest_by_cosine() {
+    let index = LibraryIndex {
+        dim: 4,
+        entries: vec![
+            index::IndexEntry { system_id: "gba".into(), stem: "advance wars".into(), vector: vec![1.0, 0.0, 0.0, 0.0] },
+            index::IndexEntry { system_id: "nes".into(), stem: "zelda".into(), vector: vec![0.0, 1.0, 0.0, 0.0] },
+        ],
+        library: [0; 32], routing: [0; 32], weights: [0; 32],
+    };
+    let (i, sim) = index.query(&[0.9, 0.1, 0.0, 0.0]).unwrap();
+    assert_eq!(index.entries[i].stem, "advance wars");
+    assert!(sim > 0.99, "near-identical vector: {sim}");
+    let (i, sim) = index.query(&[0.0, 1.0, 0.0, 0.0]).unwrap();
+    assert_eq!(index.entries[i].stem, "zelda");
+    assert!((sim - 1.0).abs() < 1e-9);
+    // Wrong-dimension queries refuse rather than misrank.
+    assert!(index.query(&[1.0, 0.0]).is_none());
+}
+
+#[test]
+fn clean_stem_matches_spike_fixtures() {
+    assert_eq!(tags::clean_stem("Dragon Spirit_[Euro]_disc3.img"), "dragon spirit");
+    assert_eq!(tags::clean_stem("sega-saturn/Wipeout (PAL).gdi"), "wipeout");
+}
+

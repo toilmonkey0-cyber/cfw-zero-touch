@@ -11,4 +11,6 @@
 
 pub mod acquire;
 pub mod embed_client;
+pub mod index;
 pub mod manifest;
+pub mod tags;
