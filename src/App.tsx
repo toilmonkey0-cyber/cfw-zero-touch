@@ -68,6 +68,52 @@ type FirstbootState = { state: "safe" | "armed" | "unknown"; reason: string };
 
 type Step = "profile" | "card" | "library" | "flash" | "bootOnce" | "done";
 
+type SortMode = "none" | "smart" | "dat";
+
+type NeedleArtifactStatus = {
+  id: string;
+  role: string;
+  fileName: string;
+  size: number;
+  present: boolean;
+  verified: boolean;
+  path: string | null;
+};
+
+type VariantDecision =
+  | { kind: "Keep" }
+  | { kind: "SkipRegion"; winner: string }
+  | { kind: "SkipDuplicate"; kept: string };
+
+type Classification = {
+  routes: {
+    relative: string;
+    size: number;
+    systemId: string;
+    tier: string;
+    variant: VariantDecision;
+  }[];
+  needsReview: {
+    reviewId: string;
+    relative: string;
+    size: number;
+    nearestStem: string | null;
+    nearestSystem: string | null;
+    similarity: number | null;
+  }[];
+  groups: {
+    systemId: string;
+    stem: string;
+    kept: number;
+    skippedVariants: number;
+    skippedDuplicates: number;
+  }[];
+  indexStats: { titles: number; rebuilt: boolean; dim: number };
+  coldStart: boolean;
+};
+
+type Resolution = { systemId: string | null; size: number };
+
 function formatBytes(bytes: number): string {
   if (bytes < 0) return "unknown size";
   if (bytes < 1000) return `${bytes} B`;
@@ -106,6 +152,12 @@ export default function App() {
   const [staging, setStaging] = useState(false);
   const [stageSummary, setStageSummary] = useState("");
   const [stagedLibrary, setStagedLibrary] = useState("");
+  const [sortMode, setSortMode] = useState<SortMode>("none");
+  const [needleStatus, setNeedleStatus] = useState<NeedleArtifactStatus[] | null>(null);
+  const [engineBusy, setEngineBusy] = useState(false);
+  const [engineMessage, setEngineMessage] = useState("");
+  const [classification, setClassification] = useState<Classification | null>(null);
+  const [resolutions, setResolutions] = useState<Record<string, Resolution>>({});
 
   useEffect(() => {
     invoke<Profile[]>("list_profiles")
@@ -128,6 +180,46 @@ export default function App() {
       .then(setDiagPath)
       .catch(() => setDiagPath(""));
   }, []);
+
+  useEffect(() => {
+    refreshNeedleStatus();
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<string>("needle-progress", (event) => {
+      setEngineMessage(event.payload);
+    });
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  async function refreshNeedleStatus() {
+    try {
+      setNeedleStatus(await invoke<NeedleArtifactStatus[]>("needle_status"));
+    } catch {
+      setNeedleStatus(null);
+    }
+  }
+
+  async function installEngine() {
+    setEngineBusy(true);
+    setEngineMessage("Downloading the smart-sort engine…");
+    try {
+      await invoke<string>("needle_acquire", { artifactId: "weights" });
+      setEngineMessage("Smart-sort engine ready.");
+      await refreshNeedleStatus();
+    } catch (cause) {
+      setEngineMessage(`Engine download failed: ${String(cause)}`);
+    } finally {
+      setEngineBusy(false);
+    }
+  }
+
+  function engineReady(): boolean {
+    const weights = needleStatus?.find((row) => row.id === "weights");
+    return Boolean(weights?.present && weights?.verified);
+  }
 
   async function checkFeed(silent = false) {
     if (!silent) setBusy(true);
@@ -332,6 +424,17 @@ export default function App() {
     setPlan(null);
     setStagedLibrary("");
     setStageSummary("");
+    setClassification(null);
+    setResolutions({});
+  }
+
+  function setSortChoice(mode: SortMode) {
+    resetPlan();
+    setSortMode(mode);
+    setEngineMessage("");
+    if (mode === "smart") {
+      void refreshNeedleStatus();
+    }
   }
 
   async function chooseDatFolder() {
@@ -351,11 +454,15 @@ export default function App() {
 
   async function preview() {
     if (!profile || !volume || !library) return;
+    if (sortMode === "smart") {
+      await previewSmart();
+      return;
+    }
     setBusy(true);
     setError("");
     try {
       let source = library;
-      if (datFolder) {
+      if (sortMode === "dat" && datFolder) {
         setStaging(true);
         setProgress("Staging a sorted copy with igir…");
         const report = await invoke<StageReport>("stage_library", {
@@ -391,6 +498,83 @@ export default function App() {
     }
   }
 
+  async function previewSmart() {
+    if (!profile || !volume || !library) return;
+    if (!engineReady()) {
+      setError(
+        "The smart-sort engine is not installed. Use Download below the Smart sort option (about 35 MB, checksum-verified), or choose another sort mode.",
+      );
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setProgress("Reading the library…");
+    try {
+      const result = await invoke<Classification>("classify_library", {
+        profileId: profile.id,
+        library,
+        include: included,
+        regions,
+      });
+      setClassification(result);
+      // Review choices default to the suggestion (skip when there is none).
+      const defaults: Record<string, Resolution> = {};
+      for (const row of result.needsReview) {
+        defaults[row.reviewId] = {
+          systemId: row.nearestSystem,
+          size: row.size,
+        };
+      }
+      setResolutions(defaults);
+      setProgress("");
+      if (result.needsReview.length === 0) {
+        await planWithSmart();
+      }
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function planWithSmart() {
+    if (!profile || !volume || !library) return;
+    setBusy(true);
+    setError("");
+    try {
+      const next = await invoke<PlanView>("plan_roms", {
+        profileId: profile.id,
+        volumeId: volume.id,
+        library,
+        include: included,
+        smart: { regions, resolutions },
+      });
+      setPlan(next);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function setResolution(reviewId: string, systemId: string | null) {
+    const row = classification?.needsReview.find((item) => item.reviewId === reviewId);
+    if (!row) return;
+    setResolutions((current) => ({
+      ...current,
+      [reviewId]: { systemId, size: row.size },
+    }));
+  }
+
+  function acceptAllSuggestions() {
+    if (!classification) return;
+    const defaults: Record<string, Resolution> = {};
+    for (const row of classification.needsReview) {
+      defaults[row.reviewId] = { systemId: row.nearestSystem, size: row.size };
+    }
+    setResolutions(defaults);
+  }
+
   async function copyRoms() {
     if (!profile || !volume || !library) return;
     setBusy(true);
@@ -403,6 +587,7 @@ export default function App() {
         library: stagedLibrary || library,
         include: included,
         dryRun: false,
+        ...(sortMode === "smart" ? { smart: { regions, resolutions } } : {}),
       });
       setReport(next);
       setStep("done");
@@ -619,39 +804,172 @@ export default function App() {
           {library ? <p className="path">{library}</p> : null}
           <div className="sort">
             <p>
-              Sort with a DAT (optional). A DAT is a catalog you download yourself — for example
-              from No-Intro's datomatic. With one chosen, Preview trims to one game per title,
-              filters regions, and verifies checksums. Without one, Preview copies as today.
+              Sorting (optional). Smart sort needs no DAT: it routes files by folder, by unique
+              file extension, and by title similarity against your organized folders. A DAT
+              (a catalog you download yourself, e.g. from No-Intro's datomatic) trims to one game
+              per title, filters regions, and verifies checksums.
             </p>
-            <button onClick={() => void chooseDatFolder()}>Choose DAT folder</button>
-            {datFolder ? <p className="path">{datFolder}</p> : null}
-            <div className="row">
-              {["USA", "EUR", "JPN"].map((region) => (
-                <label key={region}>
+            <div className="row modes">
+              {(
+                [
+                  ["none", "No sorting (copy as-is)"],
+                  ["smart", "Smart sort (no DAT needed)"],
+                  ["dat", "Sort with a DAT (igir)"],
+                ] as [SortMode, string][]
+              ).map(([mode, label]) => (
+                <label key={mode} className={sortMode === mode ? "mode active" : "mode"}>
                   <input
-                    type="checkbox"
-                    checked={regions.includes(region)}
-                    disabled={!datFolder}
-                    onChange={() => toggleRegion(region)}
+                    type="radio"
+                    name="sortMode"
+                    checked={sortMode === mode}
+                    onChange={() => setSortChoice(mode)}
                   />
-                  {region}
+                  {label}
                 </label>
               ))}
-              <label>
-                <input
-                  type="checkbox"
-                  checked={single}
-                  disabled={!datFolder}
-                  onChange={() => {
-                    resetPlan();
-                    setSingle(!single);
-                  }}
-                />
-                One game per title (1G1R)
-              </label>
             </div>
+            {sortMode === "smart" ? (
+              <div className="engine">
+                {engineReady() ? (
+                  <p className="chip ok">Smart-sort engine ready ({formatBytes(needleStatus?.find((row) => row.id === "weights")?.size ?? 35_000_000)}).</p>
+                ) : (
+                  <div className="row">
+                    <p className="chip">
+                      Engine not installed. Download about 35 MB, checksum-verified, to this PC
+                      only.
+                    </p>
+                    <button disabled={busy || engineBusy} onClick={() => void installEngine()}>
+                      {engineBusy ? "Downloading…" : "Download the smart-sort engine"}
+                    </button>
+                  </div>
+                )}
+                {engineMessage ? <p className="path">{engineMessage}</p> : null}
+                {classification?.coldStart ? (
+                  <p className="error">
+                    Too few organized titles to auto-route ({classification.indexStats.titles}
+                    {" "}indexed). Sort files into system folders first, or use a DAT.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            {sortMode === "dat" ? (
+              <div>
+                <button onClick={() => void chooseDatFolder()}>Choose DAT folder</button>
+                {datFolder ? <p className="path">{datFolder}</p> : null}
+              </div>
+            ) : null}
+            {sortMode !== "none" ? (
+              <div className="row">
+                {["USA", "EUR", "JPN"].map((region) => (
+                  <label key={region}>
+                    <input
+                      type="checkbox"
+                      checked={regions.includes(region)}
+                      onChange={() => toggleRegion(region)}
+                    />
+                    {region}
+                  </label>
+                ))}
+                {sortMode === "dat" ? (
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={single}
+                      disabled={!datFolder}
+                      onChange={() => {
+                        resetPlan();
+                        setSingle(!single);
+                      }}
+                    />
+                    One game per title (1G1R)
+                  </label>
+                ) : null}
+              </div>
+            ) : null}
             {stageSummary ? <p>{stageSummary}</p> : null}
           </div>
+          {classification && sortMode === "smart" && !plan && classification.needsReview.length > 0 ? (
+            <div className="review">
+              <h3>
+                Review {classification.needsReview.length} file
+                {classification.needsReview.length === 1 ? "" : "s"}
+              </h3>
+              <p>
+                Suggestions come from title similarity to your organized folders and are usually
+                right — accept them all or adjust per file.
+              </p>
+              <div className="row">
+                <button onClick={acceptAllSuggestions}>Accept all suggestions</button>
+                <button disabled={busy} onClick={() => void planWithSmart()}>
+                  Continue
+                </button>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>File</th>
+                    <th>Nearest title</th>
+                    <th>Match</th>
+                    <th>Route to</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {classification.needsReview.map((row) => (
+                    <tr key={row.reviewId}>
+                      <td className="path">{row.relative}</td>
+                      <td>{row.nearestStem ?? "—"}</td>
+                      <td>
+                        {row.similarity != null ? `${Math.round(row.similarity * 100)}%` : "—"}
+                      </td>
+                      <td>
+                        <select
+                          value={resolutions[row.reviewId]?.systemId ?? ""}
+                          onChange={(event) =>
+                            setResolution(
+                              row.reviewId,
+                              event.target.value === "" ? null : event.target.value,
+                            )
+                          }
+                        >
+                          <option value="">Skip this file</option>
+                          {included.map((systemId) => (
+                            <option key={systemId} value={systemId}>
+                              {systemId}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          {classification && sortMode === "smart" && plan ? (
+            <div className="variants">
+              {classification.routes.length > classification.routes.filter((row) => row.variant.kind === "Keep").length ? (
+                <p>
+                  {classification.routes.filter((row) => row.variant.kind === "SkipRegion").length}{" "}
+                  other-region variant
+                  {classification.routes.filter((row) => row.variant.kind === "SkipRegion").length === 1 ? "" : "s"} and{" "}
+                  {classification.routes.filter((row) => row.variant.kind === "SkipDuplicate").length} duplicate
+                  {classification.routes.filter((row) => row.variant.kind === "SkipDuplicate").length === 1 ? "" : "s"}{" "}
+                  skipped (kept your {regions.join(", ")} preference).
+                </p>
+              ) : null}
+              <ul>
+                {classification.groups
+                  .filter((group) => group.skippedVariants + group.skippedDuplicates > 0)
+                  .slice(0, 8)
+                  .map((group) => (
+                    <li key={`${group.systemId}/${group.stem}`}>
+                      skip (variant) — {group.stem} ({group.systemId}): kept {group.kept}, skipped{" "}
+                      {group.skippedVariants + group.skippedDuplicates}
+                    </li>
+                  ))}
+              </ul>
+            </div>
+          ) : null}
           <ul className="systems">
             {profile.romSchema.systems.map((system) => (
               <li key={system.id}>

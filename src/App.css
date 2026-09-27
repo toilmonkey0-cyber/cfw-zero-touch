@@ -92,3 +92,50 @@ input[type="text"], input:not([type]) {
 ol {
   padding-left: 18px;
 }
+
+/* Smart sort (needle) */
+.modes .mode {
+  border: 1px solid #d0d4dc;
+  border-radius: 8px;
+  padding: 0.45rem 0.7rem;
+  cursor: pointer;
+}
+.modes .mode.active {
+  border-color: #2563eb;
+  background: #eff4ff;
+}
+.chip {
+  margin: 0;
+  padding: 0.3rem 0.6rem;
+  border-radius: 999px;
+  background: #f1f3f7;
+  font-size: 0.9rem;
+}
+.chip.ok {
+  background: #e7f6ec;
+}
+.engine .error {
+  margin-top: 0.4rem;
+}
+.review table {
+  border-collapse: collapse;
+  margin-top: 0.6rem;
+  width: 100%;
+  font-size: 0.9rem;
+}
+.review th,
+.review td {
+  border: 1px solid #d0d4dc;
+  padding: 0.3rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+.review thead th {
+  background: #f6f7fa;
+}
+.variants ul {
+  margin: 0.3rem 0 0;
+  padding-left: 1.2rem;
+  font-size: 0.9rem;
+  color: #555;
+}
