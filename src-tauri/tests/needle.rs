@@ -1029,6 +1029,9 @@ fn mock_server(
         while served < max_requests && start.elapsed() < std::time::Duration::from_secs(20) {
             match listener.accept() {
                 Ok((mut socket, _)) => {
+                    // Deterministic reads/writes regardless of the
+                    // listener's non-blocking accept loop.
+                    socket.set_nonblocking(false).ok();
                     // ureq reads responses to completion on the connection,
                     // so wait for the full request bytes (headers, plus any
                     // body) with a stack instead of a single short read.
@@ -1048,7 +1051,24 @@ fn mock_server(
                                     }
                                 }
                             }
-                            Err(_) => break,
+                            Err(error) => {
+                                // On Windows an accepted socket can
+                                // inherit the listener's non-blocking
+                                // mode: a not-ready read must keep
+                                // waiting, dropping the connection
+                                // here surfaces client-side as an
+                                // abort (10053) on slow machines.
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::Interrupted
+                                ) {
+                                    std::thread::sleep(std::time::Duration::from_millis(2));
+                                    continue;
+                                }
+                                break;
+                            }
                         }
                     }
                     if !complete {
