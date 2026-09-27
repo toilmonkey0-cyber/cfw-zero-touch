@@ -34,7 +34,7 @@ fn fetch_writer(bytes: &'static [u8]) -> impl FnMut(&Path) -> Result<(), String>
 
 #[test]
 fn manifest_pins_are_complete_wellformed_and_pinned_to_a_revision() {
-    assert_eq!(manifest::NEEDLE_ARTIFACTS.len(), 4);
+    assert_eq!(manifest::NEEDLE_ARTIFACTS.len(), 5);
 
     let runtime: Vec<_> = manifest::NEEDLE_ARTIFACTS
         .iter()
@@ -42,7 +42,7 @@ fn manifest_pins_are_complete_wellformed_and_pinned_to_a_revision() {
         .collect();
     assert_eq!(
         runtime.iter().map(|a| a.id).collect::<Vec<_>>(),
-        vec!["weights", "serve-engine"],
+        vec!["weights", "serve-engine", "embed-helper"],
         "exactly the two runtime downloads, in a stable order"
     );
     let build: Vec<_> = manifest::NEEDLE_ARTIFACTS
@@ -94,6 +94,11 @@ fn runtime_artifact_ids_are_validated() {
     assert_eq!(
         acquire::runtime_artifact("serve-engine").unwrap().file_name,
         "needle.exe"
+    );
+    assert_eq!(
+        acquire::runtime_artifact("embed-helper").unwrap().file_name,
+        "cfw-embed.exe",
+        "our CI-built helper is a pinned runtime download"
     );
 
     let build = acquire::runtime_artifact("embed-lib").unwrap_err();

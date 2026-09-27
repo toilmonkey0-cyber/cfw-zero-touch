@@ -1,0 +1,105 @@
+name: cfw-embed helper
+
+# Builds the cfw-embed helper from a clean checkout with a pinned
+# llvm-mingw toolchain and SHA-256-pinned engine build inputs (the PR 1
+# manifest pins), then verifies the build reproduces the committed exe
+# pin byte-for-byte. Publishing to the 'helpers' release happens only on
+# an explicit workflow_dispatch with `release` set — the manifest URL
+# points at that release asset.
+
+on:
+  push:
+    branches: ["needle/**"]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish cfw-embed.exe to the 'helpers' release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  LLVM_MINGW_URL: https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-x86_64.zip
+  # Official GitHub asset digest for the pinned release.
+  LLVM_MINGW_SHA256: e3ad77d117a4bea19a7a3b333341824d79a5a371004a10e25b8504e7b3047666
+  # Hugging Face repo revision the engine build inputs are pinned to
+  # (same revision as src-tauri/src/needle/manifest.rs).
+  NEEDLE_HF_BASE: https://huggingface.co/Cactus-Compute/needle3/resolve/main
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Fetch and hash-verify the pinned llvm-mingw toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Invoke-WebRequest $env:LLVM_MINGW_URL -OutFile llvm-mingw.zip
+          $hash = (Get-FileHash llvm-mingw.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:LLVM_MINGW_SHA256) {
+            throw "llvm-mingw digest mismatch: got $hash"
+          }
+          Expand-Archive llvm-mingw.zip -DestinationPath "$env:RUNNER_TEMP\toolchain"
+
+      - name: Fetch the pinned engine build inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force inputs | Out-Null
+          foreach ($name in @("libneedle.a", "needle.h")) {
+            Invoke-WebRequest "$env:NEEDLE_HF_BASE/windows-x86_64/$name" -OutFile "inputs/$name"
+          }
+          # build.ps1 verifies these files against the PR 1 manifest pins
+          # before it links anything; a mismatch aborts the build.
+
+      - name: Build cfw-embed.exe (same flags as tools/cfw-embed/build.ps1)
+        shell: pwsh
+        run: |
+          .\tools\cfw-embed\build.ps1 `
+            -ToolchainDir "$env:RUNNER_TEMP\toolchain\llvm-mingw-20260922-ucrt-x86_64" `
+            -NeedleDir inputs `
+            -OutDir out
+
+      - name: Smoke-test the helper (needs no weights)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "out\cfw-embed.exe" -ArgumentList "--weights","missing.cact" `
+            -NoNewWindow -PassThru -RedirectStandardError smoke-err.txt
+          if (-not $p.WaitForExit(10000) -or $p.ExitCode -eq 0) {
+            throw "helper should fail cleanly on missing weights"
+          }
+          Get-Content smoke-err.txt
+
+      - name: Verify reproducibility against the committed manifest pin
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $built = (Get-FileHash "out\cfw-embed.exe" -Algorithm SHA256).Hash.ToLower()
+          $manifest = Get-Content src-tauri\src\needle\manifest.rs -Raw
+          if (-not ($manifest -match [regex]::Escape($built))) {
+            throw "cfw-embed.exe is not reproducible: built $built, which is not the pin committed in src-tauri/src/needle/manifest.rs. Update the pin to this hash only after verifying the change is intentional."
+          }
+          "reproducible: $built"
+
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cfw-embed
+          path: out/cfw-embed.exe
+          if-no-files-found: error
+
+      - name: Publish to the helpers release (explicit dispatch only)
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sha = (Get-FileHash "out\cfw-embed.exe" -Algorithm SHA256).Hash.ToLower()
+          gh release create helpers --title "Pinned helper builds" --notes "Reproducible helper builds. cfw-embed.exe sha256: $sha" --prerelease 2>$null
+          gh release upload helpers "out\cfw-embed.exe" --clobber
+          gh release upload helpers ($sha | ForEach-Object { Set-Content "cfw-embed.exe.sha256" $_; "cfw-embed.exe.sha256" }) --clobber

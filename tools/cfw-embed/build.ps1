@@ -51,6 +51,7 @@ if (-not (Test-Path $clang)) { throw "clang++ not found at $clang" }
 
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 & $clang -O2 -DNDEBUG `
+    "-Wl,/Brepro" `
     -I $NeedleDir -L $NeedleDir `
     (Join-Path $PSScriptRoot "cfw-embed.cpp") `
     -lneedle -static `

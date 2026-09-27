@@ -37,7 +37,7 @@ pub struct Artifact {
 }
 
 /// The pins. Order is stable: runtime downloads first, build inputs after.
-pub const NEEDLE_ARTIFACTS: [Artifact; 4] = [
+pub const NEEDLE_ARTIFACTS: [Artifact; 5] = [
     Artifact {
         id: "weights",
         role: ArtifactRole::RuntimeDownload,
@@ -55,6 +55,15 @@ pub const NEEDLE_ARTIFACTS: [Artifact; 4] = [
         size: 1_276_928,
         file_name: "needle.exe",
         purpose: "Serve-mode HTTP engine (Phase 2 Card Doctor; unused in Phase 1)",
+    },
+    Artifact {
+        id: "embed-helper",
+        role: ArtifactRole::RuntimeDownload,
+        url: "https://github.com/toilmonkey0-cyber/cfw-zero-touch/releases/download/helpers/cfw-embed.exe",
+        sha256: "614acfcd751c6cfca25d8e579855fdecda7e5cca73260828ff7cf497316efd50",
+        size: 2_384_384,
+        file_name: "cfw-embed.exe",
+        purpose: "Card Studio's own embedding helper, built by the helper-publish CI job from pinned llvm-mingw + engine inputs (reproducibility-checked against this pin on every build)",
     },
     Artifact {
         id: "embed-lib",
