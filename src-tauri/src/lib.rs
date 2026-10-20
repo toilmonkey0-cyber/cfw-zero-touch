@@ -1,3 +1,4 @@
+pub mod block_device;
 pub mod diag;
 pub mod feed;
 pub mod firstboot;
