@@ -68,6 +68,7 @@ fn copy_still_refuses_a_fixed_disk() {
     assert!(error.to_lowercase().contains("removable"));
 }
 
+#[cfg(windows)]
 #[test]
 fn windows_listing_returns_only_removable_drives() {
     let volumes = cfw_zero_touch_lib::volume::list_volumes().expect("drive list");

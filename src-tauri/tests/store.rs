@@ -66,7 +66,7 @@ fn store_root_honors_cfw_studio_data() {
     assert_eq!(store_root(), PathBuf::from(r"C:\cfw-test-data"));
     assert_eq!(
         profile_store_dir(),
-        PathBuf::from(r"C:\cfw-test-data\profiles")
+        PathBuf::from(r"C:\cfw-test-data").join("profiles")
     );
     std::env::remove_var("CFW_STUDIO_DATA");
 }

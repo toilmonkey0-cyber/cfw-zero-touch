@@ -77,6 +77,11 @@ button:disabled {
   margin: 12px 0;
 }
 
+progress {
+  width: 100%;
+  height: 10px;
+}
+
 input[type="text"], input:not([type]) {
   display: block;
   margin-top: 6px;

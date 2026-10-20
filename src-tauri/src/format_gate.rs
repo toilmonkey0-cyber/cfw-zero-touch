@@ -19,16 +19,36 @@ pub enum FormatBlock {
     Script,
 }
 
+/// Removable media with a reported capacity. Format and stock-card backup
+/// both call this instead of copying the check.
+pub fn drive_is_usable(current: &VolumeInfo) -> Result<(), FormatBlock> {
+    if !current.is_removable {
+        return Err(FormatBlock::NotRemovable);
+    }
+    if current.total_bytes == 0 {
+        return Err(FormatBlock::Size);
+    }
+    Ok(())
+}
+
+/// The capacity shown to the operator must still be the capacity of the drive.
+pub fn displayed_size_matches(
+    current: &VolumeInfo,
+    displayed_bytes: u64,
+) -> Result<(), FormatBlock> {
+    if current.total_bytes != displayed_bytes {
+        Err(FormatBlock::Size)
+    } else {
+        Ok(())
+    }
+}
+
 pub fn authorize_format(current: &VolumeInfo, request: &FormatRequest) -> Result<(), FormatBlock> {
     if request.confirmation != "FORMAT" {
         return Err(FormatBlock::Confirmation);
     }
-    if !current.is_removable {
-        return Err(FormatBlock::NotRemovable);
-    }
-    if current.total_bytes != request.displayed_bytes {
-        return Err(FormatBlock::Size);
-    }
+    drive_is_usable(current)?;
+    displayed_size_matches(current, request.displayed_bytes)?;
     if current.id != request.volume_id || current.letter != request.letter {
         return Err(FormatBlock::Identity);
     }

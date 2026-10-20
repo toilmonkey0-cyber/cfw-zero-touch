@@ -111,6 +111,12 @@ fn refuse_special() -> io::Error {
 /// A block or character device that the lexical check missed is refused from
 /// `symlink_metadata` before `OpenOptions::open`.
 fn open_regular(path: &Path, create: bool) -> io::Result<File> {
+    open_regular_access(path, create, true)
+}
+
+/// `write` is false for a backup source. Create and the flash-test opener
+/// still pass true.
+fn open_regular_access(path: &Path, create: bool, write: bool) -> io::Result<File> {
     if is_physical_disk_path(path) {
         return Err(refuse_physical());
     }
@@ -125,7 +131,10 @@ fn open_regular(path: &Path, create: bool) -> io::Result<File> {
         Err(error) => return Err(error),
     }
     let mut options = OpenOptions::new();
-    options.read(true).write(true);
+    options.read(true);
+    if write {
+        options.write(true);
+    }
     if create {
         options.create(true).truncate(true);
     }
@@ -164,6 +173,16 @@ impl FileBlockDevice {
     /// Open an existing regular file. Reported capacity equals the file length.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = open_regular(path, false)?;
+        let stored_len = file.metadata()?.len();
+        Self::from_file(path, file, stored_len, stored_len)
+    }
+
+    /// Open an existing regular file for reading only.
+    ///
+    /// Backup uses this. `write_at` fails because the handle was not opened
+    /// for write, and a physical-disk path is still refused before the open.
+    pub fn open_read_only(path: &Path) -> io::Result<Self> {
+        let file = open_regular_access(path, false, false)?;
         let stored_len = file.metadata()?.len();
         Self::from_file(path, file, stored_len, stored_len)
     }
