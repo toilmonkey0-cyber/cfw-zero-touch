@@ -3,6 +3,10 @@ node_modules/
 dist/
 .pnpm-store/
 
+# Python fixture script
+__pycache__/
+*.pyc
+
 # Rust / Tauri
 src-tauri/target/
 src-tauri/gen/

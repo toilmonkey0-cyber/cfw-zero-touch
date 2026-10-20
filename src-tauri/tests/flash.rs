@@ -1,9 +1,16 @@
 use std::io::{Cursor, Write};
 
-use cfw_zero_touch_lib::flash::{
-    authorize_flash, ensure_image, extracted_image_name, image_file_name, sha256_bytes, write_gzip,
-    FlashBlock, FlashDisk, FlashPlan,
+use cfw_zero_touch_lib::block_device::{
+    backup_stored, DeviceCursor, FakeBlockDevice, FileBlockDevice,
 };
+use cfw_zero_touch_lib::flash::{
+    authorize_flash, ensure_image, extracted_image_name, image_file_name, sha256_bytes,
+    sha256_prefix, write_gzip, FlashBlock, FlashDisk, FlashPlan, SectorWriter,
+};
+
+#[allow(dead_code, unused_imports)]
+#[path = "fixtures/mod.rs"]
+mod fixtures;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
@@ -188,4 +195,106 @@ fn wrong_cached_hash_is_replaced() {
 #[test]
 fn authorized_usb_disk_is_allowed() {
     authorize_flash(&disk(1, true, 100), &plan("FLASH", 1, 100, "abc")).unwrap();
+}
+
+#[test]
+fn flash_size_gate_uses_the_reported_size_of_a_fixture_card() {
+    let card = fixtures::build_card(fixtures::CardOptions::armed_original());
+    let stored = card.stored_len();
+    let reported = fixtures::wrap_reported_len(stored);
+    authorize_flash(&disk(1, true, reported), &plan("FLASH", 1, reported, "abc")).unwrap();
+    let error =
+        authorize_flash(&disk(1, true, reported), &plan("FLASH", 1, stored, "abc")).unwrap_err();
+    assert_eq!(error, FlashBlock::Size);
+}
+
+#[test]
+fn gzip_flash_helpers_roundtrip_a_fixture_image_on_a_fake_device() {
+    let card = fixtures::build_card(fixtures::CardOptions::disarmed_clone());
+    assert_eq!(card.bytes.len() % 512, 0);
+    let scratch = fixtures::Scratch::new("flash-fixture");
+    let path = scratch.path().join("card.img");
+    let stored = card.stored_len();
+    let device = FileBlockDevice::create(&path, stored, stored).unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&card.bytes).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut cursor = DeviceCursor::new(device);
+    let mut writer = SectorWriter::new(&mut cursor);
+    let written = write_gzip(Cursor::new(compressed), &mut writer).unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+    assert_eq!(written, stored);
+    cursor.rewind();
+    let card_hash = sha256_prefix(&mut cursor, written).unwrap();
+    let image_hash = sha256_bytes(&card.bytes);
+    assert_eq!(card_hash, image_hash);
+    authorize_flash(
+        &disk(1, true, stored),
+        &FlashPlan {
+            confirmation: "FLASH".into(),
+            disk_number: 1,
+            displayed_bytes: stored,
+            expected_sha256: image_hash,
+            actual_sha256: card_hash,
+        },
+    )
+    .unwrap();
+
+    let mut flashed = cursor.into_device();
+    let probe_buf = {
+        let mut buf = vec![0u8; stored as usize];
+        flashed.read_at(0, &mut buf).unwrap();
+        buf
+    };
+    let probe = fixtures::probe_image(&probe_buf).unwrap();
+    assert!(probe
+        .partitions
+        .iter()
+        .any(|part| part.label.eq_ignore_ascii_case("BOOT") && part.filesystem == "fat16"));
+    assert!(probe
+        .partitions
+        .iter()
+        .any(|part| part.label.eq_ignore_ascii_case("EASYROMS") && part.filesystem == "exfat"));
+}
+
+#[test]
+fn wraparound_fixture_fails_flash_readback() {
+    let card = fixtures::build_wrap_card();
+    let stored = card.stored_len();
+    let reported = card.reported_len;
+    assert!(reported > stored);
+    let scratch = fixtures::Scratch::new("wrap-flash");
+    let path = scratch.path().join("wrap-card.img");
+    let mut device = FileBlockDevice::create(&path, stored, reported).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), stored);
+    device.write_at(0, &card.bytes).unwrap();
+    let mut backup = Vec::new();
+    assert_eq!(backup_stored(&mut device, &mut backup).unwrap(), stored);
+    assert_eq!(backup, card.bytes);
+
+    let mut payload = card.bytes.clone();
+    payload.extend(std::iter::repeat_n(0xA5, 512));
+    assert!((payload.len() as u64) <= reported);
+    device.write_at(0, &payload).unwrap();
+    let mut readback = vec![0u8; payload.len()];
+    device.read_at(0, &mut readback).unwrap();
+    assert_ne!(readback, payload);
+    assert_eq!(
+        &readback[..512],
+        &payload[stored as usize..stored as usize + 512]
+    );
+
+    let image_hash = sha256_bytes(&payload);
+    let mut cursor = DeviceCursor::new(device);
+    let card_hash = sha256_prefix(&mut cursor, payload.len() as u64).unwrap();
+    assert_ne!(card_hash, image_hash);
+    // authorize_flash compares the reported size with the plan. A wrap card
+    // passes that gate; the read-back hash above is what catches it.
+    authorize_flash(
+        &disk(1, true, reported),
+        &plan("FLASH", 1, reported, &image_hash),
+    )
+    .unwrap();
 }

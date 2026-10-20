@@ -4,6 +4,10 @@ use cfw_zero_touch_lib::firstboot::{
     boot_letter, card_safety, disarm_easyroms_firstboot, user_roms_are_safe, CardSafety,
 };
 
+#[allow(dead_code, unused_imports)]
+#[path = "fixtures/mod.rs"]
+mod fixtures;
+
 fn fixture() -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
         "cfw-firstboot-{}-{}",
@@ -98,6 +102,65 @@ fn card_safety_allows_a_card_whose_boot_ran_firstboot() {
     let volumes = expanded_card_volumes();
     assert_eq!(card_safety(&volumes, Some(&boot)), CardSafety::Safe);
     let _ = fs::remove_dir_all(boot.parent().unwrap());
+}
+
+#[test]
+fn armed_fixture_boot_is_not_safe_for_user_roms() {
+    let card = fixtures::build_card(fixtures::CardOptions::armed_original());
+    let scratch = fixtures::Scratch::new("armed-boot");
+    let boot = scratch.path().join("boot");
+    fixtures::extract_boot(&card.bytes, &boot).unwrap();
+    let error = user_roms_are_safe(&boot).unwrap_err();
+    assert!(error.contains("expandtoexfat.sh"), "{error}");
+    assert!(boot.join("doneit").is_file());
+    let probe = fixtures::probe_image(&card.bytes).unwrap();
+    match card_safety(&fixtures::lettered_volumes(&probe), Some(&boot)) {
+        CardSafety::Armed(reason) => assert!(reason.contains("expandtoexfat.sh"), "{reason}"),
+        other => panic!("expected Armed, got {other:?}"),
+    }
+    assert_eq!(
+        fixtures::read_easyroms(&card.bytes, "gba/game.gba").unwrap(),
+        b"keep-me"
+    );
+}
+
+#[test]
+fn disarm_on_an_extracted_fixture_boot_removes_scripts_and_leaves_dtbs() {
+    let card = fixtures::build_card(fixtures::CardOptions::armed_clone());
+    let scratch = fixtures::Scratch::new("disarm-fixture");
+    let boot = scratch.path().join("boot");
+    fixtures::extract_boot(&card.bytes, &boot).unwrap();
+    let report = disarm_easyroms_firstboot(&boot).unwrap();
+    assert!(report.removed.iter().any(|name| name == "expandtoexfat.sh"));
+    assert!(report.removed.iter().any(|name| name == "firstboot.sh"));
+    user_roms_are_safe(&boot).unwrap();
+    assert!(boot.join("rk3326-r36s-type4-linux.dtb").is_file());
+    assert!(boot.join("rk3326-r36s-linux.dtb").is_file());
+    assert!(!fixtures::boot_file(&card.bytes, "expandtoexfat.sh")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        fixtures::read_easyroms(&card.bytes, "gba/game.gba").unwrap(),
+        b"keep-me"
+    );
+}
+
+#[test]
+fn disarmed_fixture_boot_is_safe_and_refuses_another_disarm() {
+    let card = fixtures::build_card(fixtures::CardOptions::disarmed_original());
+    let scratch = fixtures::Scratch::new("disarmed-boot");
+    let boot = scratch.path().join("boot");
+    fixtures::extract_boot(&card.bytes, &boot).unwrap();
+    user_roms_are_safe(&boot).unwrap();
+    let error = disarm_easyroms_firstboot(&boot).unwrap_err();
+    assert!(error.to_lowercase().contains("expandtoexfat"), "{error}");
+    let probe = fixtures::probe_image(&card.bytes).unwrap();
+    assert_eq!(
+        card_safety(&fixtures::lettered_volumes(&probe), Some(&boot)),
+        CardSafety::Safe
+    );
+    assert!(boot.join("gameconsole-r36s.dtb").is_file());
+    assert!(boot.join("rk3326-rg351mp-linux.dtb").is_file());
 }
 
 #[test]
