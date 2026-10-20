@@ -47,6 +47,14 @@ fn format_refuses_when_the_shown_size_no_longer_matches() {
 }
 
 #[test]
+fn format_refuses_a_drive_that_reports_size_zero() {
+    let mut empty = card();
+    empty.total_bytes = 0;
+    let error = authorize_format(&empty, &request("FORMAT", 0)).unwrap_err();
+    assert_eq!(error, FormatBlock::Size);
+}
+
+#[test]
 fn format_refuses_when_the_drive_identity_changed() {
     let mut moved = request("FORMAT", 32_000_000_000);
     moved.volume_id = "F:".into();

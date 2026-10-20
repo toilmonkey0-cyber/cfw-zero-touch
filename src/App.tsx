@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import "./App.css";
+import { stockImagePath } from "./backupPath";
 import { formatBytes } from "./formatBytes";
 
 type SystemFolder = { id: string; folder: string; extensions: string[] };
@@ -80,7 +81,18 @@ type DoctorReport = {
   suggestedProfileId: string | null;
 };
 
-type Step = "profile" | "card" | "library" | "flash" | "bootOnce" | "done";
+type Step = "profile" | "card" | "library" | "flash" | "bootOnce" | "done" | "backup";
+
+type BackupProgress = { bytesRead: number; bytesTotal: number };
+
+type BackupReport = {
+  status: "complete" | "cancelled";
+  image: string;
+  sidecar: string;
+  sha256: string;
+  partial: string;
+  bytes: number;
+};
 
 type SortMode = "none" | "smart" | "dat";
 
@@ -145,6 +157,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [flashDisks, setFlashDisks] = useState<FlashDisk[]>([]);
   const [flashLog, setFlashLog] = useState("");
+  const [backupDest, setBackupDest] = useState("");
+  const [backupProgress, setBackupProgress] = useState<BackupProgress | null>(null);
+  const [backupReport, setBackupReport] = useState<BackupReport | null>(null);
   const [keepExistingFolders, setKeepExistingFolders] = useState(false);
   const [feedCheck, setFeedCheck] = useState<FeedCheck | null>(null);
   const [checkingFeed, setCheckingFeed] = useState(false);
@@ -301,6 +316,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const unlisten = listen<BackupProgress>("backup-progress", (event) => {
+      setBackupProgress(event.payload);
+    });
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
     const unlisten = listen<{ relativeDest: string; index: number; total: number; done: boolean }>(
       "copy-progress",
       (event) => {
@@ -346,6 +370,49 @@ export default function App() {
     }
     setStep("card");
     await refreshVolumes(next);
+  }
+
+  async function openBackup() {
+    setError("");
+    setBackupReport(null);
+    setBackupProgress(null);
+    setStep("backup");
+    await refreshFlashDisks();
+  }
+
+  async function chooseBackupDestination() {
+    const selected = await save({
+      title: "Save stock-card backup",
+      defaultPath: "stock-card.img.gz",
+      filters: [{ name: "Compressed disk image", extensions: ["gz"] }],
+    });
+    if (typeof selected === "string" && selected.trim().length > 0) {
+      setBackupDest(stockImagePath(selected));
+    }
+  }
+
+  async function startBackup(disk: FlashDisk) {
+    if (!backupDest) return;
+    setBusy(true);
+    setError("");
+    setBackupReport(null);
+    setBackupProgress(null);
+    try {
+      const report = await invoke<BackupReport>("backup_stock_card", {
+        diskNumber: disk.number,
+        displayedBytes: disk.sizeBytes,
+        destination: backupDest,
+      });
+      setBackupReport(report);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelBackup() {
+    await invoke("cancel_stock_backup");
   }
 
   async function refreshFlashDisks() {
@@ -721,6 +788,11 @@ export default function App() {
               </div>
             </div>
           ) : null}
+          <div className="row">
+            <button disabled={busy} onClick={() => void openBackup()}>
+              Back up a stock card
+            </button>
+          </div>
           {profiles.length === 0 ? <p>No ROMs-card profiles found.</p> : null}
           <div className="cards">
             {profiles.map((item) => (
@@ -734,6 +806,70 @@ export default function App() {
               </button>
             ))}
           </div>
+        </section>
+      ) : null}
+
+      {step === "backup" ? (
+        <section>
+          <h2>Back up a stock card</h2>
+          <p>
+            Reads the whole removable card into a compressed .img.gz and a SHA-256 file next to
+            it. The card is opened read-only. This does not format or flash the card. Fixed disks
+            and disk 0 are not listed. Cancel keeps a .partial file and does not leave a finished
+            image. If Windows refuses the read, run Card Studio as administrator and try again.
+          </p>
+          <div className="row">
+            <button disabled={busy} onClick={() => void refreshFlashDisks()}>
+              Refresh disks
+            </button>
+            <button disabled={busy} onClick={() => void chooseBackupDestination()}>
+              Choose where to save
+            </button>
+            <button disabled={busy} onClick={() => setStep("profile")}>
+              Back
+            </button>
+          </div>
+          {backupDest ? <p className="path">{backupDest}</p> : <p>Choose a .img.gz file first.</p>}
+          {flashDisks.length === 0 ? <p>No USB disk detected.</p> : null}
+          <ul className="volumes">
+            {flashDisks.map((disk) => (
+              <li key={disk.number}>
+                <div>
+                  <strong>
+                    Disk {disk.number}: {disk.name}
+                  </strong>
+                  <span>{formatBytes(disk.sizeBytes)}</span>
+                </div>
+                <button
+                  disabled={busy || backupDest.length === 0}
+                  onClick={() => void startBackup(disk)}
+                >
+                  Back up disk {disk.number}
+                </button>
+              </li>
+            ))}
+          </ul>
+          {backupProgress ? (
+            <div>
+              <progress value={backupProgress.bytesRead} max={backupProgress.bytesTotal || 1} />
+              <p>
+                Read {formatBytes(backupProgress.bytesRead)} of{" "}
+                {formatBytes(backupProgress.bytesTotal)}
+              </p>
+            </div>
+          ) : null}
+          {busy ? (
+            <button onClick={() => void cancelBackup()}>Cancel backup</button>
+          ) : null}
+          {backupReport?.status === "complete" ? (
+            <p className="path">
+              Saved {backupReport.image} ({formatBytes(backupReport.bytes)}). SHA-256{" "}
+              {backupReport.sha256}. Checksum file {backupReport.sidecar}.
+            </p>
+          ) : null}
+          {backupReport?.status === "cancelled" ? (
+            <p className="path">Cancelled. Partial file: {backupReport.partial}</p>
+          ) : null}
         </section>
       ) : null}
 

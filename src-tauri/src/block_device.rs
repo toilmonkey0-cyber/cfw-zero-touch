@@ -12,6 +12,7 @@
 //! disk. [`FileBlockDevice::create`] and [`FileBlockDevice::open`] reject
 //! `/dev/...` and `\\.\PhysicalDrive...` paths before any open on that path.
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -39,7 +40,12 @@ pub trait FakeBlockDevice {
 /// The check is lexical. It does not stat, open, read, or write the path.
 pub fn is_physical_disk_path(path: &Path) -> bool {
     let raw = path.to_string_lossy();
-    let raw_lower = raw.to_ascii_lowercase();
+    // Windows `canonicalize` returns `\\?\C:\...` for an ordinary folder.
+    // That prefix is a file namespace, not a disk. Strip it only for a drive
+    // letter or `UNC\share`. `\\?\PhysicalDriveN`, `\\?\GLOBALROOT\...`, and
+    // `\\?\Volume{...}` stay verbatim and fail the checks below.
+    let checked = simplify_verbatim_file_path(&raw);
+    let raw_lower = checked.to_ascii_lowercase();
     if raw_lower.contains("physicaldrive")
         || raw_lower.starts_with(r"\\.\")
         || raw_lower.starts_with(r"\\?\")
@@ -55,6 +61,43 @@ pub fn is_physical_disk_path(path: &Path) -> bool {
         return true;
     }
     dev_root(&lexical_absolute(path))
+}
+
+/// `\\?\C:\dir` and `\\?\UNC\server\share` become the path Win32 would show.
+/// Anything else, including device namespaces, is returned unchanged.
+fn simplify_verbatim_file_path(raw: &str) -> Cow<'_, str> {
+    let Some(rest) = strip_verbatim_prefix(raw) else {
+        return Cow::Borrowed(raw);
+    };
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Cow::Borrowed(rest);
+    }
+    if let Some(share) = strip_prefix_ci(rest, r"UNC\").or_else(|| strip_prefix_ci(rest, "UNC/")) {
+        let mut unc = String::from(r"\\");
+        unc.push_str(share);
+        return Cow::Owned(unc);
+    }
+    Cow::Borrowed(raw)
+}
+
+fn strip_verbatim_prefix(raw: &str) -> Option<&str> {
+    strip_prefix_ci(raw, r"\\?\").or_else(|| strip_prefix_ci(raw, "//?/"))
+}
+
+fn strip_prefix_ci<'a>(hay: &'a str, prefix: &str) -> Option<&'a str> {
+    let hay_bytes = hay.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
+    if hay_bytes.len() >= prefix_bytes.len()
+        && hay_bytes[..prefix_bytes.len()]
+            .iter()
+            .zip(prefix_bytes)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    {
+        Some(&hay[prefix_bytes.len()..])
+    } else {
+        None
+    }
 }
 
 fn dev_root(path: &Path) -> bool {
@@ -111,6 +154,12 @@ fn refuse_special() -> io::Error {
 /// A block or character device that the lexical check missed is refused from
 /// `symlink_metadata` before `OpenOptions::open`.
 fn open_regular(path: &Path, create: bool) -> io::Result<File> {
+    open_regular_access(path, create, true)
+}
+
+/// `write` is false for a backup source. Create and the flash-test opener
+/// still pass true.
+fn open_regular_access(path: &Path, create: bool, write: bool) -> io::Result<File> {
     if is_physical_disk_path(path) {
         return Err(refuse_physical());
     }
@@ -125,7 +174,10 @@ fn open_regular(path: &Path, create: bool) -> io::Result<File> {
         Err(error) => return Err(error),
     }
     let mut options = OpenOptions::new();
-    options.read(true).write(true);
+    options.read(true);
+    if write {
+        options.write(true);
+    }
     if create {
         options.create(true).truncate(true);
     }
@@ -164,6 +216,16 @@ impl FileBlockDevice {
     /// Open an existing regular file. Reported capacity equals the file length.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = open_regular(path, false)?;
+        let stored_len = file.metadata()?.len();
+        Self::from_file(path, file, stored_len, stored_len)
+    }
+
+    /// Open an existing regular file for reading only.
+    ///
+    /// Backup uses this. `write_at` fails because the handle was not opened
+    /// for write, and a physical-disk path is still refused before the open.
+    pub fn open_read_only(path: &Path) -> io::Result<Self> {
+        let file = open_regular_access(path, false, false)?;
         let stored_len = file.metadata()?.len();
         Self::from_file(path, file, stored_len, stored_len)
     }
@@ -358,12 +420,39 @@ mod tests {
         assert!(is_physical_disk_path(Path::new("/dev/mmcblk0")));
         assert!(is_physical_disk_path(Path::new("/dev/loop0")));
         assert!(is_physical_disk_path(Path::new("/dev")));
+        assert!(is_physical_disk_path(Path::new(
+            r"\\?\GLOBALROOT\Device\Harddisk0\DR0"
+        )));
+        assert!(is_physical_disk_path(Path::new(
+            r"\\.\GLOBALROOT\Device\Harddisk0\DR0"
+        )));
+        assert!(is_physical_disk_path(Path::new(
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\card.img"
+        )));
+        assert!(is_physical_disk_path(Path::new(r"\\.\C:")));
         let error = FileBlockDevice::create(Path::new("/dev/sda"), 512, 512).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("physical disk"));
         let missing =
             FileBlockDevice::create(Path::new("/dev/cfw-not-a-real-node"), 512, 512).unwrap_err();
         assert!(missing.to_string().contains("physical disk"));
+    }
+
+    #[test]
+    fn verbatim_drive_letter_and_unc_paths_are_ordinary_files() {
+        for path in [
+            r"\\?\C:\Users\cfw\stock.img.gz",
+            r"\\?\D:\backup\stock.img.gz",
+            r"\\?\c:\users\cfw\stock.img.gz",
+            r"//?/C:/Users/cfw/stock.img.gz",
+            r"\\?\UNC\nas\share\stock.img.gz",
+            r"//?/UNC/nas/share/stock.img.gz",
+        ] {
+            assert!(
+                !is_physical_disk_path(Path::new(path)),
+                "{path} is a file path, not a disk"
+            );
+        }
     }
 
     #[test]

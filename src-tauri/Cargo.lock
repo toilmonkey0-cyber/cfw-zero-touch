@@ -506,6 +506,7 @@ version = "0.2.0"
 dependencies = [
  "flate2",
  "jsonschema",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3135,6 +3136,9 @@ checksum = "a15ad77d9e70a92437d8f74c35d99b4e4691128df018833e99f90bcd36152672"
 dependencies = [
  "block2",
  "dispatch2",
+ "glib-sys",
+ "gobject-sys",
+ "gtk-sys",
  "js-sys",
  "log",
  "objc2",

@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod block_device;
 pub mod diag;
 pub mod feed;
@@ -15,6 +16,7 @@ pub mod store;
 pub mod volume;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use profiles::Profile;
 use romcopy::CopyPlan;
@@ -1097,6 +1099,200 @@ fn flash_os(
     Ok(text)
 }
 
+static STOCK_BACKUP_RUNNING: AtomicBool = AtomicBool::new(false);
+static STOCK_BACKUP_CANCEL: AtomicBool = AtomicBool::new(false);
+
+struct StockBackupGuard;
+
+impl Drop for StockBackupGuard {
+    fn drop(&mut self) {
+        STOCK_BACKUP_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+fn begin_stock_backup() -> Result<StockBackupGuard, String> {
+    if STOCK_BACKUP_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err("a stock-card backup is already running".into());
+    }
+    STOCK_BACKUP_CANCEL.store(false, Ordering::SeqCst);
+    Ok(StockBackupGuard)
+}
+
+/// `Get-Disk` only. This does not open `\\.\PhysicalDriveN`.
+fn query_flash_disk(number: u32) -> Result<flash::FlashDisk, String> {
+    if number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    let script = format!(
+        "$d = Get-Disk -Number {number}; Write-Output ($d.Number.ToString() + '|' + $d.BusType.ToString() + '|' + $d.Size.ToString() + '|' + $d.IsSystem.ToString() + '|' + $d.IsBoot.ToString())"
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|error| format!("could not inspect the disk: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find(|line| line.contains('|'))
+        .ok_or("no disk info")?;
+    let queried = backup::parse_disk_query(line, number)?;
+    Ok(flash::FlashDisk {
+        number: queried.number,
+        bus: queried.bus,
+        size_bytes: queried.size_bytes,
+        system_disk: queried.system_disk,
+    })
+}
+
+/// Read-only on purpose. Do not add `.write(true)`: a stock-card backup must
+/// not be able to change the card. The wipe path stays in `cfw-flash` and is
+/// not called from here. Tests never call this; they use fixture files.
+fn open_stock_disk_read_only(number: u32) -> Result<std::fs::File, String> {
+    if number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(format!(r"\\.\PhysicalDrive{number}"))
+            .map_err(|error| {
+                format!(
+                    "could not open disk {number} read-only ({error}). If Windows refused access, run Card Studio as administrator and try again. The card was not written."
+                )
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        Err(format!(
+            "reading physical disk {number} is implemented for Windows; the card was not opened"
+        ))
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupReportView {
+    status: String,
+    image: String,
+    sidecar: String,
+    sha256: String,
+    partial: String,
+    bytes: u64,
+}
+
+#[tauri::command]
+fn backup_stock_card(
+    app: tauri::AppHandle,
+    disk_number: u32,
+    displayed_bytes: u64,
+    destination: String,
+) -> Result<BackupReportView, String> {
+    let _guard = begin_stock_backup()?;
+    if disk_number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    let destination = PathBuf::from(&destination);
+    backup::check_destination(&destination).map_err(|error| error.to_string())?;
+    let info = query_flash_disk(disk_number)?;
+    let disk = backup::BackupDisk {
+        number: info.number,
+        bus: info.bus,
+        size_bytes: info.size_bytes,
+        system_disk: info.system_disk || info.number == 0,
+        displayed_bytes,
+    };
+    backup::authorize_backup(&disk).map_err(|block| block.message().to_string())?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let free = backup::directory_free_bytes(parent)
+        .map_err(|error| format!("could not check free space: {error}"))?;
+    let need = backup::bytes_required(info.size_bytes);
+    if free < need {
+        return Err(format!(
+            "not enough free space for the backup: need {need} bytes, {free} free"
+        ));
+    }
+    diag::log(
+        "INFO",
+        "backup_start",
+        &format!("disk={disk_number} bytes={}", info.size_bytes),
+    );
+    let file = open_stock_disk_read_only(disk_number).inspect_err(|error| {
+        diag::log("ERROR", "backup_failed", error);
+    })?;
+    let mut source = backup::ReadOnlyFile::new(file, info.size_bytes);
+    let mut last_emit = 0u64;
+    let outcome = backup::backup_image(
+        &mut source,
+        &destination,
+        free,
+        &STOCK_BACKUP_CANCEL,
+        |progress| {
+            let boundary = progress.bytes_read == progress.bytes_total;
+            if boundary || progress.bytes_read.saturating_sub(last_emit) >= 1024 * 1024 {
+                last_emit = progress.bytes_read;
+                let _ = app.emit("backup-progress", &progress);
+            }
+        },
+    )
+    .map_err(|error| {
+        diag::log("ERROR", "backup_failed", &error.to_string());
+        error.to_string()
+    })?;
+    match outcome {
+        backup::BackupOutcome::Complete {
+            image,
+            sidecar,
+            sha256,
+            bytes,
+        } => {
+            diag::log(
+                "INFO",
+                "backup_done",
+                &format!("disk={disk_number} bytes={bytes}"),
+            );
+            Ok(BackupReportView {
+                status: "complete".into(),
+                image: image.display().to_string(),
+                sidecar: sidecar.display().to_string(),
+                sha256,
+                partial: String::new(),
+                bytes,
+            })
+        }
+        backup::BackupOutcome::Cancelled { partial } => {
+            diag::log(
+                "INFO",
+                "backup_cancelled",
+                &format!("disk={disk_number} partial={}", partial.display()),
+            );
+            Ok(BackupReportView {
+                status: "cancelled".into(),
+                image: String::new(),
+                sidecar: String::new(),
+                sha256: String::new(),
+                partial: partial.display().to_string(),
+                bytes: 0,
+            })
+        }
+    }
+}
+
+#[tauri::command]
+fn cancel_stock_backup() {
+    STOCK_BACKUP_CANCEL.store(true, Ordering::SeqCst);
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FeedCheckView {
@@ -1577,6 +1773,8 @@ pub fn run() {
             list_profiles,
             list_flash_disks,
             flash_os,
+            backup_stock_card,
+            cancel_stock_backup,
             list_volumes,
             firstboot_state,
             prepare_card,
