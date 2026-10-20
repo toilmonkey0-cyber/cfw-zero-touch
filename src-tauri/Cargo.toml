@@ -3,6 +3,7 @@ name = "cfw-zero-touch"
 version = "0.2.0"
 description = "Desktop wizard that prepares a handheld CFW ROMs card on the PC"
 authors = ["Aaron"]
+license = "MIT"
 edition = "2021"
 default-run = "cfw-zero-touch"
 

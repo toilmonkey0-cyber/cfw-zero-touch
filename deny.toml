@@ -1,0 +1,44 @@
+# Supply-chain check for the Tauri crate graph.
+# CI runs `cargo deny check` as a warning only: a finding is reported and the job stays green.
+# Advisories currently fail on transitive rustls vulnerabilities and unmaintained `unic-*`
+# crates pulled in by Tauri. Licenses, bans, and sources pass.
+# The graph is the Windows target this app actually ships.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+
+[advisories]
+version = 2
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

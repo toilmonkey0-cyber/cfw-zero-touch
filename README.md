@@ -117,10 +117,11 @@ Checks:
 
 ```bash
 npm test               # tsc --noEmit + eslint
+npm run test:unit      # vitest
 cd src-tauri && cargo test
 ```
 
-Build a release bundle with `npm run tauri build`. CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and the frontend checks on every push.
+Build a release bundle with `npm run tauri build`. CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and the frontend checks (including `npm run test:unit`) on every push. Pull requests also build an unsigned Windows installer and upload the `.msi` and `.exe`. `cargo deny` and `npm audit` run as warnings and do not fail the workflow.
 
 ## Documentation
 
