@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import "./App.css";
+import { formatBytes } from "./formatBytes";
 
 type SystemFolder = { id: string; folder: string; extensions: string[] };
 
@@ -126,14 +127,6 @@ type Classification = {
 };
 
 type Resolution = { systemId: string | null; size: number };
-
-function formatBytes(bytes: number): string {
-  if (bytes < 0) return "unknown size";
-  if (bytes < 1000) return `${bytes} B`;
-  const mb = bytes / 1_000_000;
-  if (mb < 1000) return mb < 10 ? `${mb.toFixed(1)} MB` : `${Math.round(mb)} MB`;
-  return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
-}
 
 export default function App() {
   const [step, setStep] = useState<Step>("profile");
