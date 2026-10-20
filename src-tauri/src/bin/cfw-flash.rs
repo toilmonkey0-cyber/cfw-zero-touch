@@ -1,9 +1,13 @@
 use std::fs::File;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::Command;
 
 use cfw_zero_touch_lib::flash::{
     authorize_flash, sha256_prefix, sha256_reader, write_gzip, FlashDisk, FlashPlan, SectorWriter,
+};
+use cfw_zero_touch_lib::restore::{
+    cancel_file_requests_stop, hashes_match, image_fits, WatchedWrite,
 };
 
 fn arg(name: &str) -> String {
@@ -11,6 +15,12 @@ fn arg(name: &str) -> String {
     std::env::args()
         .find_map(|item| item.strip_prefix(&prefix).map(str::to_string))
         .unwrap_or_else(|| panic!("missing --{name}"))
+}
+
+/// Absent when this is an OS flash. Restore passes the flag by name.
+fn optional_arg(name: &str) -> Option<String> {
+    let prefix = format!("--{name}=");
+    std::env::args().find_map(|item| item.strip_prefix(&prefix).map(str::to_string))
 }
 
 fn main() {
@@ -44,6 +54,40 @@ fn main() {
         std::process::exit(3);
     }
 
+    // Restore-only. OS flash does not pass these flags, so it still clears
+    // and writes exactly as before.
+    let uncompressed = match optional_arg("uncompressed-bytes") {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                eprintln!("bad --uncompressed-bytes");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    if let Some(image_bytes) = uncompressed {
+        if !image_fits(image_bytes, disk.size_bytes) {
+            eprintln!("image is larger than the target disk");
+            std::process::exit(4);
+        }
+    }
+    let cancel_file = optional_arg("cancel-file");
+    if let Some(path) = &cancel_file {
+        match cancel_file_requests_stop(Path::new(path)) {
+            Ok(true) => {
+                eprintln!("restore cancelled before writing");
+                std::process::exit(9);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let progress_file = optional_arg("progress-file");
+
     if disk_has_label(disk_number, "EASYROMS") {
         println!("card is labeled EASYROMS; FLASH confirmation is erasing it");
     }
@@ -53,10 +97,29 @@ fn main() {
         std::process::exit(5);
     });
 
-    let written = write_physical(disk_number, &image).unwrap_or_else(|error| {
+    let written = if cancel_file.is_some() || progress_file.is_some() {
+        write_physical_watched(
+            disk_number,
+            &image,
+            cancel_file.as_deref(),
+            progress_file.as_deref(),
+            uncompressed.unwrap_or(0),
+        )
+    } else {
+        write_physical(disk_number, &image)
+    }
+    .unwrap_or_else(|error| {
         eprintln!("{error}");
-        std::process::exit(6);
+        let code = if cancel_file.is_some() && error.contains("restore cancelled") {
+            9
+        } else {
+            6
+        };
+        std::process::exit(code);
     });
+    if let Some(path) = &progress_file {
+        let _ = std::fs::write(path, format!("readback 0 {written}\n"));
+    }
     let card_hash = hash_physical(disk_number, written).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(7);
@@ -76,6 +139,14 @@ fn main() {
     if image_hash != card_hash {
         eprintln!("card does not match the image");
         std::process::exit(8);
+    }
+    if let Some(sidecar) = optional_arg("sidecar-sha256") {
+        if !hashes_match(&card_hash, &sidecar) {
+            eprintln!("verify=fail");
+            eprintln!("card does not match the backup checksum");
+            std::process::exit(8);
+        }
+        println!("verify=pass");
     }
     println!("RESULT=OK");
 }
@@ -142,16 +213,35 @@ fn clear_disk(number: u32) -> Result<(), String> {
 
 fn write_physical(number: u32, image: &str) -> Result<u64, String> {
     let mut output = SectorWriter::new(open_drive(number)?);
+    write_opened_image(image, &mut output)
+}
+
+fn write_opened_image(image: &str, output: &mut impl Write) -> Result<u64, String> {
     let mut input = File::open(image).map_err(|error| error.to_string())?;
     let written = if image.ends_with(".gz") {
-        write_gzip(input, &mut output)?
+        write_gzip(input, &mut *output)?
     } else {
-        write_raw(&mut input, &mut output)?
+        write_raw(&mut input, &mut *output)?
     };
     output
         .flush()
         .map_err(|error| format!("could not flush the image: {error}"))?;
     Ok(written)
+}
+
+fn write_physical_watched(
+    number: u32,
+    image: &str,
+    cancel_file: Option<&str>,
+    progress_file: Option<&str>,
+    total: u64,
+) -> Result<u64, String> {
+    let mut drive = open_drive(number)?;
+    let cancel_path = cancel_file.map(Path::new);
+    let progress_path = progress_file.map(Path::new);
+    let mut output = SectorWriter::new(&mut drive);
+    let mut watched = WatchedWrite::new(&mut output, total, None, cancel_path, progress_path, None);
+    write_opened_image(image, &mut watched)
 }
 
 fn write_raw(input: &mut File, output: &mut impl Write) -> Result<u64, String> {

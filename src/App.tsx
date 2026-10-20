@@ -6,6 +6,12 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import "./App.css";
 import { stockImagePath } from "./backupPath";
 import { formatBytes } from "./formatBytes";
+import {
+  isFinishedBackupName,
+  restoreConfirmPrompt,
+  restoreDiskModel,
+  restorePhaseLabel,
+} from "./restorePath";
 
 type SystemFolder = { id: string; folder: string; extensions: string[] };
 
@@ -81,7 +87,7 @@ type DoctorReport = {
   suggestedProfileId: string | null;
 };
 
-type Step = "profile" | "card" | "library" | "flash" | "bootOnce" | "done" | "backup";
+type Step = "profile" | "card" | "library" | "flash" | "bootOnce" | "done" | "backup" | "restore";
 
 type BackupProgress = { bytesRead: number; bytesTotal: number };
 
@@ -92,6 +98,16 @@ type BackupReport = {
   sha256: string;
   partial: string;
   bytes: number;
+};
+
+type RestoreProgress = { phase: string; bytesDone: number; bytesTotal: number };
+
+type RestoreReport = {
+  status: "pass" | "fail" | "cancelled";
+  sha256: string;
+  cardSha256: string;
+  bytes: number;
+  detail: string;
 };
 
 type SortMode = "none" | "smart" | "dat";
@@ -160,6 +176,10 @@ export default function App() {
   const [backupDest, setBackupDest] = useState("");
   const [backupProgress, setBackupProgress] = useState<BackupProgress | null>(null);
   const [backupReport, setBackupReport] = useState<BackupReport | null>(null);
+  const [restoreImage, setRestoreImage] = useState("");
+  const [restoreConfirmation, setRestoreConfirmation] = useState("");
+  const [restoreProgress, setRestoreProgress] = useState<RestoreProgress | null>(null);
+  const [restoreReport, setRestoreReport] = useState<RestoreReport | null>(null);
   const [keepExistingFolders, setKeepExistingFolders] = useState(false);
   const [feedCheck, setFeedCheck] = useState<FeedCheck | null>(null);
   const [checkingFeed, setCheckingFeed] = useState(false);
@@ -325,6 +345,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const unlisten = listen<RestoreProgress>("restore-progress", (event) => {
+      setRestoreProgress(event.payload);
+    });
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
     const unlisten = listen<{ relativeDest: string; index: number; total: number; done: boolean }>(
       "copy-progress",
       (event) => {
@@ -413,6 +442,53 @@ export default function App() {
 
   async function cancelBackup() {
     await invoke("cancel_stock_backup");
+  }
+
+  async function openRestore() {
+    setError("");
+    setRestoreReport(null);
+    setRestoreProgress(null);
+    setRestoreConfirmation("");
+    setStep("restore");
+    await refreshFlashDisks();
+  }
+
+  async function chooseRestoreImage() {
+    const selected = await open({
+      title: "Choose a stock-card backup",
+      filters: [{ name: "Compressed disk image", extensions: ["gz"] }],
+      multiple: false,
+    });
+    if (typeof selected === "string" && selected.trim().length > 0) {
+      setRestoreImage(selected.trim());
+      setRestoreReport(null);
+    }
+  }
+
+  async function startRestore(disk: FlashDisk) {
+    if (!isFinishedBackupName(restoreImage)) return;
+    setBusy(true);
+    setError("");
+    setRestoreReport(null);
+    setRestoreProgress(null);
+    try {
+      const report = await invoke<RestoreReport>("restore_backup", {
+        diskNumber: disk.number,
+        displayedBytes: disk.sizeBytes,
+        displayedModel: restoreDiskModel(disk.name),
+        confirmation: restoreConfirmation,
+        imagePath: restoreImage,
+      });
+      setRestoreReport(report);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelRestore() {
+    await invoke("cancel_restore");
   }
 
   async function refreshFlashDisks() {
@@ -792,6 +868,9 @@ export default function App() {
             <button disabled={busy} onClick={() => void openBackup()}>
               Back up a stock card
             </button>
+            <button disabled={busy} onClick={() => void openRestore()}>
+              Restore a backup
+            </button>
           </div>
           {profiles.length === 0 ? <p>No ROMs-card profiles found.</p> : null}
           <div className="cards">
@@ -869,6 +948,91 @@ export default function App() {
           ) : null}
           {backupReport?.status === "cancelled" ? (
             <p className="path">Cancelled. Partial file: {backupReport.partial}</p>
+          ) : null}
+        </section>
+      ) : null}
+
+      {step === "restore" ? (
+        <section>
+          <h2>Restore a backup</h2>
+          <p>
+            Writes a finished .img.gz backup onto the USB disk you confirm. The backup is checked
+            against its .sha256 file before anything is erased. Disk 0, fixed disks, and Windows
+            system or boot disks are refused. After the write, the card is read back and compared
+            to that same checksum.
+          </p>
+          <div className="row">
+            <button disabled={busy} onClick={() => void refreshFlashDisks()}>
+              Refresh disks
+            </button>
+            <button disabled={busy} onClick={() => void chooseRestoreImage()}>
+              Choose backup
+            </button>
+            <button disabled={busy} onClick={() => setStep("profile")}>
+              Back
+            </button>
+          </div>
+          {restoreImage ? (
+            <p className="path">{restoreImage}</p>
+          ) : (
+            <p>Choose a finished .img.gz and its .sha256 file.</p>
+          )}
+          {restoreImage && !isFinishedBackupName(restoreImage) ? (
+            <p className="error">Choose a finished .img.gz. Partial backups are refused.</p>
+          ) : null}
+          {flashDisks.length === 0 ? <p>No USB disk detected.</p> : null}
+          <ul className="volumes">
+            {flashDisks.map((disk) => {
+              const model = restoreDiskModel(disk.name);
+              return (
+                <li key={disk.number}>
+                  <div>
+                    <strong>
+                      Disk {disk.number}: {model}
+                    </strong>
+                    <span>{formatBytes(disk.sizeBytes)}</span>
+                  </div>
+                  <label>
+                    {restoreConfirmPrompt({
+                      number: disk.number,
+                      name: model,
+                      sizeLabel: formatBytes(disk.sizeBytes),
+                    })}
+                    <input
+                      value={restoreConfirmation}
+                      onChange={(event) => setRestoreConfirmation(event.target.value)}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <button
+                    disabled={
+                      busy ||
+                      restoreConfirmation !== "FLASH" ||
+                      !isFinishedBackupName(restoreImage)
+                    }
+                    onClick={() => void startRestore(disk)}
+                  >
+                    Restore onto disk {disk.number}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          {restoreProgress ? (
+            <div>
+              <progress
+                value={restoreProgress.bytesDone}
+                max={restoreProgress.bytesTotal || 1}
+              />
+              <p>
+                {restorePhaseLabel(restoreProgress.phase)}{" "}
+                {formatBytes(restoreProgress.bytesDone)} of {formatBytes(restoreProgress.bytesTotal)}
+              </p>
+            </div>
+          ) : null}
+          {busy ? <button onClick={() => void cancelRestore()}>Cancel restore</button> : null}
+          {restoreReport ? (
+            <p className={restoreReport.status === "fail" ? "error" : "path"}>{restoreReport.detail}</p>
           ) : null}
         </section>
       ) : null}
