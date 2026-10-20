@@ -110,6 +110,48 @@ pub fn source_volume(disk: &BackupDisk) -> VolumeInfo {
     }
 }
 
+/// One `Get-Disk` line: `number|bus|size|IsSystem|IsBoot`.
+///
+/// `system_disk` is set for disk 0 and when Windows reports IsSystem or IsBoot.
+/// The flash helper does not use this parser.
+pub struct QueriedDisk {
+    pub number: u32,
+    pub bus: String,
+    pub size_bytes: u64,
+    pub system_disk: bool,
+}
+
+pub fn parse_disk_query(line: &str, expected_number: u32) -> Result<QueriedDisk, String> {
+    let mut parts = line.trim().split('|');
+    let found: u32 = parts
+        .next()
+        .unwrap_or_default()
+        .parse()
+        .map_err(|_| format!("bad disk line {line}"))?;
+    if found != expected_number {
+        return Err("disk identity changed before the backup".into());
+    }
+    let bus = parts.next().unwrap_or("").to_string();
+    let size_bytes: u64 = parts
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| format!("bad disk size {line}"))?;
+    let is_system = flag_is_true(parts.next().unwrap_or(""));
+    let is_boot = flag_is_true(parts.next().unwrap_or(""));
+    Ok(QueriedDisk {
+        number: found,
+        bus,
+        size_bytes,
+        system_disk: found == 0 || is_system || is_boot,
+    })
+}
+
+fn flag_is_true(value: &str) -> bool {
+    let value = value.trim();
+    value == "1" || value.eq_ignore_ascii_case("true")
+}
+
 pub fn authorize_backup(disk: &BackupDisk) -> Result<(), BackupBlock> {
     let volume = source_volume(disk);
     let decision = decide(&volume, "");
@@ -362,7 +404,10 @@ pub fn backup_image(
     let file = options.open(&partial).map_err(|error| {
         BackupError::Write(format!("could not create {}: {error}", partial.display()))
     })?;
-    let mut encoder = GzEncoder::new(file, Compression::fast());
+    // `spoil` stays set until `finish` returns the writer. Dropping the
+    // encoder writes a gzip trailer; the wrapper then replaces those bytes
+    // so a cancelled or failed partial cannot be decompressed.
+    let mut encoder = GzEncoder::new(PartialFile { file, spoil: true }, Compression::fast());
     let mut view = ReadOnlyView(device);
     let mut hasher = Sha256::new();
     let mut offset = 0u64;
@@ -397,15 +442,20 @@ pub fn backup_image(
         return Ok(BackupOutcome::Cancelled { partial });
     }
 
-    let finished = encoder.finish().map_err(|error| {
+    let mut finished = encoder.finish().map_err(|error| {
         BackupError::Write(format!(
             "could not finish the compressed image: {error}; partial backup left at {}",
             partial.display()
         ))
     })?;
-    finished.sync_all().map_err(|error| {
-        BackupError::Write(format!("could not flush {}: {error}", partial.display()))
-    })?;
+    finished.spoil = false;
+    if let Err(error) = finished.file.sync_all() {
+        finished.spoil = true;
+        return Err(BackupError::Write(format!(
+            "could not flush {}: {error}",
+            partial.display()
+        )));
+    }
     drop(finished);
     fs::rename(&partial, destination).map_err(|error| {
         BackupError::Write(format!(
@@ -428,6 +478,36 @@ pub fn backup_image(
         sha256,
         bytes: total,
     })
+}
+
+/// Owns the partial file. On drop, a still-spoiled file is replaced with a
+/// marker that is not a gzip stream. `GzEncoder`'s drop writes a valid
+/// trailer first; this drop runs after that and removes it.
+struct PartialFile {
+    file: File,
+    spoil: bool,
+}
+
+impl Write for PartialFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        if !self.spoil {
+            return;
+        }
+        let _ = self.file.set_len(0);
+        let _ = self.file.seek(io::SeekFrom::Start(0));
+        let _ = self.file.write_all(b"CFW-PARTIAL\n");
+        let _ = self.file.sync_all();
+    }
 }
 
 fn hex_hash(bytes: &[u8]) -> String {

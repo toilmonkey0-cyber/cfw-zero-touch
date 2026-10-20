@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use cfw_zero_touch_lib::backup::{
-    authorize_backup, backup_image, bytes_required, directory_free_bytes, partial_path,
-    sidecar_path, source_volume, BackupBlock, BackupDisk, BackupError, BackupOutcome,
+    authorize_backup, backup_image, bytes_required, check_destination, directory_free_bytes,
+    parse_disk_query, partial_path, sidecar_path, source_volume, BackupBlock, BackupDisk,
+    BackupError, BackupOutcome,
 };
 use cfw_zero_touch_lib::block_device::{FakeBlockDevice, FileBlockDevice};
 use cfw_zero_touch_lib::flash::sha256_bytes;
@@ -203,6 +204,15 @@ fn cancel_leaves_partial_and_does_not_publish_a_finished_image() {
     assert!(std::fs::metadata(&partial).unwrap().len() > 0);
     assert_eq!(device.writes, 0);
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+    let partial_bytes = std::fs::read(&partial).unwrap();
+    let mut restored = Vec::new();
+    let decoded = flate2::read::GzDecoder::new(partial_bytes.as_slice()).read_to_end(&mut restored);
+    assert!(
+        decoded.is_err(),
+        "cancelled partial decompressed to {} bytes",
+        restored.len()
+    );
 }
 
 #[test]
@@ -287,6 +297,133 @@ fn backup_refuses_to_follow_a_symlinked_partial_file() {
     assert_eq!(device.writes, 0);
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert!(!destination.exists());
+}
+
+#[test]
+fn verbatim_drive_letter_is_not_a_physical_backup_destination() {
+    let path = Path::new(r"\\?\C:\Users\cfw\stock.img.gz");
+    assert!(!cfw_zero_touch_lib::block_device::is_physical_disk_path(
+        path
+    ));
+    if let Err(error) = check_destination(path) {
+        let message = error.to_string().to_lowercase();
+        assert!(
+            !message.contains("physical"),
+            "drive-letter verbatim path was treated as a disk: {message}"
+        );
+    }
+}
+
+#[test]
+fn device_paths_are_refused_before_any_filesystem_call() {
+    for path in [
+        r"\\.\PhysicalDrive0",
+        r"\\?\PhysicalDrive1",
+        r"\\?\GLOBALROOT\Device\Harddisk0\DR0",
+        r"\\.\GLOBALROOT\Device\Harddisk0\DR0",
+        r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\card.img.gz",
+        r"\\.\C:",
+    ] {
+        let error = check_destination(Path::new(path)).unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("physical"),
+            "{path} -> {error}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_canonical_drive_destination_is_accepted() {
+    let dir = std::env::temp_dir().join(format!(
+        "cfw-backup-dest-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = dir.join("stock.img.gz");
+    let canonical = std::fs::canonicalize(&dir).unwrap();
+    let display = canonical.display().to_string();
+    let bare = display.strip_prefix(r"\\?\").unwrap_or(display.as_str());
+    let verbatim = format!(r"\\?\{bare}");
+    assert!(
+        !cfw_zero_touch_lib::block_device::is_physical_disk_path(std::path::Path::new(&verbatim)),
+        "{verbatim}"
+    );
+    assert!(
+        !cfw_zero_touch_lib::block_device::is_physical_disk_path(&canonical),
+        "canonical path treated as a disk: {display}"
+    );
+    match check_destination(&dest) {
+        Ok(()) => {}
+        Err(error) => panic!("C: destination refused: {error}"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_device_paths_are_still_refused() {
+    for path in [
+        r"\\.\PhysicalDrive0",
+        r"\\?\PhysicalDrive1",
+        r"\\?\GLOBALROOT\Device\Harddisk0\Partition0\card.img.gz",
+        r"\\.\C:",
+        r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\card.img.gz",
+    ] {
+        let error = check_destination(Path::new(path)).unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("physical"),
+            "{path} -> {error}"
+        );
+    }
+}
+
+#[test]
+fn get_disk_system_or_boot_flags_refuse_the_backup() {
+    let system = parse_disk_query("3|USB|33554432|True|False", 3).unwrap();
+    assert!(system.system_disk);
+    assert_eq!(
+        authorize_backup(&BackupDisk {
+            number: system.number,
+            bus: system.bus.clone(),
+            size_bytes: system.size_bytes,
+            system_disk: system.system_disk,
+            displayed_bytes: system.size_bytes,
+        }),
+        Err(BackupBlock::NotRemovable)
+    );
+
+    let boot = parse_disk_query("4|USB|33554432|False|True", 4).unwrap();
+    assert!(boot.system_disk);
+    assert_eq!(
+        authorize_backup(&BackupDisk {
+            number: boot.number,
+            bus: boot.bus,
+            size_bytes: boot.size_bytes,
+            system_disk: boot.system_disk,
+            displayed_bytes: boot.size_bytes,
+        }),
+        Err(BackupBlock::NotRemovable)
+    );
+
+    let normal = parse_disk_query("5|USB|33554432|False|False", 5).unwrap();
+    assert!(!normal.system_disk);
+    assert_eq!(normal.number, 5);
+    assert_eq!(normal.size_bytes, 33_554_432);
+    assert!(authorize_backup(&BackupDisk {
+        number: normal.number,
+        bus: normal.bus,
+        size_bytes: normal.size_bytes,
+        system_disk: normal.system_disk,
+        displayed_bytes: normal.size_bytes,
+    })
+    .is_ok());
+
+    assert!(parse_disk_query("9|USB|1|False|False", 3).is_err());
 }
 
 #[test]

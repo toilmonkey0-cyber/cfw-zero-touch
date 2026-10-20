@@ -1124,7 +1124,7 @@ fn query_flash_disk(number: u32) -> Result<flash::FlashDisk, String> {
         return Err("refusing to open disk 0".into());
     }
     let script = format!(
-        "$d = Get-Disk -Number {number}; Write-Output ($d.Number.ToString() + '|' + $d.BusType + '|' + $d.Size)"
+        "$d = Get-Disk -Number {number}; Write-Output ($d.Number.ToString() + '|' + $d.BusType.ToString() + '|' + $d.Size.ToString() + '|' + $d.IsSystem.ToString() + '|' + $d.IsBoot.ToString())"
     );
     let output = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
@@ -1138,26 +1138,12 @@ fn query_flash_disk(number: u32) -> Result<flash::FlashDisk, String> {
         .lines()
         .find(|line| line.contains('|'))
         .ok_or("no disk info")?;
-    let mut parts = line.trim().split('|');
-    let found: u32 = parts
-        .next()
-        .unwrap_or_default()
-        .parse()
-        .map_err(|_| format!("bad disk line {line}"))?;
-    if found != number {
-        return Err("disk identity changed before the backup".into());
-    }
-    let bus = parts.next().unwrap_or("").to_string();
-    let size_bytes: u64 = parts
-        .next()
-        .unwrap_or("0")
-        .parse()
-        .map_err(|_| format!("bad disk size {line}"))?;
+    let queried = backup::parse_disk_query(line, number)?;
     Ok(flash::FlashDisk {
-        number: found,
-        bus,
-        size_bytes,
-        system_disk: found == 0,
+        number: queried.number,
+        bus: queried.bus,
+        size_bytes: queried.size_bytes,
+        system_disk: queried.system_disk,
     })
 }
 
