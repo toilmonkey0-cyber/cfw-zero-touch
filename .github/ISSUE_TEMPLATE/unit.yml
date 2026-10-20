@@ -1,0 +1,34 @@
+name: Unit
+description: One unit of work, shipped as one squash-merged pull request.
+title: "[Unit]: "
+labels: ["unit"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One unit per pull request, on a branch named `unit/NN-name`. Green is docs and guardrails. Yellow changes app behavior and does not write disks. Red touches flash, format, volume, or firstboot.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What this unit ships, in a few sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: Checks that must be true before the pull request is squash-merged. The pull request links back here.
+    validations:
+      required: true
+  - type: dropdown
+    id: risk-tier
+    attributes:
+      label: Risk tier
+      description: Green is docs, templates, or copy. Yellow changes app behavior and does not write disks. Red touches flash, format, volume, or firstboot.
+      options:
+        - green
+        - yellow
+        - red
+    validations:
+      required: true
