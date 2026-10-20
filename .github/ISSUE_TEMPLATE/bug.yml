@@ -1,0 +1,47 @@
+name: Bug
+description: Something went wrong while preparing or flashing a card.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell us the card you were using. The diagnostics log is at `%LOCALAPPDATA%\cfw-card-studio\diagnostics.log`. It does not contain ROM file names.
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Handheld model.
+      placeholder: Powkiddy RGB10X
+    validations:
+      required: true
+  - type: input
+    id: cfw
+    attributes:
+      label: CFW
+      description: Firmware and the profile you picked.
+      placeholder: dArkOS RGB10X, profile darkos-rgb10x-os
+    validations:
+      required: true
+  - type: input
+    id: card-size
+    attributes:
+      label: Card size
+      description: Size printed on the card, and the size the app showed.
+      placeholder: 64 GB card, app showed 59.5 GB
+    validations:
+      required: true
+  - type: textarea
+    id: diag-log
+    attributes:
+      label: Diagnostics log
+      description: Paste the relevant lines from diagnostics.log. Leave out anything that is not from that file.
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what the app did instead.
+    validations:
+      required: true

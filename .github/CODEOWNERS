@@ -1,0 +1,6 @@
+# Disk and first-boot code. @toilmonkey0-cyber reviews these paths.
+/src-tauri/src/flash.rs          @toilmonkey0-cyber
+/src-tauri/src/volume.rs         @toilmonkey0-cyber
+/src-tauri/src/format_gate.rs    @toilmonkey0-cyber
+/src-tauri/src/firstboot.rs      @toilmonkey0-cyber
+/src-tauri/src/bin/              @toilmonkey0-cyber

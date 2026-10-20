@@ -1,0 +1,27 @@
+name: Device request
+description: Ask for a card layout for a handheld that is not supported yet.
+title: "[Device]: "
+labels: ["device-request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A new device starts from the stock card. List the DTB files that are already on it. Do not attach copyrighted ROMs or BIOS.
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Handheld model and, if you know it, the panel or clone variant.
+      placeholder: R36S clone, panel 4
+    validations:
+      required: true
+  - type: textarea
+    id: stock-dtb-files
+    attributes:
+      label: Stock DTB file list
+      description: Every DTB file on the stock card. One file name per line, with the folder if it is not in the card root.
+      placeholder: |
+        rk3326-r36s.dtb
+        rk3326-r36s-v2.dtb
+    validations:
+      required: true
