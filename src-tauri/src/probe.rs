@@ -9,9 +9,14 @@
 //! after the same size and model recheck U4 uses, and only when this module
 //! authorizes the disk. Tests pass a [`FakeBlockDevice`].
 
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
 
 use crate::backup::{self, BackupBlock, BackupDisk};
 use crate::block_device::{is_physical_disk_path, FakeBlockDevice};
@@ -19,6 +24,13 @@ use crate::restore::{self, RestoreError};
 
 /// Pattern block. Samples and the sequential window stay on this boundary.
 pub const PROBE_BLOCK: u64 = 512;
+
+/// Leading bytes that must be zero, along with sector 0, the GPT header, and
+/// every sample, before a card with no backup may be tested.
+pub const BLANK_HEAD: u64 = 1024 * 1024;
+
+/// How much of the card is hashed into the backup's card identity.
+pub const PREFIX_IDENTITY_BYTES: u64 = 4 * 1024 * 1024;
 
 const SEQUENTIAL_LIMIT: u64 = 1024 * 1024;
 
@@ -29,6 +41,8 @@ pub struct ProbeDisk {
     pub size_bytes: u64,
     pub system_disk: bool,
     pub model: String,
+    /// Fresh disk serial or UniqueId. Empty when the disk does not report one.
+    pub serial: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +81,7 @@ impl ProbeBlock {
                 "the disk model on screen does not match this disk; refresh and confirm the model shown"
             }
             Self::Backup => {
-                "the backup does not match this card's size, model, and checksum file. The card was not written."
+                "the backup does not match this card. The size, model, serial, or contents differ. The card was not written."
             }
             Self::NotBlank => {
                 "this card has data on it. Back up this exact card in this session before testing it. The card was not written."
@@ -79,14 +93,21 @@ impl ProbeBlock {
 #[derive(Debug)]
 pub enum ProbeError {
     Blocked(ProbeBlock),
-    Failed(String),
+    Failed { message: String, overwritten: bool },
+}
+
+fn fail(overwritten: bool, message: impl Into<String>) -> ProbeError {
+    ProbeError::Failed {
+        message: message.into(),
+        overwritten,
+    }
 }
 
 impl std::fmt::Display for ProbeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Blocked(block) => formatter.write_str(block.message()),
-            Self::Failed(message) => formatter.write_str(message),
+            Self::Failed { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -125,12 +146,27 @@ pub enum ProbeStatus {
     Cancelled { overwritten: bool, summary: String },
 }
 
+/// Identity captured when this process backed the card up.
+///
+/// `bytes` and `model` are the disk at backup time. `prefix_sha256` is the
+/// first [`PREFIX_IDENTITY_BYTES`] of that card. `serial` is Windows
+/// `UniqueId`, or `SerialNumber` when UniqueId is empty. An empty serial means
+/// the disk did not report one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardIdentity {
+    pub serial: String,
+    pub prefix_sha256: String,
+    pub bytes: u64,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionBackup {
     pub image: PathBuf,
     pub size_bytes: u64,
     pub model: String,
     pub sha256: String,
+    pub identity: CardIdentity,
 }
 
 #[derive(Debug, Default)]
@@ -230,49 +266,58 @@ pub fn authorize_probe(disk: &ProbeDisk, plan: &ProbePlan) -> Result<(), ProbeBl
     })
 }
 
-/// No partition table, or every sample block is still zeros.
+/// A card is blank only when sector 0, the GPT header sector, the first 1 MiB,
+/// and every sample block are all zeros.
+///
+/// A missing partition table is not enough. Leftover bytes with no partition
+/// entry are still data.
 pub fn card_is_blank(device: &mut dyn FakeBlockDevice) -> Result<bool, ProbeError> {
-    if !has_partitions(device)? {
-        return Ok(true);
+    let len = device.reported_len();
+    if len < PROBE_BLOCK * 2 || !len.is_multiple_of(PROBE_BLOCK) {
+        return Ok(false);
     }
-    let offsets = sample_offsets(device.reported_len());
+    if !span_is_zero(device, 0, PROBE_BLOCK)? {
+        return Ok(false);
+    }
+    if !span_is_zero(device, PROBE_BLOCK, PROBE_BLOCK)? {
+        return Ok(false);
+    }
+    if !span_is_zero(device, 0, len.min(BLANK_HEAD))? {
+        return Ok(false);
+    }
+    let offsets = sample_offsets(len);
     regions_all_zero(device, &offsets)
 }
 
-fn has_partitions(device: &mut dyn FakeBlockDevice) -> Result<bool, ProbeError> {
-    if device.reported_len() < PROBE_BLOCK {
-        return Ok(false);
-    }
-    let mut sector = [0u8; PROBE_BLOCK as usize];
-    device.read_at(0, &mut sector).map_err(|error| {
-        ProbeError::Failed(format!("could not read the partition table: {error}"))
-    })?;
-    let mut parts = false;
-    if sector[510] == 0x55 && sector[511] == 0xAA {
-        for slot in 0..4 {
-            if sector[446 + slot * 16 + 4] != 0 {
-                parts = true;
-                break;
-            }
+fn span_is_zero(
+    device: &mut dyn FakeBlockDevice,
+    offset: u64,
+    len: u64,
+) -> Result<bool, ProbeError> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let end = offset.saturating_add(len);
+    let mut at = offset;
+    while at < end {
+        let n = ((end - at) as usize).min(buf.len());
+        device
+            .read_at(at, &mut buf[..n])
+            .map_err(|error| fail(false, format!("could not read the card at {at}: {error}")))?;
+        if buf[..n].iter().any(|byte| *byte != 0) {
+            return Ok(false);
         }
+        at += n as u64;
     }
-    if !parts && device.reported_len() >= PROBE_BLOCK * 2 {
-        let mut gpt = [0u8; 8];
-        device.read_at(PROBE_BLOCK, &mut gpt).map_err(|error| {
-            ProbeError::Failed(format!("could not read the partition table: {error}"))
-        })?;
-        if &gpt == b"EFI PART" {
-            parts = true;
-        }
-    }
-    Ok(parts)
+    Ok(true)
 }
 
 fn regions_all_zero(device: &mut dyn FakeBlockDevice, offsets: &[u64]) -> Result<bool, ProbeError> {
     let mut buf = vec![0u8; PROBE_BLOCK as usize];
     for offset in offsets {
         device.read_at(*offset, &mut buf).map_err(|error| {
-            ProbeError::Failed(format!("could not read the card at {offset}: {error}"))
+            fail(
+                false,
+                format!("could not read the card at {offset}: {error}"),
+            )
         })?;
         if buf.iter().any(|byte| *byte != 0) {
             return Ok(false);
@@ -281,12 +326,21 @@ fn regions_all_zero(device: &mut dyn FakeBlockDevice, offsets: &[u64]) -> Result
     Ok(true)
 }
 
+pub fn overwrite_notice(backed_up: bool) -> &'static str {
+    if backed_up {
+        "Part of this card was overwritten. Restore your backup before you use this card."
+    } else {
+        "Part of this card was overwritten. Format the card again before you use this card."
+    }
+}
+
 pub fn plain_summary(
     kind: CardKind,
     claimed: u64,
     real: u64,
     write_mbps: f64,
     read_mbps: f64,
+    backed_up: bool,
 ) -> String {
     let claimed_label = format_capacity(claimed);
     let real_label = format_capacity(real);
@@ -306,16 +360,24 @@ pub fn plain_summary(
             "This card is failing: it says {claimed_label} but only about {real_label} could be read back."
         ),
     };
-    format!("{lead} {speeds}")
+    format!("{lead} {speeds} {}", overwrite_notice(backed_up))
 }
 
-pub fn cancel_summary(overwritten: bool) -> String {
-    if overwritten {
+pub fn cancel_summary(overwritten: bool, backed_up: bool) -> String {
+    if !overwritten {
+        return "Cancelled. Nothing on the card was overwritten.".into();
+    }
+    if backed_up {
         "Cancelled. Data on the card was overwritten. Restore your backup before you use this card."
             .into()
     } else {
-        "Cancelled. Nothing on the card was overwritten.".into()
+        "Cancelled. Data on the card was overwritten. Format the card again before you use this card."
+            .into()
     }
+}
+
+pub fn unknown_overwrite_summary() -> &'static str {
+    "Cancelled. The log did not say whether the card was overwritten. Restore your backup, or format the card, before you use it."
 }
 
 pub fn run_probe(
@@ -324,17 +386,18 @@ pub fn run_probe(
     cancel: &AtomicBool,
     cancel_file: Option<&Path>,
 ) -> Result<ProbeStatus, ProbeError> {
+    let backed_up = request.backup.is_some();
     authorize_probe(request.disk, request.plan).map_err(ProbeError::Blocked)?;
     if device.reported_len() != request.disk.size_bytes {
         return Err(ProbeError::Blocked(ProbeBlock::Size));
     }
     if let Some(backup) = request.backup {
-        verify_session_backup(backup, request.disk, cancel)?;
+        verify_session_backup(backup, request.disk, device, cancel)?;
     } else if !card_is_blank(device)? {
         return Err(ProbeError::Blocked(ProbeBlock::NotBlank));
     }
-    if stop_requested(cancel, cancel_file)? {
-        return Ok(cancelled(false));
+    if stop_requested(cancel, cancel_file, false)? {
+        return Ok(cancelled(false, backed_up));
     }
 
     let claimed = device.reported_len();
@@ -344,48 +407,60 @@ pub fn run_probe(
     }
     let mut overwritten = false;
     for offset in &offsets {
-        if stop_requested(cancel, cancel_file)? {
-            return Ok(cancelled(overwritten));
+        if stop_requested(cancel, cancel_file, overwritten)? {
+            return Ok(cancelled(overwritten, backed_up));
         }
         let block = pattern(*offset);
-        device.write_at(*offset, &block).map_err(|error| {
-            ProbeError::Failed(format!(
-                "could not write the test pattern at {offset}: {error}"
-            ))
-        })?;
+        // A failed write may already have landed. Say so.
         overwritten = true;
+        device.write_at(*offset, &block).map_err(|error| {
+            fail(
+                true,
+                format!(
+                    "could not write the test pattern at {offset}: {error}. {}",
+                    overwrite_notice(backed_up)
+                ),
+            )
+        })?;
     }
-    if stop_requested(cancel, cancel_file)? {
-        return Ok(cancelled(overwritten));
+    if stop_requested(cancel, cancel_file, overwritten)? {
+        return Ok(cancelled(overwritten, backed_up));
     }
 
     let mut samples = Vec::with_capacity(offsets.len());
     let mut buf = vec![0u8; PROBE_BLOCK as usize];
     for offset in &offsets {
-        if stop_requested(cancel, cancel_file)? {
-            return Ok(cancelled(overwritten));
+        if stop_requested(cancel, cancel_file, overwritten)? {
+            return Ok(cancelled(overwritten, backed_up));
         }
         device.read_at(*offset, &mut buf).map_err(|error| {
-            ProbeError::Failed(format!(
-                "could not read the test pattern at {offset}: {error}"
-            ))
+            fail(
+                true,
+                format!(
+                    "could not read the test pattern at {offset}: {error}. {}",
+                    overwrite_notice(backed_up)
+                ),
+            )
         })?;
         samples.push((*offset, decode_tag(&buf)));
     }
     let (kind, real_bytes, aliased) = judge(claimed, &samples);
 
-    if stop_requested(cancel, cancel_file)? {
-        return Ok(cancelled(overwritten));
+    if stop_requested(cancel, cancel_file, overwritten)? {
+        return Ok(cancelled(overwritten, backed_up));
     }
-    let (write_mbps, read_mbps) = match measure_speed(device, cancel, cancel_file, &mut overwritten)
-    {
-        Ok(speeds) => speeds,
-        Err(ProbeError::Failed(message)) if message == "probe-cancelled" => {
-            return Ok(cancelled(overwritten));
-        }
-        Err(error) => return Err(error),
-    };
-    let summary = plain_summary(kind, claimed, real_bytes, write_mbps, read_mbps);
+    let (write_mbps, read_mbps) =
+        match measure_speed(device, cancel, cancel_file, &mut overwritten, backed_up) {
+            Ok(speeds) => speeds,
+            Err(ProbeError::Failed {
+                message,
+                overwritten,
+            }) if message == "probe-cancelled" => {
+                return Ok(cancelled(overwritten, backed_up));
+            }
+            Err(error) => return Err(error),
+        };
+    let summary = plain_summary(kind, claimed, real_bytes, write_mbps, read_mbps, backed_up);
     Ok(ProbeStatus::Finished(ProbeReport {
         kind,
         claimed_bytes: claimed,
@@ -397,32 +472,60 @@ pub fn run_probe(
     }))
 }
 
-fn cancelled(overwritten: bool) -> ProbeStatus {
+fn cancelled(overwritten: bool, backed_up: bool) -> ProbeStatus {
     ProbeStatus::Cancelled {
         overwritten,
-        summary: cancel_summary(overwritten),
+        summary: cancel_summary(overwritten, backed_up),
     }
 }
 
-fn verify_session_backup(
+/// The recorded backup must be this card: size, model, serial, prefix hash,
+/// gzip prefix, and sidecar. Size and model alone are not accepted.
+pub fn verify_session_backup(
     backup: &SessionBackup,
     disk: &ProbeDisk,
+    device: &mut dyn FakeBlockDevice,
     cancel: &AtomicBool,
 ) -> Result<(), ProbeError> {
-    if backup.size_bytes != disk.size_bytes || !restore::same_model(&backup.model, &disk.model) {
+    if is_physical_disk_path(&backup.image) {
         return Err(ProbeError::Blocked(ProbeBlock::Backup));
     }
-    if is_physical_disk_path(&backup.image) {
+    let stored = match load_identity(&backup.image) {
+        Ok(identity) => identity,
+        Err(_) => return Err(ProbeError::Blocked(ProbeBlock::Backup)),
+    };
+    if !same_identity(&stored, &backup.identity)
+        || stored.bytes != backup.size_bytes
+        || !restore::same_model(&stored.model, &backup.model)
+    {
+        return Err(ProbeError::Blocked(ProbeBlock::Backup));
+    }
+    if stored.bytes != disk.size_bytes || !restore::same_model(&stored.model, &disk.model) {
+        return Err(ProbeError::Blocked(ProbeBlock::Backup));
+    }
+    if normalize_serial(&stored.serial) != normalize_serial(&disk.serial) {
+        return Err(ProbeError::Blocked(ProbeBlock::Backup));
+    }
+    let image_prefix = match gzip_prefix_sha256(&backup.image, stored.bytes) {
+        Ok(hash) => hash,
+        Err(_) => return Err(ProbeError::Blocked(ProbeBlock::Backup)),
+    };
+    if !restore::hashes_match(&image_prefix, &stored.prefix_sha256) {
+        return Err(ProbeError::Blocked(ProbeBlock::Backup));
+    }
+    let live_prefix = prefix_sha256(device)?;
+    if !restore::hashes_match(&live_prefix, &stored.prefix_sha256) {
         return Err(ProbeError::Blocked(ProbeBlock::Backup));
     }
     let inspected = match restore::inspect_backup(&backup.image, cancel, |_| {}) {
         Ok(inspected) => inspected,
         Err(RestoreError::Cancelled { .. }) => {
-            return Err(ProbeError::Failed(cancel_summary(false)));
+            return Err(fail(false, cancel_summary(false, true)));
         }
         Err(_) => return Err(ProbeError::Blocked(ProbeBlock::Backup)),
     };
     if inspected.image_bytes != disk.size_bytes
+        || inspected.image_bytes != stored.bytes
         || !restore::hashes_match(&inspected.sha256, &backup.sha256)
     {
         return Err(ProbeError::Blocked(ProbeBlock::Backup));
@@ -430,7 +533,11 @@ fn verify_session_backup(
     Ok(())
 }
 
-fn stop_requested(cancel: &AtomicBool, cancel_file: Option<&Path>) -> Result<bool, ProbeError> {
+fn stop_requested(
+    cancel: &AtomicBool,
+    cancel_file: Option<&Path>,
+    overwritten: bool,
+) -> Result<bool, ProbeError> {
     if cancel.load(Ordering::Acquire) {
         return Ok(true);
     }
@@ -438,11 +545,12 @@ fn stop_requested(cancel: &AtomicBool, cancel_file: Option<&Path>) -> Result<boo
         return Ok(false);
     };
     if is_physical_disk_path(path) {
-        return Err(ProbeError::Failed(
-            "refusing to read a cancel flag from a physical disk path".into(),
+        return Err(fail(
+            overwritten,
+            "refusing to read a cancel flag from a physical disk path",
         ));
     }
-    restore::cancel_file_requests_stop(path).map_err(ProbeError::Failed)
+    restore::cancel_file_requests_stop(path).map_err(|error| fail(overwritten, error))
 }
 
 fn pattern(offset: u64) -> [u8; PROBE_BLOCK as usize] {
@@ -557,6 +665,7 @@ fn measure_speed(
     cancel: &AtomicBool,
     cancel_file: Option<&Path>,
     overwritten: &mut bool,
+    backed_up: bool,
 ) -> Result<(f64, f64), ProbeError> {
     let span = sequential_span(device.reported_len());
     if span == 0 {
@@ -566,14 +675,20 @@ fn measure_speed(
     let started = Instant::now();
     let mut offset = 0u64;
     while offset < span {
-        if stop_requested(cancel, cancel_file)? {
-            return Err(ProbeError::Failed("probe-cancelled".into()));
+        if stop_requested(cancel, cancel_file, *overwritten)? {
+            return Err(fail(*overwritten, "probe-cancelled"));
         }
         let n = ((span - offset) as usize).min(chunk.len());
-        device.write_at(offset, &chunk[..n]).map_err(|error| {
-            ProbeError::Failed(format!("could not measure write speed: {error}"))
-        })?;
         *overwritten = true;
+        device.write_at(offset, &chunk[..n]).map_err(|error| {
+            fail(
+                true,
+                format!(
+                    "could not measure write speed: {error}. {}",
+                    overwrite_notice(backed_up)
+                ),
+            )
+        })?;
         offset += n as u64;
     }
     let write_mbps = megabytes_per_second(span, started.elapsed());
@@ -582,12 +697,18 @@ fn measure_speed(
     let mut buf = vec![0u8; 64 * 1024];
     offset = 0;
     while offset < span {
-        if stop_requested(cancel, cancel_file)? {
-            return Err(ProbeError::Failed("probe-cancelled".into()));
+        if stop_requested(cancel, cancel_file, *overwritten)? {
+            return Err(fail(*overwritten, "probe-cancelled"));
         }
         let n = ((span - offset) as usize).min(buf.len());
         device.read_at(offset, &mut buf[..n]).map_err(|error| {
-            ProbeError::Failed(format!("could not measure read speed: {error}"))
+            fail(
+                true,
+                format!(
+                    "could not measure read speed: {error}. {}",
+                    overwrite_notice(backed_up)
+                ),
+            )
         })?;
         offset += n as u64;
     }
@@ -633,7 +754,184 @@ fn format_mbps(value: f64) -> String {
     }
 }
 
-/// Arguments the app passes to the elevated `cfw-flash --probe` helper.
+pub fn normalize_serial(serial: &str) -> String {
+    serial
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+pub fn same_identity(recorded: &CardIdentity, other: &CardIdentity) -> bool {
+    restore::hashes_match(&recorded.prefix_sha256, &other.prefix_sha256)
+        && normalize_serial(&recorded.serial) == normalize_serial(&other.serial)
+}
+
+/// `Get-Disk` UniqueId, then SerialNumber. Does not open the disk.
+pub fn disk_serial_script(number: u32) -> String {
+    format!(
+        "$d = Get-Disk -Number {number}; $id = [string]$d.UniqueId; if ([string]::IsNullOrWhiteSpace($id)) {{ $id = [string]$d.SerialNumber }}; $id = $id -replace '\\|','/'; $id = $id -replace \"[`r`n]\",' '; Write-Output $id.Trim()"
+    )
+}
+
+pub fn prefix_len(card_bytes: u64) -> u64 {
+    card_bytes.min(PREFIX_IDENTITY_BYTES)
+}
+
+pub fn prefix_sha256(device: &mut dyn FakeBlockDevice) -> Result<String, ProbeError> {
+    let len = prefix_len(device.reported_len());
+    if len == 0 {
+        return Err(fail(
+            false,
+            "refusing to identify a card that reports size 0",
+        ));
+    }
+    hash_device_prefix(device, len)
+}
+
+fn hash_device_prefix(device: &mut dyn FakeBlockDevice, len: u64) -> Result<String, ProbeError> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut offset = 0u64;
+    while offset < len {
+        let n = ((len - offset) as usize).min(buf.len());
+        device
+            .read_at(offset, &mut buf[..n])
+            .map_err(|error| fail(false, format!("could not read the card identity: {error}")))?;
+        hasher.update(&buf[..n]);
+        offset += n as u64;
+    }
+    Ok(hex_hash(hasher.finalize()))
+}
+
+pub fn gzip_prefix_sha256(path: &Path, card_bytes: u64) -> Result<String, ProbeError> {
+    if is_physical_disk_path(path) {
+        return Err(fail(
+            false,
+            "refusing to read a backup from a physical disk path",
+        ));
+    }
+    let len = prefix_len(card_bytes);
+    if len == 0 {
+        return Err(fail(false, "refusing to identify a backup of size 0"));
+    }
+    let file = File::open(path)
+        .map_err(|error| fail(false, format!("could not open {}: {error}", path.display())))?;
+    let mut decoder = GzDecoder::new(file);
+    let mut hasher = Sha256::new();
+    let mut left = len;
+    let mut buf = vec![0u8; 64 * 1024];
+    while left > 0 {
+        let n = (left as usize).min(buf.len());
+        decoder.read_exact(&mut buf[..n]).map_err(|error| {
+            fail(
+                false,
+                format!("could not read the backup identity: {error}"),
+            )
+        })?;
+        hasher.update(&buf[..n]);
+        left -= n as u64;
+    }
+    Ok(hex_hash(hasher.finalize()))
+}
+
+pub fn identity_path(image: &Path) -> PathBuf {
+    let mut name = image.file_name().unwrap_or_default().to_os_string();
+    name.push(".identity");
+    image.with_file_name(name)
+}
+
+pub fn write_identity(image: &Path, identity: &CardIdentity) -> Result<(), String> {
+    let path = identity_path(image);
+    if is_physical_disk_path(image) || is_physical_disk_path(&path) {
+        return Err("refusing to write card identity to a physical disk path".into());
+    }
+    if !restore::is_sha256_hex(&identity.prefix_sha256) {
+        return Err("card identity prefix is not a sha256".into());
+    }
+    let serial = normalize_serial(&identity.serial);
+    let model = one_line(&identity.model);
+    let body = format!(
+        "prefix-sha256={}\nserial={serial}\nbytes={}\nmodel={model}\n",
+        identity.prefix_sha256.trim().to_ascii_lowercase(),
+        identity.bytes,
+    );
+    restore::write_new_nofollow(&path, body.as_bytes())
+        .map_err(|error| format!("could not write card identity: {error}"))
+}
+
+pub fn load_identity(image: &Path) -> Result<CardIdentity, String> {
+    let path = identity_path(image);
+    if is_physical_disk_path(image) || is_physical_disk_path(&path) {
+        return Err("refusing to read card identity from a physical disk path".into());
+    }
+    let text = restore::read_nofollow_string(&path)
+        .map_err(|error| format!("could not read card identity: {error}"))?;
+    parse_identity(&text)
+}
+
+pub fn parse_identity(text: &str) -> Result<CardIdentity, String> {
+    let mut prefix = None;
+    let mut serial = None;
+    let mut bytes = None;
+    let mut model = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("prefix-sha256=") {
+            prefix = Some(value.trim().to_ascii_lowercase());
+        } else if let Some(value) = line.strip_prefix("serial=") {
+            serial = Some(normalize_serial(value));
+        } else if let Some(value) = line.strip_prefix("bytes=") {
+            bytes = Some(
+                value
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| format!("bad card identity size in {line}"))?,
+            );
+        } else if let Some(value) = line.strip_prefix("model=") {
+            model = Some(one_line(value));
+        } else {
+            return Err(format!("bad card identity line {line}"));
+        }
+    }
+    let prefix = prefix.ok_or("card identity is missing prefix-sha256")?;
+    if !restore::is_sha256_hex(&prefix) {
+        return Err("card identity prefix is not a sha256".into());
+    }
+    Ok(CardIdentity {
+        prefix_sha256: prefix,
+        serial: serial.unwrap_or_default(),
+        bytes: bytes.ok_or("card identity is missing bytes")?,
+        model: model.ok_or("card identity is missing model")?,
+    })
+}
+
+fn one_line(text: &str) -> String {
+    text.replace(['\n', '\r', '|'], " ").trim().to_string()
+}
+
+fn hex_hash(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
+/// Lock failure on the backup route refuses the write.
+pub fn backup_write_allowed(locked: Result<(), String>) -> Result<(), String> {
+    locked.map_err(|error| {
+        format!("could not lock and dismount the card, so nothing was written: {error}")
+    })
+}
+
+/// Arguments the app passes straight to the elevated `cfw-flash --probe` helper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelperRequest {
     pub disk_number: u32,
@@ -642,11 +940,14 @@ pub struct HelperRequest {
     pub displayed_model: String,
     pub backup_image: Option<PathBuf>,
     pub backup_sha256: Option<String>,
+    pub backup_prefix_sha256: Option<String>,
+    pub backup_serial: Option<String>,
     pub cancel_file: PathBuf,
     pub log_file: PathBuf,
 }
 
-pub fn helper_script_line(tool: &Path, request: &HelperRequest) -> Result<String, String> {
+/// One elevated `Start-Process` of `cfw-flash`. No temp script.
+pub fn helper_launch_command(tool: &Path, request: &HelperRequest) -> Result<String, String> {
     for path in [
         tool,
         request.backup_image.as_deref().unwrap_or(Path::new("")),
@@ -657,28 +958,49 @@ pub fn helper_script_line(tool: &Path, request: &HelperRequest) -> Result<String
             return Err("refusing a physical disk path".into());
         }
     }
-    let backup = match (&request.backup_image, &request.backup_sha256) {
-        (Some(path), Some(sha)) => format!(
-            " --backup-image='{}' --backup-sha256='{}'",
-            powershell_quote(&path.display().to_string())?,
-            powershell_quote(sha)?
-        ),
-        (None, None) => String::new(),
+    let mut args = vec![
+        "--probe".to_string(),
+        format!("--disk={}", request.disk_number),
+        format!("--confirm={}", request.confirmation),
+        format!("--expected-bytes={}", request.displayed_bytes),
+        format!("--expected-model={}", request.displayed_model),
+    ];
+    match (
+        &request.backup_image,
+        &request.backup_sha256,
+        &request.backup_prefix_sha256,
+        &request.backup_serial,
+    ) {
+        (Some(image), Some(sha), Some(prefix), Some(serial)) => {
+            if !restore::is_sha256_hex(sha) || !restore::is_sha256_hex(prefix) {
+                return Err("a probe backup checksum is not a sha256".into());
+            }
+            args.push(format!("--backup-image={}", image.display()));
+            args.push(format!("--backup-sha256={sha}"));
+            args.push(format!("--backup-prefix-sha256={prefix}"));
+            args.push(format!("--backup-serial={serial}"));
+        }
+        (None, None, None, None) => {}
         _ => {
             return Err(
-                "a probe backup needs both the image and the checksum from this session".into(),
+                "a probe backup needs the image, checksum, and card identity from this session"
+                    .into(),
             )
         }
-    };
+    }
+    args.push(format!("--cancel-file={}", request.cancel_file.display()));
+    args.push(format!("--log-file={}", request.log_file.display()));
+    for arg in &args {
+        powershell_quote(arg)?;
+    }
+    let list = args
+        .iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
     Ok(format!(
-        "& '{tool}' --probe --disk={disk} --confirm='{confirm}' --expected-bytes={bytes} --expected-model='{model}'{backup} --cancel-file='{cancel}' --log-file='{log}'\r\nexit $LASTEXITCODE\r\n",
+        "$p = Start-Process -FilePath '{tool}' -Verb RunAs -Wait -PassThru -ArgumentList @({list}); if ($null -eq $p -or $null -eq $p.ExitCode) {{ exit 1 }}; exit $p.ExitCode",
         tool = powershell_quote(&tool.display().to_string())?,
-        disk = request.disk_number,
-        confirm = powershell_quote(&request.confirmation)?,
-        bytes = request.displayed_bytes,
-        model = powershell_quote(&request.displayed_model)?,
-        cancel = powershell_quote(&request.cancel_file.display().to_string())?,
-        log = powershell_quote(&request.log_file.display().to_string())?,
     ))
 }
 
@@ -689,26 +1011,63 @@ fn powershell_quote(text: &str) -> Result<String, String> {
     Ok(text.replace('\'', "''"))
 }
 
+pub fn format_failed_log(overwritten: bool, message: &str) -> String {
+    format!(
+        "OVERWRITTEN={flag}\nSUMMARY={summary}\nRESULT=FAIL\n",
+        flag = yes_no(overwritten),
+        summary = one_line(message),
+    )
+}
+
 pub fn format_probe_log(status: &ProbeStatus) -> String {
     match status {
         ProbeStatus::Finished(report) => format!(
-            "KIND={kind}\nCLAIMED={claimed}\nREAL={real}\nWRITE_MBPS={write}\nREAD_MBPS={read}\nALIASED={aliased}\nSUMMARY={summary}\nRESULT=OK\n",
+            "KIND={kind}\nCLAIMED={claimed}\nREAL={real}\nWRITE_MBPS={write}\nREAD_MBPS={read}\nALIASED={aliased}\nOVERWRITTEN=yes\nSUMMARY={summary}\nRESULT=OK\n",
             kind = report.kind.label(),
             claimed = report.claimed_bytes,
             real = report.real_bytes,
             write = report.write_mbps,
             read = report.read_mbps,
             aliased = if report.aliased { "yes" } else { "no" },
-            summary = report.summary,
+            summary = one_line(&report.summary),
         ),
         ProbeStatus::Cancelled {
             overwritten,
             summary,
         } => format!(
             "RESULT=CANCELLED\nOVERWRITTEN={flag}\nSUMMARY={summary}\n",
-            flag = if *overwritten { "yes" } else { "no" },
+            flag = yes_no(*overwritten),
+            summary = one_line(summary),
         ),
     }
+}
+
+fn yes_no(overwritten: bool) -> &'static str {
+    if overwritten {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// `Ok` only when the log has exactly one `OVERWRITTEN=yes` or `OVERWRITTEN=no`.
+pub fn overwritten_flag(log: &str) -> Result<bool, String> {
+    let mut found = None;
+    for line in log.lines() {
+        let Some(value) = line.trim().strip_prefix("OVERWRITTEN=") else {
+            continue;
+        };
+        let flag = match value.trim() {
+            text if text.eq_ignore_ascii_case("yes") => true,
+            text if text.eq_ignore_ascii_case("no") => false,
+            _ => return Err(format!("bad overwritten flag in {line}")),
+        };
+        if found.is_some() {
+            return Err("more than one OVERWRITTEN line".into());
+        }
+        found = Some(flag);
+    }
+    found.ok_or_else(|| "OVERWRITTEN line is missing".into())
 }
 
 pub fn parse_probe_log(log: &str) -> Result<ProbeLog, String> {
@@ -718,7 +1077,6 @@ pub fn parse_probe_log(log: &str) -> Result<ProbeLog, String> {
     let mut real_bytes = 0u64;
     let mut read_mbps = 0.0f64;
     let mut write_mbps = 0.0f64;
-    let mut overwritten = false;
     let mut summary = String::new();
     for line in log.lines() {
         let line = line.trim();
@@ -742,14 +1100,14 @@ pub fn parse_probe_log(log: &str) -> Result<ProbeLog, String> {
             write_mbps = value
                 .parse()
                 .map_err(|_| format!("bad write speed in {line}"))?;
-        } else if let Some(value) = line.strip_prefix("OVERWRITTEN=") {
-            overwritten = value.eq_ignore_ascii_case("yes");
         } else if let Some(value) = line.strip_prefix("SUMMARY=") {
             summary = value.to_string();
         }
     }
+    let overwritten = overwritten_flag(log)?;
     let status = match result.as_str() {
-        "OK" => "finished",
+        "OK" if overwritten => "finished",
+        "OK" => return Err("a finished probe must say the card was overwritten".into()),
         "CANCELLED" => "cancelled",
         _ => return Err("probe result is missing".into()),
     };
@@ -763,4 +1121,53 @@ pub fn parse_probe_log(log: &str) -> Result<ProbeLog, String> {
         overwritten,
         summary,
     })
+}
+
+fn summary_line(log: &str) -> Option<String> {
+    log.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("SUMMARY=")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// What the app should show after the elevated helper exits.
+///
+/// A complete log is used as written. A cancel is an exit code of 9, or the
+/// in-app cancel flag, together with the `OVERWRITTEN` line. A missing line is
+/// not treated as "nothing was overwritten."
+#[derive(Debug, Clone, PartialEq)]
+pub enum HelperFollowup {
+    Parsed(ProbeLog),
+    Cancelled { overwritten: bool, summary: String },
+}
+
+pub fn interpret_helper_log(
+    exit_code: Option<i32>,
+    log: &str,
+    user_cancelled: bool,
+    backed_up: bool,
+) -> Result<HelperFollowup, String> {
+    if let Ok(parsed) = parse_probe_log(log) {
+        return Ok(HelperFollowup::Parsed(parsed));
+    }
+    let cancelled = exit_code == Some(9) || user_cancelled;
+    match overwritten_flag(log) {
+        Ok(overwritten) if cancelled => Ok(HelperFollowup::Cancelled {
+            overwritten,
+            summary: summary_line(log).unwrap_or_else(|| cancel_summary(overwritten, backed_up)),
+        }),
+        Ok(true) => {
+            Err(summary_line(log).unwrap_or_else(|| overwrite_notice(backed_up).to_string()))
+        }
+        Ok(false) => Err(summary_line(log).unwrap_or_else(|| {
+            "The test failed. The log says the card was not overwritten.".into()
+        })),
+        Err(_) => Err(if cancelled {
+            unknown_overwrite_summary().into()
+        } else {
+            "The test did not finish, and the log did not say whether the card was overwritten. Restore your backup, or format the card, before you use it.".into()
+        }),
+    }
 }

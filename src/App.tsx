@@ -1028,7 +1028,8 @@ export default function App() {
             <p className="path">
               Saved {backupReport.image} ({formatBytes(backupReport.bytes)}). SHA-256{" "}
               {backupReport.sha256}. Checksum file {backupReport.sidecar}. A finished backup of
-              this card can be used to test it for a fake size until you close Card Studio.
+              this card can be used to test it for a fake size until you close Card Studio. The
+              test matches this card's serial and contents, not only its size and model.
             </p>
           ) : null}
           {backupReport?.status === "cancelled" ? (
@@ -1127,11 +1128,12 @@ export default function App() {
           <h2>Test a card</h2>
           <p>
             This checks whether a removable card really holds the size it claims, and measures how
-            fast it reads and writes. It writes a short test pattern, so it runs only when this
-            session already has a verified backup of this exact card, or the card is blank. Fixed
-            disks, disk 0, and Windows system or boot disks are not listed. Windows asks for
-            approval before anything is written. If you cancel, the result says whether the card
-            was overwritten.
+            fast it reads and writes. It writes a short test pattern. A finished test overwrites
+            part of the card. Restore your backup before you use the card, or format the card
+            again if it was blank. The test runs only when this session already has a verified
+            backup of this exact card, or the card is blank. Fixed disks, disk 0, and Windows
+            system or boot disks are not listed. Windows asks for approval before anything is
+            written. If you cancel, the result says whether the card was overwritten.
           </p>
           <div className="row">
             <button disabled={busy} onClick={() => void refreshProbeDisks()}>

@@ -6,9 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use cfw_zero_touch_lib::backup::{backup_image, BackupOutcome};
 use cfw_zero_touch_lib::block_device::{is_physical_disk_path, FakeBlockDevice, FileBlockDevice};
 use cfw_zero_touch_lib::probe::{
-    authorize_probe, cancel_summary, card_is_blank, helper_script_line, parse_probe_log,
-    plain_summary, run_probe, sample_offsets, BackupSession, CardKind, ProbeBlock, ProbeDisk,
-    ProbeError, ProbePlan, ProbeRequest, ProbeStatus, SessionBackup, PROBE_BLOCK,
+    authorize_probe, cancel_summary, card_is_blank, format_failed_log, format_probe_log,
+    helper_launch_command, interpret_helper_log, overwritten_flag, parse_probe_log, plain_summary,
+    prefix_sha256, run_probe, sample_offsets, write_identity, BackupSession, CardIdentity,
+    CardKind, HelperFollowup, ProbeBlock, ProbeDisk, ProbeError, ProbePlan, ProbeReport,
+    ProbeRequest, ProbeStatus, SessionBackup, PROBE_BLOCK,
 };
 use cfw_zero_touch_lib::restore::signal_cancel_file;
 
@@ -125,6 +127,8 @@ impl<D: FakeBlockDevice> FakeBlockDevice for CancelOnWrite<D> {
     }
 }
 
+const FIXTURE_SERIAL: &str = "fixture-card";
+
 fn disk(number: u32, bus: &str, size: u64, system: bool, model: &str) -> ProbeDisk {
     ProbeDisk {
         number,
@@ -132,6 +136,7 @@ fn disk(number: u32, bus: &str, size: u64, system: bool, model: &str) -> ProbeDi
         size_bytes: size,
         system_disk: system,
         model: model.into(),
+        serial: String::new(),
     }
 }
 
@@ -177,6 +182,7 @@ fn finished_backup(dir: &Path, bytes: &[u8], model: &str) -> SessionBackup {
     device.write_at(0, bytes).unwrap();
     drop(device);
     let mut source = FileBlockDevice::open_read_only(&image_path).unwrap();
+    let prefix = prefix_sha256(&mut source).expect("fixture prefix");
     let dest = dir.join("stock.img.gz");
     let outcome = backup_image(
         &mut source,
@@ -192,12 +198,22 @@ fn finished_backup(dir: &Path, bytes: &[u8], model: &str) -> SessionBackup {
             sha256,
             bytes: size,
             ..
-        } => SessionBackup {
-            image,
-            size_bytes: size,
-            model: model.into(),
-            sha256,
-        },
+        } => {
+            let identity = CardIdentity {
+                serial: FIXTURE_SERIAL.into(),
+                prefix_sha256: prefix,
+                bytes: size,
+                model: model.into(),
+            };
+            write_identity(&image, &identity).expect("fixture identity");
+            SessionBackup {
+                image,
+                size_bytes: size,
+                model: model.into(),
+                sha256,
+                identity,
+            }
+        }
         BackupOutcome::Cancelled { .. } => panic!("backup fixture was cancelled"),
     }
 }
@@ -257,11 +273,20 @@ fn wraparound_fake_card_reports_the_real_size_and_aliasing() {
     assert!(report.write_mbps.is_finite() && report.write_mbps > 0.0);
     assert!(report.read_mbps.is_finite() && report.read_mbps > 0.0);
     assert!(device.writes > 0);
-    let summary = plain_summary(CardKind::Fake, 64_000_000_000, 8_000_000_000, 12.0, 40.0);
+    let summary = plain_summary(
+        CardKind::Fake,
+        64_000_000_000,
+        8_000_000_000,
+        12.0,
+        40.0,
+        false,
+    );
     assert_eq!(
         summary,
-        "This card is fake: it says 64 GB but only holds about 8 GB. Sequential write is 12 MB/s and sequential read is 40 MB/s."
+        "This card is fake: it says 64 GB but only holds about 8 GB. Sequential write is 12 MB/s and sequential read is 40 MB/s. Part of this card was overwritten. Format the card again before you use this card."
     );
+    assert!(report.summary.contains("Part of this card was overwritten"));
+    assert!(report.summary.contains("Format the card again"));
 }
 
 #[test]
@@ -337,7 +362,14 @@ fn a_card_with_no_partition_table_is_blank_even_if_some_bytes_are_not() {
     let mut bytes = vec![0u8; reported as usize];
     bytes[600] = 0xAB;
     let mut device = open_fixture(&scratch, &bytes, reported);
-    assert!(card_is_blank(&mut device).unwrap());
+    assert!(
+        !card_is_blank(&mut device).unwrap(),
+        "leftover bytes are data even when the card has no partition table"
+    );
+
+    let zeros = Scratch::new("probe-zeros");
+    let mut blank = open_fixture(&zeros, &vec![0u8; reported as usize], reported);
+    assert!(card_is_blank(&mut blank).unwrap());
 }
 
 #[test]
@@ -350,9 +382,13 @@ fn verified_session_backup_allows_a_partitioned_card_and_a_bad_sidecar_does_not(
         inner: device,
         writes: 0,
     };
-    let card = disk(2, "USB", genuine.reported_len, false, "Stock R36S");
+    let mut card = disk(2, "USB", genuine.reported_len, false, "Stock R36S");
+    card.serial = FIXTURE_SERIAL.into();
     let status = run_on(&mut device, &card, Some(&backup), &AtomicBool::new(false)).unwrap();
-    assert!(matches!(status, ProbeStatus::Finished(_)));
+    let ProbeStatus::Finished(report) = status else {
+        panic!("expected a finished probe");
+    };
+    assert!(report.summary.contains("Restore your backup"));
     assert!(device.writes > 0);
 
     let again = open_fixture(&scratch, &genuine.bytes, genuine.reported_len);
@@ -490,6 +526,12 @@ fn physical_backup_paths_are_refused_before_the_card_is_written() {
         size_bytes: genuine.reported_len,
         model: "Stock R36S".into(),
         sha256: "ab".repeat(32),
+        identity: CardIdentity {
+            serial: FIXTURE_SERIAL.into(),
+            prefix_sha256: "ab".repeat(32),
+            bytes: genuine.reported_len,
+            model: "Stock R36S".into(),
+        },
     };
     let error = run_on(&mut device, &card, Some(&backup), &AtomicBool::new(false)).unwrap_err();
     assert!(matches!(error, ProbeError::Blocked(ProbeBlock::Backup)));
@@ -516,7 +558,7 @@ fn cancel_before_a_write_says_the_card_was_not_overwritten() {
             summary,
         } => {
             assert!(!overwritten);
-            assert_eq!(summary, cancel_summary(false));
+            assert_eq!(summary, cancel_summary(false, false));
             assert!(summary.contains("Nothing"));
         }
         ProbeStatus::Finished(_) => panic!("cancel before writing must not finish"),
@@ -524,7 +566,7 @@ fn cancel_before_a_write_says_the_card_was_not_overwritten() {
     assert_eq!(device.writes, 0);
     assert_eq!(std::fs::read(device.inner.path()).unwrap(), before);
     assert_eq!(
-        cancel_summary(false),
+        cancel_summary(false, false),
         "Cancelled. Nothing on the card was overwritten."
     );
 }
@@ -548,14 +590,18 @@ fn cancel_after_a_write_says_data_was_overwritten() {
             summary,
         } => {
             assert!(overwritten);
-            assert_eq!(summary, cancel_summary(true));
-            assert!(summary.contains("overwritten"));
+            assert_eq!(summary, cancel_summary(true, false));
+            assert!(summary.contains("Format the card again"));
         }
         ProbeStatus::Finished(_) => panic!("cancel after a write must not look finished"),
     }
     assert!(device.writes >= 1);
     assert_eq!(
-        cancel_summary(true),
+        cancel_summary(true, false),
+        "Cancelled. Data on the card was overwritten. Format the card again before you use this card."
+    );
+    assert_eq!(
+        cancel_summary(true, true),
         "Cancelled. Data on the card was overwritten. Restore your backup before you use this card."
     );
 }
@@ -600,7 +646,7 @@ fn helper_launch_uses_the_elevated_tool_and_refuses_a_physical_backup_path() {
     let cancel = Path::new("C:\\Temp\\cfw-probe-cancel.txt");
     let log = Path::new("C:\\Temp\\cfw-probe-log.txt");
     let backup = Path::new("C:\\Backups\\stock.img.gz");
-    let script = helper_script_line(
+    let script = helper_launch_command(
         tool,
         &cfw_zero_touch_lib::probe::HelperRequest {
             disk_number: 2,
@@ -609,21 +655,28 @@ fn helper_launch_uses_the_elevated_tool_and_refuses_a_physical_backup_path() {
             displayed_model: "Generic SD".into(),
             backup_image: Some(backup.into()),
             backup_sha256: Some("ab".repeat(32)),
+            backup_prefix_sha256: Some("cd".repeat(32)),
+            backup_serial: Some(FIXTURE_SERIAL.into()),
             cancel_file: cancel.into(),
             log_file: log.into(),
         },
     )
     .unwrap();
-    assert!(script.contains("--probe"));
-    assert!(script.contains("--disk=2"));
-    assert!(script.contains("--confirm='PROBE'"));
-    assert!(script.contains("--expected-bytes=64000000000"));
-    assert!(script.contains("--expected-model='Generic SD'"));
+    assert!(script.contains("Start-Process -FilePath 'cfw-flash.exe'"));
+    assert!(script.contains("-ArgumentList"));
+    assert!(script.contains("'--probe'"));
+    assert!(script.contains("'--disk=2'"));
+    assert!(script.contains("'--confirm=PROBE'"));
+    assert!(script.contains("'--expected-bytes=64000000000'"));
+    assert!(script.contains("'--expected-model=Generic SD'"));
+    assert!(script.contains("'--backup-prefix-sha256="));
+    assert!(script.contains("'--backup-serial=fixture-card'"));
     assert!(script.contains("stock.img.gz"));
+    assert!(!script.contains(".ps1"));
     assert!(!script.to_ascii_lowercase().contains("physicaldrive"));
     assert!(!script.contains("Clear-Disk"));
 
-    let error = helper_script_line(
+    let error = helper_launch_command(
         tool,
         &cfw_zero_touch_lib::probe::HelperRequest {
             disk_number: 2,
@@ -632,6 +685,8 @@ fn helper_launch_uses_the_elevated_tool_and_refuses_a_physical_backup_path() {
             displayed_model: "Generic SD".into(),
             backup_image: Some(PathBuf::from(r"\\.\PhysicalDrive1")),
             backup_sha256: None,
+            backup_prefix_sha256: None,
+            backup_serial: None,
             cancel_file: cancel.into(),
             log_file: log.into(),
         },
@@ -649,7 +704,8 @@ REAL=8000000000
 WRITE_MBPS=12
 READ_MBPS=40
 ALIASED=yes
-SUMMARY=This card is fake: it says 64 GB but only holds about 8 GB. Sequential write is 12 MB/s and sequential read is 40 MB/s.
+OVERWRITTEN=yes
+SUMMARY=This card is fake: it says 64 GB but only holds about 8 GB. Sequential write is 12 MB/s and sequential read is 40 MB/s. Part of this card was overwritten. Restore your backup before you use this card.
 RESULT=OK
 EXIT=0
 ";
@@ -658,10 +714,21 @@ EXIT=0
     assert_eq!(report.kind, "fake");
     assert_eq!(report.claimed_bytes, 64_000_000_000);
     assert_eq!(report.real_bytes, 8_000_000_000);
-    assert!(!report.overwritten);
+    assert!(report.overwritten);
     assert!(report
         .summary
         .starts_with("This card is fake: it says 64 GB but only holds about 8 GB."));
+    assert!(report.summary.contains("Restore your backup"));
+
+    let missing = finished.replace("OVERWRITTEN=yes\n", "");
+    assert!(parse_probe_log(&missing)
+        .unwrap_err()
+        .contains("OVERWRITTEN"));
+    assert!(overwritten_flag(&missing).is_err());
+    let finished_but_not = finished.replace("OVERWRITTEN=yes", "OVERWRITTEN=no");
+    assert!(parse_probe_log(&finished_but_not)
+        .unwrap_err()
+        .contains("overwritten"));
 
     let cancelled = "\
 RESULT=CANCELLED
@@ -673,4 +740,149 @@ EXIT=9
     assert_eq!(report.status, "cancelled");
     assert!(report.overwritten);
     assert!(report.summary.contains("overwritten"));
+
+    let finished_status = ProbeStatus::Finished(ProbeReport {
+        kind: CardKind::Fake,
+        claimed_bytes: 64_000_000_000,
+        real_bytes: 8_000_000_000,
+        read_mbps: 40.0,
+        write_mbps: 12.0,
+        aliased: true,
+        summary: "done".into(),
+    });
+    let log = format_probe_log(&finished_status);
+    assert!(log.contains("OVERWRITTEN=yes"));
+    assert!(log.contains("RESULT=OK"));
+    assert!(overwritten_flag(&log).unwrap());
+    assert!(format_probe_log(&ProbeStatus::Cancelled {
+        overwritten: false,
+        summary: cancel_summary(false, true),
+    })
+    .contains("OVERWRITTEN=no"));
+    assert!(format_failed_log(true, "write failed").contains("OVERWRITTEN=yes"));
+    assert!(format_failed_log(false, "refused").contains("OVERWRITTEN=no"));
+}
+
+#[test]
+fn a_backup_of_a_different_card_with_the_same_model_and_size_is_refused() {
+    let scratch = Scratch::new("probe-other-card");
+    let size = 16 * 1024;
+    let model = "Generic SD";
+    let mut card_a = vec![0u8; size];
+    card_a[0] = 0x11;
+    card_a[510] = 0x55;
+    card_a[511] = 0xAA;
+    let mut card_b = card_a.clone();
+    card_b[0] = 0x22;
+    let backup = finished_backup(scratch.path(), &card_a, model);
+    let mut card = disk(2, "USB", size as u64, false, model);
+    card.serial = FIXTURE_SERIAL.into();
+
+    let matching = open_fixture(&scratch, &card_a, size as u64);
+    let mut matching = CountWrites {
+        inner: matching,
+        writes: 0,
+    };
+    let status = run_on(&mut matching, &card, Some(&backup), &AtomicBool::new(false)).unwrap();
+    assert!(matches!(status, ProbeStatus::Finished(_)));
+    assert!(matching.writes > 0);
+
+    let other = open_fixture(&scratch, &card_b, size as u64);
+    let before = std::fs::read(other.path()).unwrap();
+    let mut other = CountWrites {
+        inner: other,
+        writes: 0,
+    };
+    let error = run_on(&mut other, &card, Some(&backup), &AtomicBool::new(false)).unwrap_err();
+    assert!(matches!(error, ProbeError::Blocked(ProbeBlock::Backup)));
+    assert_eq!(other.writes, 0);
+    assert_eq!(std::fs::read(other.inner.path()).unwrap(), before);
+
+    card.serial = "other-reader".into();
+    let same_bytes = open_fixture(&scratch, &card_a, size as u64);
+    let before = std::fs::read(same_bytes.path()).unwrap();
+    let mut same_bytes = CountWrites {
+        inner: same_bytes,
+        writes: 0,
+    };
+    let error = run_on(
+        &mut same_bytes,
+        &card,
+        Some(&backup),
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ProbeError::Blocked(ProbeBlock::Backup)));
+    assert_eq!(same_bytes.writes, 0);
+    assert_eq!(std::fs::read(same_bytes.inner.path()).unwrap(), before);
+
+    let mut forged_device = open_fixture(&scratch, &card_b, size as u64);
+    let forged_prefix = prefix_sha256(&mut forged_device).unwrap();
+    let mut stored = cfw_zero_touch_lib::probe::load_identity(&backup.image).unwrap();
+    stored.prefix_sha256 = forged_prefix;
+    let identity_file = cfw_zero_touch_lib::probe::identity_path(&backup.image);
+    std::fs::remove_file(&identity_file).unwrap();
+    write_identity(&backup.image, &stored).unwrap();
+    let mut forged = backup.clone();
+    forged.identity = stored;
+    card.serial = FIXTURE_SERIAL.into();
+    let mut forged_device = CountWrites {
+        inner: forged_device,
+        writes: 0,
+    };
+    let error = run_on(
+        &mut forged_device,
+        &card,
+        Some(&forged),
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ProbeError::Blocked(ProbeBlock::Backup)),
+        "editing the identity file cannot retarget a backup to another card"
+    );
+    assert_eq!(forged_device.writes, 0);
+}
+
+#[test]
+fn cancel_message_comes_from_the_exit_code_and_overwritten_line() {
+    let clean = "\
+RESULT=CANCELLED
+OVERWRITTEN=no
+SUMMARY=Cancelled. Nothing on the card was overwritten.
+";
+    let follow = interpret_helper_log(Some(9), clean, true, false).unwrap();
+    assert!(matches!(
+        follow,
+        HelperFollowup::Parsed(ref log) if !log.overwritten && log.summary.contains("Nothing")
+    ));
+
+    let partial_yes = "OVERWRITTEN=yes\n";
+    let follow = interpret_helper_log(Some(9), partial_yes, false, true).unwrap();
+    match follow {
+        HelperFollowup::Cancelled {
+            overwritten,
+            summary,
+        } => {
+            assert!(overwritten);
+            assert!(summary.contains("Restore your backup"));
+        }
+        HelperFollowup::Parsed(_) => panic!("a partial log is not a finished report"),
+    }
+
+    let missing = "RESULT=CANCELLED\nSUMMARY=Cancelled.\n";
+    let error = interpret_helper_log(Some(9), missing, true, true).unwrap_err();
+    assert!(error.contains("did not say whether"));
+    assert!(!error.contains("Nothing on the card was overwritten"));
+    assert!(!error.contains("The card was not written"));
+
+    let dismissed = interpret_helper_log(Some(1), "", false, false).unwrap_err();
+    assert!(dismissed.contains("did not say whether"));
+    assert!(!dismissed.contains("Nothing on the card was overwritten"));
+    assert!(!dismissed.contains("The card was not written"));
+
+    let failed = format_failed_log(false, "the disk model changed");
+    let error = interpret_helper_log(Some(3), &failed, false, true).unwrap_err();
+    assert!(error.contains("model changed"));
+    assert!(failed.contains("OVERWRITTEN=no"));
 }
