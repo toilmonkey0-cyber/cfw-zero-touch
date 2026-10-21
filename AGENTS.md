@@ -40,3 +40,8 @@ Build a desktop app that flashes handheld CFW **and** prepares the games partiti
 - Small commits; no force-push to main; never commit secrets (tokens, private keys, passwords, or `.env` files).
 - One unit per pull request, on a branch named `unit/NN-name` (for example `unit/00-repo-guardrails`). Squash-merge into `main`.
 - Never edit `src-tauri/src/flash.rs`, `src-tauri/src/bin/cfw-flash.rs`, or `src-tauri/src/volume.rs` without the `disk-safety` label.
+
+## Cursor Cloud specific instructions
+- Login shells provide Node.js 24 (`node -v` should report 24.x) and Rust stable. Frontend checks from the repo root: `npm test` (`tsc --noEmit` and ESLint) and `npm run test:unit` (Vitest). Rust checks from `src-tauri`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+- The desktop app is `npm run tauri dev`. Vite is fixed to port 1420. That command needs a display and WebKitGTK 4.1 (`libwebkit2gtk-4.1-dev` and the rest of Tauri's Debian prerequisite list). `npm run dev` by itself has no Tauri backend, so the profile list stays empty.
+- Volume listing, format, and flash use Windows disk APIs. On Linux, choosing a layout reaches the card step and `list_volumes` reports that removable-drive listing is Windows-only; no drive is offered. `cargo test` uses disk-image fixtures and must not open a physical drive.
