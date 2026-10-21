@@ -917,7 +917,7 @@ fn ioctl(file: &File, code: u32) -> Result<(), String> {
     let mut bytes = 0u32;
     let ok = unsafe {
         DeviceIoControl(
-            file.as_raw_handle() as *mut core::ffi::c_void,
+            file.as_raw_handle(),
             code,
             std::ptr::null_mut(),
             0,
