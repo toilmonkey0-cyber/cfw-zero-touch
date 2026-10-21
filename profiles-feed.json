@@ -195,32 +195,7 @@
       },
       "version": 3,
       "stockFingerprint": {
-        "manualOnly": false,
-        "source": "DTB name rk3326-r35s-linux.dtb is the original file the AeolusUX ArkOS-R3XS panel checker asks for (https://aeolusux.github.io/ArkOS-R3XS/tools/dtbIdentify.htm). The sha256 hashes the synthetic fixture in src-tauri/tests/fixtures/stock/r35s-stock, not firmware. sizeBytes 0 matches any positive partition size; any other size must match exactly. Types and labels are the fixture descriptor for this profile and are distinct from the R36S clone boot-plus-ROMS shape.",
-        "variants": [
-          {
-            "device": "R35S",
-            "screen": "Stock panel",
-            "dtbs": [
-              {
-                "name": "rk3326-r35s-linux.dtb",
-                "sha256": "c7bb812fae7cfefeb392e6d630caebbe1b8368a1bdf7d638c80694924168d3bf"
-              }
-            ],
-            "partitions": [
-              {
-                "type": "0e",
-                "label": "BOOT",
-                "sizeBytes": 33554432
-              },
-              {
-                "type": "0b",
-                "label": "GAMES",
-                "sizeBytes": 0
-              }
-            ]
-          }
-        ]
+        "manualOnly": true
       }
     },
     {
@@ -354,71 +329,14 @@
       "version": 3,
       "stockFingerprint": {
         "manualOnly": false,
-        "source": "DTB names: the AeolusUX ArkOS-R3XS panel checker (https://aeolusux.github.io/ArkOS-R3XS/tools/dtbIdentify.htm) treats rk3326-evb-lp3-v12-linux.dtb as a clone file. rk3326-r36s-type4-linux.dtb is the clone active DTB named by this repo's ArkOS4Clone fixture in src-tauri/tests/fixtures/card.rs. Published sha256 8c4b6b738bfd5af9638db9c6e9a3ac49884ca4b773c4053a31d1a934b69246b0 is the hash dtbvault.com lists for rk3326-evb-lp3-v12-linux.dtb (board G80CA-MB V1.3-20251212, origin Original SD). The other sha256 values hash the synthetic fixture bytes in src-tauri/tests/fixtures/stock, not firmware. sizeBytes 0 matches any positive partition size; any other size must match exactly. Types and labels are the boot-plus-games shape of those fixture descriptors.",
+        "source": "https://dtbvault.com/en/file/rk3326-evb-lp3-v12-linux-IYZchb-P",
         "variants": [
           {
-            "device": "R36S clone",
-            "screen": "V12 panel",
-            "dtbs": [
-              {
-                "name": "rk3326-evb-lp3-v12-linux.dtb",
-                "sha256": "a2470b6ed7b7b14416a3aa551d2a990e9e835c427a8e5c8ffcef467e805e09d9"
-              }
-            ],
-            "partitions": [
-              {
-                "type": "0c",
-                "label": "BOOT",
-                "sizeBytes": 67108864
-              },
-              {
-                "type": "0c",
-                "label": "ROMS",
-                "sizeBytes": 0
-              }
-            ]
-          },
-          {
-            "device": "R36S clone",
-            "screen": "V12 panel",
+            "device": "R36S clone (board G80CA-MB V1.3)",
             "dtbs": [
               {
                 "name": "rk3326-evb-lp3-v12-linux.dtb",
                 "sha256": "8c4b6b738bfd5af9638db9c6e9a3ac49884ca4b773c4053a31d1a934b69246b0"
-              }
-            ],
-            "partitions": [
-              {
-                "type": "0c",
-                "label": "BOOT",
-                "sizeBytes": 0
-              },
-              {
-                "type": "0c",
-                "label": "ROMS",
-                "sizeBytes": 0
-              }
-            ]
-          },
-          {
-            "device": "R36S clone",
-            "screen": "Type 4 panel",
-            "dtbs": [
-              {
-                "name": "rk3326-r36s-type4-linux.dtb",
-                "sha256": "e0d1a9a86ecf23e1b1c3a534b9909e6edaaf090105e7024bc51b0eb249708479"
-              }
-            ],
-            "partitions": [
-              {
-                "type": "0c",
-                "label": "BOOT",
-                "sizeBytes": 67108864
-              },
-              {
-                "type": "0c",
-                "label": "ROMS",
-                "sizeBytes": 0
               }
             ]
           }

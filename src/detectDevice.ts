@@ -33,8 +33,10 @@ export function detectionNotice(
   if (detection.status !== "matched") {
     return { ...emptyNotice, message: MANUAL_DEVICE_MESSAGE };
   }
+  const identity =
+    detection.screen.length > 0 ? `${detection.device} (${detection.screen})` : detection.device;
   return {
-    message: `This looks like ${detection.device} (${detection.screen}). Confirm to use "${detection.profileName}", or choose a different layout.`,
+    message: `This looks like ${identity}. Confirm to use "${detection.profileName}", or choose a different layout.`,
     showConfirm: true,
     suggestedProfileId: detection.profileId,
   };

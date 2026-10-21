@@ -46,7 +46,8 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageSource>,
     /// Read-only stock-card identity. Absent on profiles built by older tests.
-    /// Shipped profiles are either `manualOnly` or carry device/screen variants.
+    /// Shipped profiles are `manualOnly` or carry a cited DTB hash. Screen and
+    /// partition layout are recorded only when they came from a real card.
     #[serde(
         rename = "stockFingerprint",
         default,
@@ -69,8 +70,12 @@ pub struct StockFingerprint {
 #[serde(rename_all = "camelCase")]
 pub struct StockVariant {
     pub device: String,
+    /// Panel name when one was recorded. Empty means the user confirms the screen.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub screen: String,
     pub dtbs: Vec<StockDtb>,
+    /// Present only when a real partition table was recorded for this variant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partitions: Vec<StockPartition>,
 }
 

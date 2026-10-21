@@ -1,12 +1,14 @@
 //! Read-only identification of a stock handheld card.
 //!
-//! A match needs a DTB file name and sha256 from the profile feed plus the
-//! partition layout (count, type, label, and size). Detection never opens a
-//! disk for writing and never calls the elevated flash helper. Boot files are
-//! read from a mounted directory. Disk 0, system disks, boot disks, size 0,
-//! and anything that is not USB or SD are ignored before that read.
+//! A match is a DTB file name and sha256 from the profile feed. A recorded
+//! partition layout is also required when the fingerprint has one. Detection
+//! never opens a disk for writing and never calls the elevated flash helper.
+//! Boot files are read from a mounted directory. Reading a mounted FAT
+//! partition may update access times; that change is metadata only. Disk 0,
+//! system disks, boot disks, size 0, and anything that is not USB or SD are
+//! ignored before that read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
@@ -160,7 +162,27 @@ fn matching_variants(profiles: &[Profile], card: &Observation) -> Vec<Hit> {
 }
 
 fn variant_matches(variant: &StockVariant, card: &Observation) -> bool {
-    if variant.partitions.len() != card.partitions.len() || variant.dtbs.is_empty() {
+    if variant.dtbs.is_empty() {
+        return false;
+    }
+    if !layout_matches(variant, card) {
+        return false;
+    }
+    variant.dtbs.iter().all(|expected| {
+        card.dtbs.iter().any(|actual| {
+            actual.name.eq_ignore_ascii_case(&expected.name)
+                && actual.sha256.eq_ignore_ascii_case(&expected.sha256)
+        })
+    })
+}
+
+/// An empty recorded layout matches on the DTB alone. A recorded layout must
+/// match count, type, label, and size.
+fn layout_matches(variant: &StockVariant, card: &Observation) -> bool {
+    if variant.partitions.is_empty() {
+        return true;
+    }
+    if variant.partitions.len() != card.partitions.len() {
         return false;
     }
     for (expected, actual) in variant.partitions.iter().zip(&card.partitions) {
@@ -174,14 +196,17 @@ fn variant_matches(variant: &StockVariant, card: &Observation) -> bool {
             return false;
         }
     }
-    variant.dtbs.iter().all(|expected| {
-        card.dtbs.iter().any(|actual| {
-            actual.name.eq_ignore_ascii_case(&expected.name)
-                && actual.sha256.eq_ignore_ascii_case(&expected.sha256)
-        })
-    })
+    true
 }
 
+/// Files larger than this are skipped and their bytes are not read.
+pub const MAX_DTB_BYTES: u64 = 1024 * 1024;
+/// How many `.dtb` files a boot directory read will open.
+pub const MAX_DTB_FILES: usize = 64;
+
+/// Hash top-level `*.dtb` files. Oversized files are skipped. At most
+/// [`MAX_DTB_FILES`] files are opened. Reading through a mounted FAT
+/// partition may update access times; that change is metadata only.
 pub fn read_boot_dtbs(dir: &Path) -> Result<Vec<ObservedDtb>, String> {
     if is_physical_disk_path(dir) {
         return Err("refusing a physical disk path".into());
@@ -192,9 +217,9 @@ pub fn read_boot_dtbs(dir: &Path) -> Result<Vec<ObservedDtb>, String> {
     if kind.is_symlink() || !kind.is_dir() {
         return Err(format!("{} is not a boot directory", dir.display()));
     }
-    let mut dtbs = Vec::new();
     let entries =
         fs::read_dir(dir).map_err(|error| format!("could not list {}: {error}", dir.display()))?;
+    let mut candidates = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| format!("could not list {}: {error}", dir.display()))?;
         let path = entry.path();
@@ -210,6 +235,21 @@ pub fn read_boot_dtbs(dir: &Path) -> Result<Vec<ObservedDtb>, String> {
         if !name.to_ascii_lowercase().ends_with(".dtb") {
             continue;
         }
+        candidates.push((name, path, meta.len()));
+    }
+    candidates.sort_by(|left, right| {
+        left.0
+            .to_ascii_lowercase()
+            .cmp(&right.0.to_ascii_lowercase())
+    });
+    let mut dtbs = Vec::new();
+    for (name, path, len) in candidates {
+        if len > MAX_DTB_BYTES {
+            continue;
+        }
+        if dtbs.len() >= MAX_DTB_FILES {
+            break;
+        }
         let mut file = ReadOnlyFile::open(&path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
         let bytes = file
@@ -220,11 +260,6 @@ pub fn read_boot_dtbs(dir: &Path) -> Result<Vec<ObservedDtb>, String> {
             sha256: sha256_hex(&bytes),
         });
     }
-    dtbs.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-    });
     Ok(dtbs)
 }
 
@@ -453,12 +488,14 @@ pub fn view(profiles: &[Profile], detection: Detection) -> DetectionView {
     }
 }
 
-/// Every shipped profile is manual-only or has fingerprints, and no two
-/// variants share a DTB-plus-layout key.
-pub fn audit_stock_fingerprints(profiles: &[Profile]) -> Result<(), String> {
+/// Every shipped profile is manual-only or has a cited fingerprint, no two
+/// variants share a DTB-plus-layout key, and no shipped hash equals a fixture
+/// file.
+pub fn audit_stock_fingerprints(profiles: &[Profile], fixtures_dir: &Path) -> Result<(), String> {
     if profiles.is_empty() {
         return Err("no profiles to audit".into());
     }
+    let fixture_hashes = fixture_file_hashes(fixtures_dir)?;
     let mut seen = BTreeMap::<String, String>::new();
     for profile in profiles {
         let Some(fingerprint) = &profile.stock_fingerprint else {
@@ -482,15 +519,32 @@ pub fn audit_stock_fingerprints(profiles: &[Profile]) -> Result<(), String> {
                 profile.id
             ));
         }
+        let source = fingerprint.source.as_deref().unwrap_or("");
+        if !source_is_cited(source) {
+            return Err(format!(
+                "{} fingerprint needs a source URL or 'dumped from stock card …'",
+                profile.id
+            ));
+        }
         for variant in &fingerprint.variants {
-            if variant.device.trim().is_empty() || variant.screen.trim().is_empty() {
-                return Err(format!("{} has a blank device or screen", profile.id));
+            if variant.device.trim().is_empty() {
+                return Err(format!("{} has a blank device", profile.id));
             }
-            if variant.dtbs.is_empty() || variant.partitions.is_empty() {
+            if variant.dtbs.is_empty() {
                 return Err(format!(
-                    "{} fingerprint for {} is missing dtbs or partitions",
-                    profile.id, variant.screen
+                    "{} fingerprint for {} is missing dtbs",
+                    profile.id, variant.device
                 ));
+            }
+            for dtb in &variant.dtbs {
+                let hash = dtb.sha256.to_ascii_lowercase();
+                if fixture_hashes.contains(&hash) {
+                    return Err(format!(
+                        "{} ships fingerprint {hash}, which is the sha256 of a file under {}",
+                        profile.id,
+                        fixtures_dir.display()
+                    ));
+                }
             }
             let key = variant_key(variant);
             if let Some(other) = seen.insert(key, profile.id.clone()) {
@@ -502,6 +556,53 @@ pub fn audit_stock_fingerprints(profiles: &[Profile]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn source_is_cited(source: &str) -> bool {
+    let text = source.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("fixture") || lower.contains("synthetic") || lower.contains("placeholder") {
+        return false;
+    }
+    if let Some(rest) = lower.strip_prefix("dumped from stock card ") {
+        return !rest.trim().is_empty();
+    }
+    lower.contains("https://") || lower.contains("http://")
+}
+
+fn fixture_file_hashes(dir: &Path) -> Result<BTreeSet<String>, String> {
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|error| format!("could not read fixtures {}: {error}", dir.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(format!("{} is not a fixtures directory", dir.display()));
+    }
+    let mut hashes = BTreeSet::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = fs::read_dir(&current)
+            .map_err(|error| format!("could not list {}: {error}", current.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("could not list {}: {error}", current.display()))?;
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                let bytes = fs::read(&path)
+                    .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+                hashes.insert(sha256_hex(&bytes));
+            }
+        }
+    }
+    Ok(hashes)
 }
 
 pub fn variant_key(variant: &StockVariant) -> String {

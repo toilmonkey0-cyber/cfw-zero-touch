@@ -55,31 +55,6 @@
   },
   "version": 3,
   "stockFingerprint": {
-    "manualOnly": false,
-    "source": "DTB name rk3326-r35s-linux.dtb is the original file the AeolusUX ArkOS-R3XS panel checker asks for (https://aeolusux.github.io/ArkOS-R3XS/tools/dtbIdentify.htm). The sha256 hashes the synthetic fixture in src-tauri/tests/fixtures/stock/r35s-stock, not firmware. sizeBytes 0 matches any positive partition size; any other size must match exactly. Types and labels are the fixture descriptor for this profile and are distinct from the R36S clone boot-plus-ROMS shape.",
-    "variants": [
-      {
-        "device": "R35S",
-        "screen": "Stock panel",
-        "dtbs": [
-          {
-            "name": "rk3326-r35s-linux.dtb",
-            "sha256": "c7bb812fae7cfefeb392e6d630caebbe1b8368a1bdf7d638c80694924168d3bf"
-          }
-        ],
-        "partitions": [
-          {
-            "type": "0e",
-            "label": "BOOT",
-            "sizeBytes": 33554432
-          },
-          {
-            "type": "0b",
-            "label": "GAMES",
-            "sizeBytes": 0
-          }
-        ]
-      }
-    ]
+    "manualOnly": true
   }
 }

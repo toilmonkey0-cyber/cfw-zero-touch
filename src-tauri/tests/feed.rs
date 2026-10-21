@@ -234,8 +234,11 @@ fn checked_in_feed_matches_shipped_profiles() {
         assert!(remote.version >= 1);
     }
     assert!(!feed.app.version.is_empty());
-    cfw_zero_touch_lib::detect::audit_stock_fingerprints(&feed.profiles)
-        .expect("every profile needs a fingerprint or manualOnly, with no collisions");
+    cfw_zero_touch_lib::detect::audit_stock_fingerprints(
+        &feed.profiles,
+        &repo().join("src-tauri").join("tests").join("fixtures"),
+    )
+    .expect("every profile needs a cited fingerprint or manualOnly, and no shipped hash may equal a fixture file");
 }
 
 #[test]

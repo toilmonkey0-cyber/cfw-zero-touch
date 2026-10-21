@@ -9,8 +9,8 @@ import {
 const matched: StockDetection = {
   status: "matched",
   profileId: "r36s-clone-card",
-  device: "R36S clone",
-  screen: "V12 panel",
+  device: "R36S clone (board G80CA-MB V1.3)",
+  screen: "",
   profileName: "R36S clone — games card (internal firmware)",
   message: "",
 };
@@ -41,9 +41,15 @@ describe("stock device detection", () => {
     const notice = detectionNotice(matched, false);
     expect(notice.showConfirm).toBe(true);
     expect(notice.suggestedProfileId).toBe("r36s-clone-card");
-    expect(notice.message).toContain("R36S clone");
-    expect(notice.message).toContain("V12 panel");
-    expect(notice.message).toContain("R36S clone — games card (internal firmware)");
+    expect(notice.message).toBe(
+      'This looks like R36S clone (board G80CA-MB V1.3). Confirm to use "R36S clone — games card (internal firmware)", or choose a different layout.',
+    );
+    expect(notice.message).not.toContain("V12 panel");
+    const withScreen = detectionNotice(
+      { ...matched, device: "Lab clone", screen: "V12 panel" },
+      false,
+    );
+    expect(withScreen.message).toContain("Lab clone (V12 panel)");
     expect(profileAfterConfirm(matched, false)).toBeNull();
     expect(profileAfterConfirm(matched, true)).toBe("r36s-clone-card");
   });
