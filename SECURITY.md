@@ -16,13 +16,14 @@ Expect an initial response within about a week. This is a part-time project, and
 
 ## Trust model
 
-The app performs two kinds of privileged or network-touching work, and each has its own anchor:
+The app performs privileged or network-touching work, and each kind has its own anchor:
 
 | Operation | Anchor |
 | --- | --- |
 | Flashing an OS image | The published SHA-256 in the profile, checked on the downloaded artifact before any write, and again by reading the card back after the write |
 | Profile updates (the feed) | `main` on this repository, fetched over HTTPS from `raw.githubusercontent.com`; the feed's `releaseUrl` must be `https://` or it is rejected |
 | Local-AI engine and weights | SHA-256 pins compiled into `src-tauri/src/needle/manifest.rs`, verified on download; only fetched after you consent |
+| Optional license check | `POST https://api.gumroad.com/v2/licenses/verify` over HTTPS with certificate validation. The body is the public product id and the license key. No API token is compiled in. See [`docs/LICENSING.md`](docs/LICENSING.md) |
 
 Because `main` is the profile-feed trust anchor, the repository's branch protection and account security are part of the app's security model, not just project hygiene.
 
@@ -36,7 +37,7 @@ Profile data is validated at load time, not trusted: folder and filename pattern
 - Formatting requires a removable drive, a named expected size, and the exact word `FORMAT`.
 - Copies write to a `.cfwpart` temporary name and rename on completion, so an interrupted copy cannot leave a truncated ROM behind.
 - Disk writes require elevation; the app launches the flash helper with a UAC prompt rather than assuming it already has rights.
-- Downloads and the diagnostic log stay local. There is no telemetry, no account, and no analytics. Inference for the optional local-AI tier runs on-device and never contacts the network.
+- The diagnostic log stays on this PC and is never uploaded. There is no telemetry and no analytics. An optional license check sends the product id and license key to Gumroad over HTTPS when you activate, and again to re-check a saved activation. It is not required for backup, restore, card tests, or the disk safeguards. Inference for the optional local-AI tier runs on-device and never contacts the network.
 
 ## Accepted residual risk
 
@@ -46,6 +47,7 @@ These are known and intentionally out of scope, documented rather than hidden:
 - **A profile's `custom` layout values are validated, not sandboxed.** Bounds are enforced on folders and patterns, but a malicious profile is a limited-confusion risk rather than a code-execution vector. Profiles you load yourself are trusted to the same degree as the app.
 - **The DAT sorting path shells out to your `igir`.** The app spawns `igir` (from `PATH` or `npx.cmd`) and validates the folders it is given, but the tool itself is a third-party dependency you supply.
 - **Nothing prevents you from confirming a write to a card that matters.** The confirmations are deliberately literal, and the app does not try to outsmart a determined user who types `FLASH` on the wrong card. The size and disk checks are the safety net; read them.
+- **The license check is a speed bump.** The app is open source. The cache HMAC is computed from a machine id and a label that ships in the source, so a determined person can forge a cache or skip the check. Card-safety commands do not consult it. Details and the three-computer soft limit are in [`docs/LICENSING.md`](docs/LICENSING.md).
 
 ## Out of scope
 

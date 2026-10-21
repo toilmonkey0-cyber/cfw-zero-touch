@@ -36,6 +36,7 @@ jsonschema = { version = "0.57.0", default-features = false }
 tauri-plugin-dialog = { version = "2.7.3", default-features = false }
 flate2 = "1.1.10"
 sha2 = "0.11.0"
+hmac = "0.13"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [target.'cfg(windows)'.dependencies]

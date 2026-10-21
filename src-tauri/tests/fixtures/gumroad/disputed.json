@@ -1,0 +1,13 @@
+{
+  "success": true,
+  "uses": 1,
+  "purchase": {
+    "product_id": "fixture-product-id-001",
+    "email": "buyer@example.invalid",
+    "license_key": "ECHO-KEY-SHOULD-NOT-LEAK-9999",
+    "refunded": false,
+    "disputed": true,
+    "dispute_won": true,
+    "chargebacked": false
+  }
+}
