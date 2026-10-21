@@ -2646,8 +2646,10 @@ fn diagnostics_path() -> String {
 }
 
 /// Save one support zip. Reads notes and license status only. Does not open a card.
+/// The zip is built off the command thread. License status is read only when the
+/// license lock is free; otherwise the file says the status is unknown.
 #[tauri::command]
-fn save_support_bundle(destination: String, library: Option<String>) -> Result<(), String> {
+async fn save_support_bundle(destination: String, library: Option<String>) -> Result<(), String> {
     let dest = PathBuf::from(destination.trim());
     diag::refuse_support_destination(&dest)?;
     let library = library.and_then(|value| {
@@ -2658,7 +2660,6 @@ fn save_support_bundle(destination: String, library: Option<String>) -> Result<(
             Some(PathBuf::from(trimmed))
         }
     });
-    let view = with_license(|session| session.offline_status().to_view(None));
     let mut usernames = Vec::new();
     for key in ["USER", "USERNAME"] {
         if let Ok(value) = std::env::var(key) {
@@ -2668,28 +2669,65 @@ fn save_support_bundle(destination: String, library: Option<String>) -> Result<(
             }
         }
     }
-    diag::write_support_bundle(
-        &dest,
-        &diag::SupportFacts {
-            version: env!("CARGO_PKG_VERSION").into(),
-            os_name: std::env::consts::OS.into(),
-            arch: std::env::consts::ARCH.into(),
-            library,
-            license_state: view.state,
-            license_reason: view.reason,
-            license_message: view.message,
-            license_uses: view.uses,
-            over_soft_limit: view.over_soft_limit,
-            stale: view.stale,
-            signed_updates: view.signed_updates,
-            support: view.support,
-            safety_open: view.safety_open,
-            usernames,
-            secrets: Vec::new(),
-        },
-    )?;
-    diag::log("INFO", "support_saved", "file=support-zip");
-    Ok(())
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    let os_name = std::env::consts::OS.to_string();
+    let arch = std::env::consts::ARCH.to_string();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let view = support_license_view();
+        diag::write_support_bundle(
+            &dest,
+            &diag::SupportFacts {
+                version,
+                os_name,
+                arch,
+                library,
+                license_state: view.state,
+                license_reason: view.reason,
+                license_message: view.message,
+                license_uses: view.uses,
+                over_soft_limit: view.over_soft_limit,
+                stale: view.stale,
+                signed_updates: view.signed_updates,
+                support: view.support,
+                safety_open: view.safety_open,
+                usernames,
+                secrets: Vec::new(),
+            },
+        )?;
+        diag::log("INFO", "support_saved", "file=support-zip");
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("could not save the support file".into()),
+    }
+}
+
+/// License status for the support file. `try_lock` returns immediately when
+/// another command holds the license lock, so saving the file cannot freeze
+/// the window or wait on Gumroad.
+fn support_license_view() -> license::LicenseView {
+    let guard = match license::session_lock().try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return license::LicenseView {
+                state: "unknown".into(),
+                reason: "unknown".into(),
+                message: "License status was not read.".into(),
+                uses: None,
+                over_soft_limit: false,
+                stale: false,
+                signed_updates: false,
+                support: false,
+                safety_open: true,
+            };
+        }
+    };
+    let view = license::production_session().offline_status().to_view(None);
+    drop(guard);
+    view
 }
 
 /// Doctor diagnosis of one selected card: deterministic templates plus an
@@ -3240,16 +3278,74 @@ mod tests {
 
     #[test]
     fn save_support_bundle_refuses_a_disk_device() {
-        let error = save_support_bundle("/dev/mmcblk0".into(), None).unwrap_err();
+        let error =
+            tauri::async_runtime::block_on(save_support_bundle("/dev/mmcblk0".into(), None))
+                .unwrap_err();
         assert!(
             error.to_lowercase().contains("disk") || error.to_lowercase().contains("file"),
             "{error}"
         );
-        let drive = save_support_bundle(r"\\.\PhysicalDrive1".into(), None).unwrap_err();
+        let drive =
+            tauri::async_runtime::block_on(save_support_bundle(r"\\.\PhysicalDrive1".into(), None))
+                .unwrap_err();
         assert!(
             drive.to_lowercase().contains("disk") || drive.to_lowercase().contains("file"),
             "{drive}"
         );
+        let com = tauri::async_runtime::block_on(save_support_bundle("//./COM1".into(), None))
+            .unwrap_err();
+        assert!(
+            com.to_lowercase().contains("disk") || com.to_lowercase().contains("file"),
+            "{com}"
+        );
+        let notes = tauri::async_runtime::block_on(save_support_bundle("notes.txt".into(), None))
+            .unwrap_err();
+        assert!(notes.to_lowercase().contains("zip"), "{notes}");
+    }
+
+    #[test]
+    fn save_support_bundle_does_not_wait_for_the_license_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "cfw-support-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var("CFW_STUDIO_DATA").ok();
+        std::env::set_var("CFW_STUDIO_DATA", &dir);
+        let dest = dir.join("cfw-card-studio-support.zip");
+        let guard = super::license::session_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dest_thread = dest.clone();
+        std::thread::spawn(move || {
+            let result = tauri::async_runtime::block_on(save_support_bundle(
+                dest_thread.display().to_string(),
+                None,
+            ));
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(3));
+        drop(guard);
+        let saved = result.expect("support file waited on the license lock");
+        saved.expect("support file saved");
+        let bytes = std::fs::read(&dest).unwrap();
+        let files = super::diag::read_stored_zip(&bytes).unwrap();
+        let license_text = files
+            .iter()
+            .find(|(name, _)| name == "license.txt")
+            .map(|(_, data)| String::from_utf8_lossy(data).into_owned())
+            .unwrap_or_default();
+        assert!(license_text.contains("state=unknown"), "{license_text}");
+        match previous {
+            Some(value) => std::env::set_var("CFW_STUDIO_DATA", value),
+            None => std::env::remove_var("CFW_STUDIO_DATA"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

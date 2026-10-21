@@ -15,6 +15,38 @@ use cfw_zero_touch_lib::diag::{
 // CFW_STUDIO_DATA manipulation so parallel threads cannot flake.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+struct RestoreVar {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl RestoreVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
+}
+
+impl Drop for RestoreVar {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 fn scratch_data(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "cfw-{name}-{}-{}",
@@ -40,7 +72,7 @@ fn timestamps_are_utc_and_handle_leap_days() {
 
 #[test]
 fn log_appends_timestamped_lines_under_the_store_root() {
-    let _env = ENV_LOCK.lock().unwrap();
+    let _env = env_lock();
     let root = scratch_data("diag-append");
     log("INFO", "event_one", "detail one");
     log("WARN", "event_two", "detail two");
@@ -63,7 +95,7 @@ fn log_appends_timestamped_lines_under_the_store_root() {
 
 #[test]
 fn oversized_logs_rotate_to_old() {
-    let _env = ENV_LOCK.lock().unwrap();
+    let _env = env_lock();
     let root = scratch_data("diag-rotate");
     {
         let mut file = fs::OpenOptions::new()
@@ -150,7 +182,7 @@ fn assert_absent(zip: &[u8], files: &[(String, Vec<u8>)], secret: &str) {
 
 #[test]
 fn support_zip_hides_fixture_rom_names_and_the_library_path() {
-    let _env = ENV_LOCK.lock().unwrap();
+    let _env = env_lock();
     let root = scratch_data("support-roms");
     let library = root.join("library");
     fs::create_dir_all(library.join("snes")).unwrap();
@@ -200,7 +232,7 @@ fn support_zip_hides_fixture_rom_names_and_the_library_path() {
 
 #[test]
 fn support_zip_hides_the_license_key_email_and_gumroad_body() {
-    let _env = ENV_LOCK.lock().unwrap();
+    let _env = env_lock();
     let root = scratch_data("support-license");
     let key = "ABCD-EFGH-IJKL-MN99";
     let echo = "ECHO-KEY-SHOULD-NOT-LEAK-9999";
@@ -261,7 +293,7 @@ fn support_zip_hides_the_license_key_email_and_gumroad_body() {
 
 #[test]
 fn support_zip_opens_with_readme_and_the_saved_card_results() {
-    let _env = ENV_LOCK.lock().unwrap();
+    let _env = env_lock();
     let root = scratch_data("support-open");
     fs::write(log_path(), "INFO app_start version=9.9.9-test\n").unwrap();
     fs::write(log_path().with_extension("old"), "INFO older note\n").unwrap();
@@ -300,6 +332,24 @@ fn support_zip_opens_with_readme_and_the_saved_card_results() {
         }
     }
     assert!(readme.to_lowercase().contains("license key"));
+    assert!(
+        readme.to_lowercase().contains("serial"),
+        "readme should say the card serial is included: {readme}"
+    );
+    assert!(
+        readme.to_lowercase().contains("partition"),
+        "readme should say the partition id is included: {readme}"
+    );
+    let left_out = readme.to_lowercase();
+    let left_at = left_out
+        .find("removed")
+        .or_else(|| left_out.find("not included"))
+        .unwrap_or(0);
+    let left_out = &left_out[left_at..];
+    assert!(
+        !left_out.contains("serial") && !left_out.contains("partition"),
+        "serial and partition id are included, so the left-out wording must not claim they are removed: {readme}"
+    );
     assert_eq!(entry(&files, "version.txt").trim(), "version=9.9.9-test");
     let os = entry(&files, "os.txt");
     assert!(os.contains("os=test-os"), "{os}");
@@ -322,6 +372,8 @@ fn support_zip_opens_with_readme_and_the_saved_card_results() {
 
 #[test]
 fn support_file_refuses_a_disk_device_path() {
+    let _env = env_lock();
+    let root = scratch_data("support-dest");
     let disk = refuse_support_destination(Path::new("/dev/mmcblk0")).unwrap_err();
     assert!(
         disk.to_lowercase().contains("disk") || disk.to_lowercase().contains("file"),
@@ -332,12 +384,129 @@ fn support_file_refuses_a_disk_device_path() {
         drive.to_lowercase().contains("disk") || drive.to_lowercase().contains("file"),
         "{drive}"
     );
+    for device in [
+        r"//./COM1",
+        r"//?/Volume{abc}",
+        r"\\?\UNC\nas\share\cfw-card-studio-support.zip",
+        r"\\?\Volume{abc}\file.zip",
+    ] {
+        let error = refuse_support_destination(Path::new(device)).unwrap_err();
+        assert!(
+            error.to_lowercase().contains("disk") || error.to_lowercase().contains("file"),
+            "{device}: {error}"
+        );
+    }
+    assert!(
+        refuse_support_destination(Path::new(r"\\?\C:\support\cfw-card-studio-support.zip"))
+            .is_ok()
+    );
     assert!(refuse_support_destination(Path::new("cfw-card-studio-support.zip")).is_ok());
+    let notes = refuse_support_destination(Path::new("notes.txt")).unwrap_err();
+    assert!(notes.to_lowercase().contains("zip"), "{notes}");
+    let folder = root.join("bundle.zip");
+    fs::create_dir_all(&folder).unwrap();
+    let directory = refuse_support_destination(&folder).unwrap_err();
+    assert!(
+        directory.to_lowercase().contains("file") || directory.to_lowercase().contains("disk"),
+        "{directory}"
+    );
     let written = write_support_bundle(Path::new("/dev/sda"), &support_facts(None)).unwrap_err();
     assert!(
         written.to_lowercase().contains("disk") || written.to_lowercase().contains("file"),
         "{written}"
     );
+    let _ = fs::remove_dir_all(&root);
+    std::env::remove_var("CFW_STUDIO_DATA");
+}
+
+#[test]
+fn support_zip_hides_a_home_path_that_contains_spaces() {
+    let _env = env_lock();
+    let root = scratch_data("support-spaces");
+    let _profile = RestoreVar::set("USERPROFILE", r"C:\Users\Jane Doe");
+    let _home = RestoreVar::set("HOME", "/home/Jane Doe");
+    let spaced = r"C:\Users\Jane Doe\My Games\Super Mario.sfc";
+    let forward = "C:/Users/Jane Doe/My Games/Super Mario.sfc";
+    let extended = r"\\?\C:\Users\Jane Doe\My Games\Super Mario.sfc";
+    let short = r"C:\USERS\JANEDO~1\MYGAME~1\SUPERM~1.SFC";
+    let unix_home = "/home/Jane Doe/My Games/Super Mario.sfc";
+    fs::write(
+        log_path(),
+        format!(
+            "INFO copied {spaced}\nINFO also {forward}\nINFO ext {extended}\nINFO short {short}\nINFO unix {unix_home}\nINFO player=Jane Doe\nINFO account=JANEDO~1\n"
+        ),
+    )
+    .unwrap();
+
+    let zip = build_support_zip(&support_facts(None));
+    let files = read_stored_zip(&zip).expect("zip opens");
+    for secret in [
+        spaced,
+        forward,
+        extended,
+        short,
+        unix_home,
+        "Jane Doe",
+        "Super Mario",
+        "JANEDO~1",
+        "MYGAME~1",
+        "SUPERM~1",
+    ] {
+        assert_absent(&zip, &files, secret);
+    }
+    let notes = entry(&files, "logs/diagnostics.log");
+    assert!(notes.contains("[path]"), "{notes}");
+    assert!(notes.contains("[user]"), "{notes}");
+    let _ = fs::remove_dir_all(&root);
+    std::env::remove_var("CFW_STUDIO_DATA");
+}
+
+#[test]
+fn support_zip_hides_old_libraries_and_unc_paths_by_pattern() {
+    let _env = env_lock();
+    let root = scratch_data("support-unc");
+    let _profile = RestoreVar::remove("USERPROFILE");
+    let _home = RestoreVar::remove("HOME");
+    let library = root.join("current-library");
+    fs::create_dir_all(&library).unwrap();
+    fs::write(library.join("Current Only.sfc"), b"fixture").unwrap();
+    let old = r"D:\Games\Old Lib\Metroid.gba";
+    let old_forward = "D:/Games/Old Lib/Metroid.gba";
+    let old_extended = r"\\?\D:\Games\Old Lib\Metroid.gba";
+    let unc = r"\\nas\roms\Sonic.md";
+    let unc_forward = "//nas/roms/Sonic.md";
+    let unc_extended = r"\\?\UNC\nas\roms\Sonic.md";
+    let staging = r"C:\Users\Someone\AppData\Local\cfw-card-studio\staging\Metroid.gba";
+    fs::write(
+        log_path(),
+        format!(
+            "INFO old {old}\nINFO fwd {old_forward}\nINFO ext {old_extended}\nINFO nas {unc}\nINFO nasfwd {unc_forward}\nINFO nasext {unc_extended}\nINFO stage {staging}\n"
+        ),
+    )
+    .unwrap();
+
+    let zip = build_support_zip(&support_facts(Some(library)));
+    let files = read_stored_zip(&zip).expect("zip opens");
+    for secret in [
+        old,
+        old_forward,
+        old_extended,
+        unc,
+        unc_forward,
+        unc_extended,
+        staging,
+        "Metroid",
+        "Sonic.md",
+        "Old Lib",
+        r"\\nas\roms",
+        "staging",
+    ] {
+        assert_absent(&zip, &files, secret);
+    }
+    let notes = entry(&files, "logs/diagnostics.log");
+    assert!(notes.contains("[path]"), "{notes}");
+    let _ = fs::remove_dir_all(&root);
+    std::env::remove_var("CFW_STUDIO_DATA");
 }
 
 fn walk_files(root: &Path) -> Vec<String> {

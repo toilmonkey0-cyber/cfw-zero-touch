@@ -62,7 +62,7 @@ These stay available with no key, an invalid key, a refunded key, or a cached ke
 - Guided setup, which calls those commands
 - Format and flash decisions, including the refusals for a fixed disk, a size of 0, disk 0, and a mismatched checksum
 - The profile feed and the public release link, which carry card-layout fixes
-- Saving a support file (version, system, notes, latest card test, and license status, with the key and email left out)
+- Saving a support file (version, system, notes, latest card test including the card serial and partition id, and license status, with game names, folder paths, the key, and email left out)
 
 The license screen is the commercial entitlement for signed builds and support. It does not download a private update package and it does not create a Gumroad product.
 

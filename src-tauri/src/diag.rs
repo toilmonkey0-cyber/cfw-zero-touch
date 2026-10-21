@@ -148,15 +148,47 @@ pub fn refuse_support_destination(path: &Path) -> Result<(), String> {
     if is_device_path(&path.to_string_lossy()) {
         return Err("The support file has to be a normal file, not a disk.".into());
     }
-    Ok(())
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !name.to_ascii_lowercase().ends_with(".zip") {
+        return Err("The support file name has to end in .zip.".into());
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(_) => Err("The support file has to be a normal file, not a disk.".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not check the support file: {error}")),
+    }
 }
 
 pub fn is_device_path(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.starts_with("/dev/")
-        || lower.contains("physicaldrive")
-        || lower.contains(r"\\.\")
-        || text.starts_with(r"\\.\")
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("/dev/") || lower.contains("physicaldrive") {
+        return true;
+    }
+    // `\\?\C:\folder\file.zip` is a normal file. Every other `\\?\`, `\\.`,
+    // `//./`, and `//?/` path is a device namespace.
+    if is_extended_drive_path(trimmed) {
+        return false;
+    }
+    trimmed.starts_with(r"\\?\")
+        || trimmed.starts_with(r"\\.\")
+        || lower.starts_with("//?/")
+        || lower.starts_with("//./")
+}
+
+/// `\\?\X:\` (and `\\?\X:` itself). Forward-slash `//?/` is not this form.
+fn is_extended_drive_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 6 || !text.starts_with(r"\\?\") {
+        return false;
+    }
+    bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+        && (bytes.len() == 6 || bytes[6] == b'\\' || bytes[6] == b'/')
 }
 
 /// Read the app's notes and the saved card results, scrub them, and zip them.
@@ -505,6 +537,7 @@ struct Privacy {
 fn privacy_for(facts: &SupportFacts, cache_secrets: &[String]) -> Privacy {
     let mut paths = Vec::new();
     let mut rom_names = Vec::new();
+    let mut usernames = facts.usernames.clone();
     if let Some(library) = &facts.library {
         let text = library.to_string_lossy();
         if !is_device_path(&text) {
@@ -512,7 +545,17 @@ fn privacy_for(facts: &SupportFacts, cache_secrets: &[String]) -> Privacy {
             rom_names.extend(rom_names_in(library));
         }
     }
-    let mut usernames = facts.usernames.clone();
+    for home in home_directories() {
+        paths.extend(path_variants(Path::new(&home)));
+        if let Some(user) = username_in(&home) {
+            usernames.push(user);
+        }
+        if let Some(short) = dos_short_path(&home) {
+            if let Some(user) = username_in(&short) {
+                usernames.push(user);
+            }
+        }
+    }
     usernames.retain(|name| name.trim().len() >= 3);
     let mut secrets = facts.secrets.clone();
     secrets.extend(cache_secrets.iter().cloned());
@@ -527,11 +570,159 @@ fn privacy_for(facts: &SupportFacts, cache_secrets: &[String]) -> Privacy {
 
 fn path_variants(path: &Path) -> Vec<String> {
     let text = path.to_string_lossy().into_owned();
-    let mut out = vec![text.replace('\\', "/"), text.replace('/', "\\"), text];
+    let mut out = Vec::new();
+    push_path_forms(&mut out, &text);
+    if let Some(short) = dos_short_path(&text) {
+        push_path_forms(&mut out, &short);
+    }
     out.retain(|item| item.len() >= 3);
     out.sort();
     out.dedup();
     out
+}
+
+fn push_path_forms(out: &mut Vec<String>, text: &str) {
+    let forward = text.replace('\\', "/");
+    let back = text.replace('/', "\\");
+    out.push(text.to_string());
+    out.push(forward);
+    out.push(back.clone());
+    out.extend(extended_forms(&back));
+}
+
+fn extended_forms(back: &str) -> Vec<String> {
+    if back.starts_with(r"\\?\") || back.starts_with(r"\\.\") {
+        return Vec::new();
+    }
+    let bytes = back.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return vec![format!(r"\\?\{back}")];
+    }
+    if let Some(tail) = unc_tail(back) {
+        return vec![format!(r"\\?\UNC\{tail}")];
+    }
+    Vec::new()
+}
+
+fn unc_tail(path: &str) -> Option<&str> {
+    if path.len() < 3 || !path.starts_with(r"\\") {
+        return None;
+    }
+    if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
+        return None;
+    }
+    Some(&path[2..])
+}
+
+fn home_directories() -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["USERPROFILE", "HOME"] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if trimmed.len() < 5 || trimmed == "/" || trimmed.ends_with(':') || is_device_path(trimmed)
+        {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    out
+}
+
+/// Windows 8.3 form of a path. Spaces and long names become `NAME~1`.
+fn dos_short_path(path: &str) -> Option<String> {
+    let replaced = path.replace('/', "\\");
+    let back = strip_extended_prefix(&replaced);
+    let unc = back.starts_with(r"\\");
+    let unix = !unc && path.replace('\\', "/").starts_with('/');
+    let parts: Vec<&str> = back
+        .split(['\\', '/'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut short_parts = Vec::with_capacity(parts.len());
+    for part in parts {
+        if part.len() == 2 && part.as_bytes()[1] == b':' {
+            short_parts.push(part.to_ascii_uppercase());
+        } else {
+            short_parts.push(dos_component(part));
+        }
+    }
+    let joined = if unix {
+        short_parts.join("/")
+    } else {
+        short_parts.join("\\")
+    };
+    let result = if unc {
+        format!(r"\\{joined}")
+    } else if unix {
+        format!("/{joined}")
+    } else {
+        joined
+    };
+    if result == back {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+fn strip_extended_prefix(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    if lower.starts_with(r"\\?\unc\") || lower.starts_with("//?/unc/") {
+        return format!(r"\\{}", &path[8..]);
+    }
+    if path.starts_with(r"\\?\")
+        || path.starts_with(r"\\.\")
+        || path.starts_with("//?/")
+        || path.starts_with("//./")
+    {
+        return path[4..].to_string();
+    }
+    path.to_string()
+}
+
+fn dos_component(name: &str) -> String {
+    let (base, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < name.len() => (&name[..dot], Some(&name[dot + 1..])),
+        _ => (name, None),
+    };
+    let base_short = dos_piece(base, 8);
+    match ext {
+        Some(ext) => format!("{base_short}.{}", dos_piece(ext, 3)),
+        None => base_short,
+    }
+}
+
+fn dos_piece(text: &str, limit: usize) -> String {
+    let mut cleaned = String::new();
+    let mut skipped = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            cleaned.push(ch.to_ascii_uppercase());
+        } else {
+            skipped = true;
+        }
+    }
+    if cleaned.is_empty() {
+        return if limit > 3 {
+            "X~1".to_string()
+        } else {
+            "X".to_string()
+        };
+    }
+    if limit <= 3 {
+        return cleaned.chars().take(limit).collect();
+    }
+    if skipped || cleaned.len() > limit {
+        let mut cut: String = cleaned.chars().take(6).collect();
+        cut.push_str("~1");
+        return cut;
+    }
+    cleaned
 }
 
 fn rom_names_in(library: &Path) -> Vec<String> {
@@ -636,7 +827,7 @@ What's inside:
 - logs/diagnostics.log: recent notes from this app
 - logs/diagnostics.old: the previous notes, if the log rolled over
 - probe.txt: the latest quick card test
-- identity.txt: the latest card identity check
+- identity.txt: the latest card identity check. This file includes the card serial and the partition table id
 - fake-card.txt: the latest fake-card test
 - license.txt: whether a license is turned on for this computer
 
@@ -776,18 +967,113 @@ fn apply_hits(text: &str, hits: &[Hit]) -> String {
 }
 
 fn discover_home_paths(text: &str) -> Vec<(usize, usize)> {
-    let markers = ["/home/", "/users/", "\\users\\"];
+    let bytes = text.as_bytes();
     let mut found = Vec::new();
-    for marker in markers {
-        for at in find_ci(text, marker) {
-            let start = drive_start(text, at);
-            let end = path_end(text, start);
-            if end > start + marker.len() {
-                found.push((start, end));
+    let mut index = 0;
+    while index < bytes.len() {
+        if path_boundary(bytes, index) {
+            if let Some(end) = sensitive_path_end(text, index) {
+                found.push((index, end));
+                index = end;
+                continue;
             }
         }
+        index += 1;
     }
     found
+}
+
+fn path_boundary(bytes: &[u8], index: usize) -> bool {
+    index == 0
+        || bytes[index - 1].is_ascii_whitespace()
+        || matches!(
+            bytes[index - 1],
+            b'=' | b'(' | b'[' | b',' | b';' | b'\'' | b'"'
+        )
+}
+
+fn sensitive_path_end(text: &str, start: usize) -> Option<usize> {
+    let min = path_prefix_len(&text[start..])?;
+    let end = path_end(text, start);
+    if end >= start + min && end > start {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+fn path_prefix_len(rest: &str) -> Option<usize> {
+    let lower = rest.to_ascii_lowercase();
+    if starts_with_ascii(&lower, r"\\?\unc\") || starts_with_ascii(&lower, "//?/unc/") {
+        return Some(8);
+    }
+    if starts_with_ascii(rest, r"\\?\")
+        || starts_with_ascii(rest, r"\\.\")
+        || starts_with_ascii(rest, "//?/")
+        || starts_with_ascii(rest, "//./")
+    {
+        return Some(4);
+    }
+    if let Some(len) = unc_prefix_len(rest) {
+        return Some(len);
+    }
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return Some(3);
+    }
+    for marker in ["/home/", "/users/", "\\home\\", "\\users\\"] {
+        if starts_with_ascii(&lower, marker) {
+            return Some(marker.len());
+        }
+    }
+    None
+}
+
+fn starts_with_ascii(text: &str, prefix: &str) -> bool {
+    text.len() >= prefix.len()
+        && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+fn unc_prefix_len(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    if bytes.len() < 5 {
+        return None;
+    }
+    let sep = if rest.starts_with(r"\\") {
+        b'\\'
+    } else if rest.starts_with("//") {
+        b'/'
+    } else {
+        return None;
+    };
+    if matches!(bytes[2], b'\\' | b'/' | b'?' | b'.') {
+        return None;
+    }
+    let mut index = 2;
+    while index < bytes.len() && bytes[index] != sep && !is_path_stop(bytes[index]) {
+        index += 1;
+    }
+    if index == 2 || index >= bytes.len() || bytes[index] != sep {
+        return None;
+    }
+    let share = index + 1;
+    let mut end = share;
+    while end < bytes.len()
+        && bytes[end] != sep
+        && !is_path_stop(bytes[end])
+        && !bytes[end].is_ascii_whitespace()
+    {
+        end += 1;
+    }
+    if end == share {
+        None
+    } else {
+        Some(end)
+    }
 }
 
 fn find_ci(text: &str, needle: &str) -> Vec<usize> {
@@ -811,26 +1097,20 @@ fn find_ci(text: &str, needle: &str) -> Vec<usize> {
     found
 }
 
-fn drive_start(text: &str, marker_at: usize) -> usize {
-    let bytes = text.as_bytes();
-    if marker_at >= 2 && bytes[marker_at - 1] == b':' && bytes[marker_at - 2].is_ascii_alphabetic()
-    {
-        return marker_at - 2;
-    }
-    marker_at
-}
-
 fn path_end(text: &str, start: usize) -> usize {
     let bytes = text.as_bytes();
     let mut index = start;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\'' | b'<' | b'>') {
-            break;
-        }
+    while index < bytes.len() && !is_path_stop(bytes[index]) {
         index += 1;
     }
+    while index > start && bytes[index - 1].is_ascii_whitespace() {
+        index -= 1;
+    }
     index
+}
+
+fn is_path_stop(byte: u8) -> bool {
+    byte == b'\n' || byte == b'\r' || matches!(byte, b'"' | b'\'' | b'<' | b'>' | b'|')
 }
 
 fn username_in(path: &str) -> Option<String> {
@@ -840,18 +1120,21 @@ fn username_in(path: &str) -> Option<String> {
         .collect();
     for (index, part) in parts.iter().enumerate() {
         if part.eq_ignore_ascii_case("home") || part.eq_ignore_ascii_case("users") {
-            let user = parts.get(index + 1)?;
-            let user = user.trim();
-            if user.len() >= 3
-                && user.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' || byte == b'.'
-                })
-            {
+            let user = parts.get(index + 1)?.trim();
+            if valid_username(user) {
                 return Some(user.to_string());
             }
         }
     }
     None
+}
+
+fn valid_username(user: &str) -> bool {
+    user.len() >= 3
+        && user.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && user.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'~' | b' ')
+        })
 }
 
 fn find_emails(text: &str) -> Vec<(usize, usize)> {
@@ -1039,4 +1322,57 @@ fn finite_speed(value: f64) -> String {
 
 fn one_line(text: &str) -> String {
     text.replace(['\n', '\r'], " ")
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::{is_device_path, path_end, path_variants, username_in};
+    use std::path::Path;
+
+    #[test]
+    fn path_end_includes_spaces_until_the_line_ends() {
+        let text = "C:\\Users\\Jane Doe\\My Games\\Super Mario.sfc\nnext";
+        assert_eq!(
+            &text[..path_end(text, 0)],
+            "C:\\Users\\Jane Doe\\My Games\\Super Mario.sfc"
+        );
+    }
+
+    #[test]
+    fn username_in_keeps_dos_short_names() {
+        assert_eq!(
+            username_in(r"C:\Users\JANEDO~1\Games"),
+            Some("JANEDO~1".to_string())
+        );
+    }
+
+    #[test]
+    fn extended_drive_paths_are_files_and_other_device_prefixes_are_not() {
+        assert!(!is_device_path(r"\\?\C:\support\file.zip"));
+        assert!(is_device_path(r"\\?\UNC\nas\share\file.zip"));
+        assert!(is_device_path(r"//./COM1"));
+        assert!(is_device_path(r"//?/Volume{abc}"));
+        assert!(is_device_path(r"\\.\PhysicalDrive1"));
+    }
+
+    #[test]
+    fn path_variants_include_extended_unc_and_short_names() {
+        let drive = path_variants(Path::new(r"D:\Games\Old Lib"));
+        assert!(
+            drive
+                .iter()
+                .any(|item| item.eq_ignore_ascii_case(r"\\?\D:\Games\Old Lib")),
+            "{drive:?}"
+        );
+        assert!(
+            drive.iter().any(|item| item.contains("OLDLIB~1")),
+            "{drive:?}"
+        );
+        let unc = path_variants(Path::new(r"\\nas\roms"));
+        assert!(
+            unc.iter()
+                .any(|item| item.to_ascii_lowercase().starts_with(r"\\?\unc\")),
+            "{unc:?}"
+        );
+    }
 }

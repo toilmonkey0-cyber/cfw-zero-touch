@@ -26,6 +26,18 @@ describe("Save support file", () => {
     expect(SUPPORT_COPY.toLowerCase()).toContain("license key");
     expect(SUPPORT_COPY.toLowerCase()).toContain("email");
     expect(SUPPORT_COPY.toLowerCase()).toContain("no license");
+    expect(SUPPORT_COPY.toLowerCase()).toContain("serial");
+    expect(SUPPORT_COPY.toLowerCase()).toContain("partition");
+    const lowerCopy = SUPPORT_COPY.toLowerCase();
+    const leftOutAt = lowerCopy.indexOf("left out");
+    expect(leftOutAt).toBeGreaterThan(0);
+    const sentenceStart = lowerCopy.lastIndexOf(".", leftOutAt - 1) + 1;
+    const leftOut = lowerCopy.slice(sentenceStart, leftOutAt + "left out".length);
+    expect(leftOut).toContain("game");
+    expect(leftOut).toContain("license key");
+    expect(leftOut).toContain("email");
+    expect(leftOut).not.toContain("serial");
+    expect(leftOut).not.toContain("partition");
     const button = html.match(/<button\b[^>]*>/)?.[0] ?? "";
     expect(button).toContain("type=\"button\"");
     expect(button).not.toContain("disabled");

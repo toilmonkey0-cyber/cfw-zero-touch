@@ -1919,6 +1919,9 @@ mod tests {
             "activate_license",
             "deactivate_license",
             "paid_feature",
+            "save_support_bundle",
+            "support_license_view",
+            "save_support_bundle_does_not_wait_for_the_license_lock",
         ] {
             outside = remove_function(&outside, name);
         }
@@ -1994,6 +1997,27 @@ mod tests {
                 "{name} calls Gumroad on the command task instead of the blocking pool"
             );
         }
+
+        let support = command_body(&src, "save_support_bundle");
+        let support_at = src
+            .find("fn save_support_bundle(")
+            .expect("save_support_bundle");
+        assert!(
+            src[support_at.saturating_sub(6)..support_at].contains("async"),
+            "save_support_bundle must be async"
+        );
+        let pooled = support
+            .find("spawn_blocking")
+            .expect("save_support_bundle must use spawn_blocking");
+        let read = support
+            .find("support_license_view")
+            .expect("save_support_bundle must read license status in the worker");
+        assert!(pooled < read, "license status is read on the command task");
+        let reader = command_body(&src, "support_license_view");
+        assert!(
+            reader.contains("try_lock"),
+            "support license status must not wait on the license lock"
+        );
 
         let caller = std::thread::current().id();
         let (started_tx, started_rx) = std::sync::mpsc::channel();

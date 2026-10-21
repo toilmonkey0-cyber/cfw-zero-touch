@@ -3,7 +3,7 @@ import type { ReactElement } from "react";
 export const SUPPORT_BUTTON_LABEL = "Save support file";
 
 export const SUPPORT_COPY =
-  "Saves one zip you can send to support. It includes the app version, the operating system on this computer, recent notes, the latest card test, and whether a license is turned on. Game names, your folders, the license key, and email addresses are left out. Saving this file needs no license.";
+  "Saves one zip you can send to support. It includes the app version, the operating system on this computer, recent notes, the latest card test, the card serial, the partition id, and whether a license is turned on. Game names, your folders, the license key, and email addresses are left out. Saving this file needs no license.";
 
 export type SupportInvoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 
