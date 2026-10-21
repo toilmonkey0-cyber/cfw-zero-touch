@@ -6,6 +6,7 @@ pub mod firstboot;
 pub mod flash;
 pub mod folder_map;
 pub mod format_gate;
+pub mod fullcheck;
 pub mod igir;
 pub mod needle;
 pub mod prepare;
@@ -1117,7 +1118,7 @@ impl Drop for StockBackupGuard {
 }
 
 fn begin_stock_backup() -> Result<StockBackupGuard, String> {
-    if PROBE_RUNNING.load(Ordering::SeqCst) {
+    if PROBE_RUNNING.load(Ordering::SeqCst) || FULL_RUNNING.load(Ordering::SeqCst) {
         return Err("a card test is already running".into());
     }
     if RESTORE_RUNNING.load(Ordering::SeqCst) {
@@ -1324,7 +1325,7 @@ fn restore_cancel_slot() -> std::sync::MutexGuard<'static, Option<PathBuf>> {
 }
 
 fn begin_restore() -> Result<RestoreGuard, String> {
-    if PROBE_RUNNING.load(Ordering::SeqCst) {
+    if PROBE_RUNNING.load(Ordering::SeqCst) || FULL_RUNNING.load(Ordering::SeqCst) {
         return Err("a card test is already running".into());
     }
     if STOCK_BACKUP_RUNNING.load(Ordering::SeqCst) {
@@ -1702,6 +1703,9 @@ fn cancel_restore() {
 static PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
 static PROBE_CANCEL: AtomicBool = AtomicBool::new(false);
 static PROBE_CANCEL_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+static FULL_RUNNING: AtomicBool = AtomicBool::new(false);
+static FULL_CANCEL: AtomicBool = AtomicBool::new(false);
+static FULL_CANCEL_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 struct ProbeGuard;
 
@@ -1732,6 +1736,9 @@ fn begin_probe() -> Result<ProbeGuard, String> {
     }
     if RESTORE_RUNNING.load(Ordering::SeqCst) {
         return Err("a backup restore is already running".into());
+    }
+    if FULL_RUNNING.load(Ordering::SeqCst) {
+        return Err("a card test is already running".into());
     }
     if PROBE_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("a card test is already running".into());
@@ -1894,6 +1901,107 @@ fn list_probe_disks() -> Result<Vec<FlashDiskView>, String> {
     Ok(disks)
 }
 
+struct ScreenGate {
+    remembered: Option<probe::SessionBackup>,
+}
+
+enum ScreenStop {
+    Cancelled {
+        bytes: u64,
+        overwritten: bool,
+        summary: String,
+    },
+    Failed(String),
+}
+
+/// App-side blank or identity check shared by the quick probe and the full test.
+///
+/// A card that cannot be opened without admin is logged and left to the
+/// helper. The helper still rechecks the same gates before it writes.
+fn screen_gate(
+    disk_number: u32,
+    displayed_bytes: u64,
+    displayed_model: &str,
+    confirmation: &str,
+    word: &str,
+    cancel: &AtomicBool,
+    skip_event: &str,
+) -> Result<ScreenGate, ScreenStop> {
+    let live = query_restore_disk(disk_number).map_err(ScreenStop::Failed)?;
+    let remembered = session_backups()
+        .find(live.size_bytes, &live.model)
+        .cloned();
+    let probe_disk = probe_disk_from_restore(&live, String::new());
+    let plan = probe::ProbePlan {
+        confirmation: confirmation.to_string(),
+        disk_number,
+        displayed_bytes,
+        displayed_model: displayed_model.to_string(),
+    };
+    probe::authorize_card_write(&probe_disk, &plan, word)
+        .map_err(|block| ScreenStop::Failed(block.message().to_string()))?;
+
+    if let Some(backup) = &remembered {
+        match restore::inspect_backup(&backup.image, cancel, |_| {}) {
+            Ok(_) => {}
+            Err(restore::RestoreError::Cancelled { .. }) => {
+                return Err(ScreenStop::Cancelled {
+                    bytes: live.size_bytes,
+                    overwritten: false,
+                    summary: probe::cancel_summary(false, true),
+                });
+            }
+            Err(_) if cancel.load(Ordering::SeqCst) => {
+                return Err(ScreenStop::Cancelled {
+                    bytes: live.size_bytes,
+                    overwritten: false,
+                    summary: probe::cancel_summary(false, true),
+                });
+            }
+            Err(error) => return Err(ScreenStop::Failed(error.to_string())),
+        }
+    }
+
+    match open_stock_disk_read_only(disk_number) {
+        Ok(file) => {
+            let mut source = backup::ReadOnlyFile::new(file, live.size_bytes);
+            if let Some(backup) = &remembered {
+                let serial = query_disk_serial(disk_number).map_err(ScreenStop::Failed)?;
+                let probe_disk = probe_disk_from_restore(&live, serial);
+                match probe::verify_session_backup(backup, &probe_disk, &mut source, cancel) {
+                    Ok(()) => {}
+                    Err(probe::ProbeError::Failed {
+                        overwritten,
+                        message,
+                    }) if !overwritten
+                        && (cancel.load(Ordering::SeqCst) || message.starts_with("Cancelled.")) =>
+                    {
+                        return Err(ScreenStop::Cancelled {
+                            bytes: live.size_bytes,
+                            overwritten,
+                            summary: message,
+                        });
+                    }
+                    Err(error) => return Err(ScreenStop::Failed(error.to_string())),
+                }
+            } else if !probe::card_is_blank(&mut source)
+                .map_err(|error| ScreenStop::Failed(error.to_string()))?
+            {
+                return Err(ScreenStop::Failed(
+                    probe::ProbeBlock::NotBlank.message().into(),
+                ));
+            }
+        }
+        Err(error) => {
+            let probe::AppPrecheck::Deferred { note } = probe::app_precheck(Some(&error)) else {
+                return Err(ScreenStop::Failed(error));
+            };
+            diag::log("WARN", skip_event, &format!("disk={disk_number} {note}"));
+        }
+    }
+    Ok(ScreenGate { remembered })
+}
+
 /// Test a removable card for fake capacity. Writes go through `cfw-flash`.
 ///
 /// A backup of this card from the current process, or a blank card, is
@@ -1919,75 +2027,23 @@ fn probe_card(
         return Err(probe::ProbeBlock::Confirmation.message().into());
     }
     let tool = flash_tool()?;
-    let live = query_restore_disk(disk_number)?;
-    let remembered = session_backups()
-        .find(live.size_bytes, &live.model)
-        .cloned();
-    let probe_disk = probe_disk_from_restore(&live, String::new());
-    let plan = probe::ProbePlan {
-        confirmation: confirmation.clone(),
+    let ScreenGate { remembered } = match screen_gate(
         disk_number,
         displayed_bytes,
-        displayed_model: displayed_model.clone(),
+        &displayed_model,
+        &confirmation,
+        "PROBE",
+        &PROBE_CANCEL,
+        "probe_precheck_skipped",
+    ) {
+        Ok(gate) => gate,
+        Err(ScreenStop::Cancelled {
+            bytes,
+            overwritten,
+            summary,
+        }) => return Ok(cancelled_probe_view(bytes, overwritten, summary)),
+        Err(ScreenStop::Failed(message)) => return Err(message),
     };
-    probe::authorize_probe(&probe_disk, &plan).map_err(|block| block.message().to_string())?;
-
-    if let Some(backup) = &remembered {
-        match restore::inspect_backup(&backup.image, &PROBE_CANCEL, |_| {}) {
-            Ok(_) => {}
-            Err(restore::RestoreError::Cancelled { .. }) => {
-                return Ok(cancelled_probe_view(
-                    live.size_bytes,
-                    false,
-                    probe::cancel_summary(false, true),
-                ));
-            }
-            Err(_) if PROBE_CANCEL.load(Ordering::SeqCst) => {
-                return Ok(cancelled_probe_view(
-                    live.size_bytes,
-                    false,
-                    probe::cancel_summary(false, true),
-                ));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-
-    match open_stock_disk_read_only(disk_number) {
-        Ok(file) => {
-            let mut source = backup::ReadOnlyFile::new(file, live.size_bytes);
-            if let Some(backup) = &remembered {
-                let serial = query_disk_serial(disk_number)?;
-                let probe_disk = probe_disk_from_restore(&live, serial);
-                match probe::verify_session_backup(backup, &probe_disk, &mut source, &PROBE_CANCEL)
-                {
-                    Ok(()) => {}
-                    Err(probe::ProbeError::Failed {
-                        overwritten,
-                        message,
-                    }) if !overwritten
-                        && (PROBE_CANCEL.load(Ordering::SeqCst)
-                            || message.starts_with("Cancelled.")) =>
-                    {
-                        return Ok(cancelled_probe_view(live.size_bytes, overwritten, message));
-                    }
-                    Err(error) => return Err(error.to_string()),
-                }
-            } else if !probe::card_is_blank(&mut source).map_err(|error| error.to_string())? {
-                return Err(probe::ProbeBlock::NotBlank.message().into());
-            }
-        }
-        Err(error) => {
-            let probe::AppPrecheck::Deferred { note } = probe::app_precheck(Some(&error)) else {
-                return Err(error);
-            };
-            diag::log(
-                "WARN",
-                "probe_precheck_skipped",
-                &format!("disk={disk_number} {note}"),
-            );
-        }
-    }
 
     let temps = probe_temp_paths();
     restore::write_new_nofollow(&temps.cancel, b"")
@@ -2071,6 +2127,259 @@ fn probe_card(
 #[tauri::command]
 fn cancel_probe() {
     signal_probe_cancel();
+}
+
+struct FullGuard;
+
+impl Drop for FullGuard {
+    fn drop(&mut self) {
+        FULL_RUNNING.store(false, Ordering::SeqCst);
+        *full_cancel_slot() = None;
+    }
+}
+
+fn full_cancel_slot() -> std::sync::MutexGuard<'static, Option<PathBuf>> {
+    FULL_CANCEL_FILE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn begin_full() -> Result<FullGuard, String> {
+    if STOCK_BACKUP_RUNNING.load(Ordering::SeqCst) {
+        return Err("a stock-card backup is already running".into());
+    }
+    if RESTORE_RUNNING.load(Ordering::SeqCst) {
+        return Err("a backup restore is already running".into());
+    }
+    if PROBE_RUNNING.load(Ordering::SeqCst) {
+        return Err("a card test is already running".into());
+    }
+    if FULL_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err("a card test is already running".into());
+    }
+    FULL_CANCEL.store(false, Ordering::SeqCst);
+    Ok(FullGuard)
+}
+
+fn signal_full_cancel() {
+    FULL_CANCEL.store(true, Ordering::SeqCst);
+    if let Some(path) = full_cancel_slot().clone() {
+        let _ = restore::signal_cancel_file(&path);
+    }
+}
+
+struct FullTemps {
+    log: PathBuf,
+    cancel: PathBuf,
+    progress: PathBuf,
+}
+
+impl Drop for FullTemps {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.log);
+        let _ = std::fs::remove_file(&self.cancel);
+        let _ = std::fs::remove_file(&self.progress);
+    }
+}
+
+fn full_temp_paths() -> FullTemps {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    );
+    let dir = std::env::temp_dir();
+    FullTemps {
+        log: dir.join(format!("cfw-full-ui-{unique}.txt")),
+        cancel: dir.join(format!("cfw-full-cancel-{unique}.txt")),
+        progress: dir.join(format!("cfw-full-progress-{unique}.txt")),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FullReportView {
+    status: String,
+    overwritten: bool,
+    summary: String,
+    bad_count: u32,
+    claimed_bytes: u64,
+    write_mbps: f64,
+    read_mbps: f64,
+}
+
+fn full_view(parsed: fullcheck::FullLog, claimed_bytes: u64) -> FullReportView {
+    FullReportView {
+        status: parsed.status,
+        overwritten: parsed.overwritten,
+        summary: parsed.summary,
+        bad_count: u32::try_from(parsed.bad_ranges.len()).unwrap_or(u32::MAX),
+        claimed_bytes: if parsed.claimed_bytes == 0 {
+            claimed_bytes
+        } else {
+            parsed.claimed_bytes
+        },
+        write_mbps: parsed.write_mbps,
+        read_mbps: parsed.read_mbps,
+    }
+}
+
+fn cancelled_full_view(claimed_bytes: u64, overwritten: bool, summary: String) -> FullReportView {
+    full_view(
+        fullcheck::FullLog {
+            status: "cancelled".into(),
+            overwritten,
+            summary,
+            bad_ranges: Vec::new(),
+            claimed_bytes,
+            write_mbps: 0.0,
+            read_mbps: 0.0,
+        },
+        claimed_bytes,
+    )
+}
+
+/// Write a pattern across the whole card and read it back. Optional and slow.
+///
+/// Uses the same blank-or-backup gate as the quick probe. The elevated helper
+/// rechecks size, model, bus, system/boot, and identity after approval, and
+/// locks volumes on the backup route before it writes.
+#[tauri::command]
+fn full_check_card(
+    app: tauri::AppHandle,
+    disk_number: u32,
+    displayed_bytes: u64,
+    displayed_model: String,
+    confirmation: String,
+) -> Result<FullReportView, String> {
+    let _guard = begin_full()?;
+    if disk_number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    if confirmation != fullcheck::FULL_WORD {
+        return Err(probe::ProbeBlock::Confirmation.message().into());
+    }
+    let tool = flash_tool()?;
+    let ScreenGate { remembered } = match screen_gate(
+        disk_number,
+        displayed_bytes,
+        &displayed_model,
+        &confirmation,
+        fullcheck::FULL_WORD,
+        &FULL_CANCEL,
+        "fullcheck_precheck_skipped",
+    ) {
+        Ok(gate) => gate,
+        Err(ScreenStop::Cancelled {
+            bytes,
+            overwritten,
+            summary,
+        }) => {
+            return Ok(cancelled_full_view(bytes, overwritten, summary));
+        }
+        Err(ScreenStop::Failed(message)) => return Err(message),
+    };
+
+    let temps = full_temp_paths();
+    restore::write_new_nofollow(&temps.cancel, b"")
+        .map_err(|error| format!("could not prepare cancel: {error}"))?;
+    restore::write_new_nofollow(&temps.log, b"")
+        .map_err(|error| format!("could not prepare the full-check log: {error}"))?;
+    restore::write_new_nofollow(&temps.progress, b"")
+        .map_err(|error| format!("could not prepare progress: {error}"))?;
+    *full_cancel_slot() = Some(temps.cancel.clone());
+    let request = probe::HelperRequest {
+        disk_number,
+        confirmation,
+        displayed_bytes,
+        displayed_model: displayed_model.clone(),
+        backup_image: remembered.as_ref().map(|backup| backup.image.clone()),
+        backup_sha256: remembered.as_ref().map(|backup| backup.sha256.clone()),
+        backup_prefix_sha256: remembered
+            .as_ref()
+            .map(|backup| backup.identity.prefix_sha256.clone()),
+        backup_serial: remembered
+            .as_ref()
+            .map(|backup| backup.identity.serial.clone()),
+        cancel_file: temps.cancel.clone(),
+        log_file: temps.log.clone(),
+    };
+    let launch = probe::launch_command(&tool, "--full-check", &request, Some(&temps.progress))?;
+
+    let model_log = displayed_model.replace(['\n', '\r'], " ");
+    diag::log(
+        "INFO",
+        "fullcheck_start",
+        &format!("disk={disk_number} bytes={displayed_bytes} model={model_log}"),
+    );
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let stop_flag = std::sync::Arc::clone(&stop);
+    let progress_path = temps.progress.clone();
+    let app_progress = app.clone();
+    let poller = std::thread::spawn(move || {
+        let mut last = String::new();
+        loop {
+            if let Ok(text) = restore::read_nofollow_string(&progress_path) {
+                if text != last {
+                    if let Some(progress) = fullcheck::parse_progress_line(&text) {
+                        let _ = app_progress.emit("fullcheck-progress", &progress);
+                    }
+                    last = text;
+                }
+            }
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
+
+    let status = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &launch])
+        .status();
+    stop.store(true, Ordering::SeqCst);
+    let _ = poller.join();
+    let status = status.map_err(|error| format!("could not start the flash tool: {error}"))?;
+    let text = restore::read_nofollow_string(&temps.log).unwrap_or_default();
+    let user_cancelled = FULL_CANCEL.load(Ordering::SeqCst);
+    match fullcheck::interpret_full_log(status.code(), &text, user_cancelled, remembered.is_some())
+    {
+        Ok(parsed) => {
+            let event = if parsed.status == "cancelled" {
+                "fullcheck_cancelled"
+            } else {
+                "fullcheck_done"
+            };
+            diag::log(
+                "INFO",
+                event,
+                &format!(
+                    "disk={disk_number} status={} overwritten={} bad={}",
+                    parsed.status,
+                    parsed.overwritten,
+                    parsed.bad_ranges.len()
+                ),
+            );
+            Ok(full_view(parsed, displayed_bytes))
+        }
+        Err(message) => {
+            diag::log(
+                "ERROR",
+                "fullcheck_failed",
+                &format!("disk={disk_number}: {message}"),
+            );
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+fn cancel_full_check() {
+    signal_full_cancel();
 }
 
 #[derive(Serialize)]
@@ -2560,6 +2869,8 @@ pub fn run() {
             cancel_restore,
             probe_card,
             cancel_probe,
+            full_check_card,
+            cancel_full_check,
             list_volumes,
             firstboot_state,
             prepare_card,

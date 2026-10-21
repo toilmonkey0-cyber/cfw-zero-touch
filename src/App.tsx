@@ -6,6 +6,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import "./App.css";
 import { stockImagePath } from "./backupPath";
 import { formatBytes } from "./formatBytes";
+import { fullConfirmPrompt, fullProgressLabel } from "./fullCheckPath";
 import { probeConfirmPrompt } from "./probePath";
 import {
   isFinishedBackupName,
@@ -97,7 +98,8 @@ type Step =
   | "done"
   | "backup"
   | "restore"
-  | "probe";
+  | "probe"
+  | "fullcheck";
 
 type BackupProgress = { bytesRead: number; bytesTotal: number };
 
@@ -129,6 +131,25 @@ type ProbeReport = {
   writeMbps: number;
   overwritten: boolean;
   summary: string;
+};
+
+type FullProgress = {
+  phase: string;
+  bytesDone: number;
+  bytesTotal: number;
+  percent: number;
+  mbps: number;
+  etaSeconds: number;
+};
+
+type FullReport = {
+  status: "finished" | "cancelled";
+  overwritten: boolean;
+  summary: string;
+  badCount: number;
+  claimedBytes: number;
+  writeMbps: number;
+  readMbps: number;
 };
 
 type SortMode = "none" | "smart" | "dat";
@@ -205,6 +226,11 @@ export default function App() {
   const [probeConfirmation, setProbeConfirmation] = useState("");
   const [probeProgress, setProbeProgress] = useState("");
   const [probeReport, setProbeReport] = useState<ProbeReport | null>(null);
+  const [fullDisks, setFullDisks] = useState<FlashDisk[]>([]);
+  const [fullConfirmation, setFullConfirmation] = useState("");
+  const [fullNote, setFullNote] = useState("");
+  const [fullProgress, setFullProgress] = useState<FullProgress | null>(null);
+  const [fullReport, setFullReport] = useState<FullReport | null>(null);
   const [keepExistingFolders, setKeepExistingFolders] = useState(false);
   const [feedCheck, setFeedCheck] = useState<FeedCheck | null>(null);
   const [checkingFeed, setCheckingFeed] = useState(false);
@@ -381,6 +407,15 @@ export default function App() {
   useEffect(() => {
     const unlisten = listen<string>("probe-progress", (event) => {
       setProbeProgress(event.payload);
+    });
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<FullProgress>("fullcheck-progress", (event) => {
+      setFullProgress(event.payload);
     });
     return () => {
       void unlisten.then((stop) => stop());
@@ -570,6 +605,56 @@ export default function App() {
 
   async function cancelProbe() {
     await invoke("cancel_probe");
+  }
+
+  async function refreshFullDisks() {
+    setBusy(true);
+    setError("");
+    try {
+      setFullDisks(await invoke<FlashDisk[]>("list_probe_disks"));
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openFullCheck() {
+    setError("");
+    setFullReport(null);
+    setFullNote("");
+    setFullProgress(null);
+    setFullConfirmation("");
+    setStep("fullcheck");
+    await refreshFullDisks();
+  }
+
+  async function startFullCheck(disk: FlashDisk) {
+    setBusy(true);
+    setError("");
+    setFullReport(null);
+    setFullProgress(null);
+    setFullNote(
+      "Checking the card. Windows may ask for approval before anything is written. This test erases the whole card and can take a long time.",
+    );
+    try {
+      const report = await invoke<FullReport>("full_check_card", {
+        diskNumber: disk.number,
+        displayedBytes: disk.sizeBytes,
+        displayedModel: restoreDiskModel(disk.name),
+        confirmation: fullConfirmation,
+      });
+      setFullReport(report);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setFullNote("");
+      setBusy(false);
+    }
+  }
+
+  async function cancelFullCheck() {
+    await invoke("cancel_full_check");
   }
 
   async function refreshFlashDisks() {
@@ -955,6 +1040,9 @@ export default function App() {
             <button disabled={busy} onClick={() => void openProbe()}>
               Test a card
             </button>
+            <button disabled={busy} onClick={() => void openFullCheck()}>
+              Full card test
+            </button>
           </div>
           {profiles.length === 0 ? <p>No ROMs-card profiles found.</p> : null}
           <div className="cards">
@@ -1190,6 +1278,83 @@ export default function App() {
               }
             >
               {probeReport.summary}
+            </p>
+          ) : null}
+        </section>
+      ) : null}
+
+      {step === "fullcheck" ? (
+        <section>
+          <h2>Full card test</h2>
+          <p>
+            This optional test writes a pattern across the whole card and reads it back. It is
+            slow. A finished test fully erases the card. Restore your backup before you use the
+            card, or format the card again if it was blank. The test runs only when this session
+            already has a verified backup of this exact card, or the card is blank. Fixed disks,
+            disk 0, and Windows system or boot disks are not listed. Windows asks for approval
+            before anything is written. If you cancel, the result says whether the card was
+            overwritten.
+          </p>
+          <div className="row">
+            <button disabled={busy} onClick={() => void refreshFullDisks()}>
+              Refresh disks
+            </button>
+            <button disabled={busy} onClick={() => setStep("profile")}>
+              Back
+            </button>
+          </div>
+          {fullDisks.length === 0 ? <p>No USB or SD card detected.</p> : null}
+          <ul className="volumes">
+            {fullDisks.map((disk) => {
+              const model = restoreDiskModel(disk.name);
+              return (
+                <li key={disk.number}>
+                  <div>
+                    <strong>
+                      Disk {disk.number}: {model}
+                    </strong>
+                    <span>{formatBytes(disk.sizeBytes)}</span>
+                  </div>
+                  <label>
+                    {fullConfirmPrompt({
+                      number: disk.number,
+                      name: model,
+                      sizeLabel: formatBytes(disk.sizeBytes),
+                    })}
+                    <input
+                      value={fullConfirmation}
+                      onChange={(event) => setFullConfirmation(event.target.value)}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <button
+                    disabled={busy || fullConfirmation !== "FULL"}
+                    onClick={() => void startFullCheck(disk)}
+                  >
+                    Erase and test disk {disk.number}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          {fullNote ? <p>{fullNote}</p> : null}
+          {fullProgress ? (
+            <div>
+              <progress value={fullProgress.percent} max={100} />
+              <p>{fullProgressLabel(fullProgress)}</p>
+            </div>
+          ) : null}
+          {busy ? <button onClick={() => void cancelFullCheck()}>Cancel test</button> : null}
+          {fullReport ? (
+            <p
+              className={
+                fullReport.badCount > 0 ||
+                (fullReport.status === "cancelled" && fullReport.overwritten)
+                  ? "error"
+                  : "path"
+              }
+            >
+              {fullReport.summary}
             </p>
           ) : null}
         </section>
