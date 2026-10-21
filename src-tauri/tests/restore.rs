@@ -8,10 +8,10 @@ use cfw_zero_touch_lib::flash::sha256_bytes;
 use cfw_zero_touch_lib::restore::{
     cancel_detail, cancel_file_requests_stop, classify_helper_stop, fail_detail, gate_restore,
     image_fits, inspect_backup, judge_helper_log, parse_exit_code, parse_helper_log,
-    parse_progress_line, parse_restore_disk, parse_sidecar, pass_detail, restore_to_device,
-    write_new_nofollow, write_nofollow, BoundedWrite, HelperVerdict, InspectedBackup, RestoreBlock,
-    RestoreDisk, RestoreError, RestoreOutcome, RestoreTarget, StopKind, DISK_CLEARED,
-    DISK_CLEAR_STARTED,
+    parse_progress_line, parse_restore_disk, parse_sidecar, pass_detail, read_nofollow_string,
+    restore_to_device, write_new_nofollow, write_nofollow, BoundedWrite, HelperVerdict,
+    InspectedBackup, RestoreBlock, RestoreDisk, RestoreError, RestoreOutcome, RestoreTarget,
+    StopKind, DISK_CLEARED, DISK_CLEAR_STARTED,
 };
 
 #[allow(dead_code, unused_imports)]
@@ -683,6 +683,15 @@ fn cancel_message_follows_the_exit_code_and_whether_clear_ran() {
         classify_helper_stop(0, "RESULT=OK\nEXIT=0\n"),
         StopKind::Other
     );
+}
+
+#[test]
+fn a_regular_progress_file_is_replaced_in_place() {
+    let scratch = Scratch::new("restore-nofollow-file");
+    let path = scratch.path().join("progress.txt");
+    write_new_nofollow(&path, b"write 0 4\n").unwrap();
+    write_nofollow(&path, b"write 4 4\n").unwrap();
+    assert_eq!(read_nofollow_string(&path).unwrap(), "write 4 4\n");
 }
 
 #[cfg(unix)]
