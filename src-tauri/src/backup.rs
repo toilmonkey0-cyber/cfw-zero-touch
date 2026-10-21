@@ -113,12 +113,22 @@ pub fn source_volume(disk: &BackupDisk) -> VolumeInfo {
 /// One `Get-Disk` line: `number|bus|size|IsSystem|IsBoot`.
 ///
 /// `system_disk` is set for disk 0 and when Windows reports IsSystem or IsBoot.
-/// The flash helper does not use this parser.
+/// `cfw-flash` parses its post-approval query with [`parse_disk_query`], so OS
+/// flash and restore both refuse system and boot disks.
 pub struct QueriedDisk {
     pub number: u32,
     pub bus: String,
     pub size_bytes: u64,
     pub system_disk: bool,
+}
+
+/// `Get-Disk` fields the helper and restore both re-read after the approval prompt.
+///
+/// FriendlyName pipes and newlines are flattened so the model stays one field.
+pub fn disk_query_script(number: u32) -> String {
+    format!(
+        "$d = Get-Disk -Number {number}; $name = [string]$d.FriendlyName; $name = $name -replace '\\|','/'; $name = $name -replace \"[`r`n]\",' '; Write-Output ($d.Number.ToString() + '|' + $d.BusType.ToString() + '|' + $d.Size.ToString() + '|' + $d.IsSystem.ToString() + '|' + $d.IsBoot.ToString() + '|' + $name)"
+    )
 }
 
 pub fn parse_disk_query(line: &str, expected_number: u32) -> Result<QueriedDisk, String> {

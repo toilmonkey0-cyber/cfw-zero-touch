@@ -10,6 +10,7 @@ pub mod igir;
 pub mod needle;
 pub mod prepare;
 pub mod profiles;
+pub mod restore;
 pub mod romcopy;
 pub mod seed;
 pub mod store;
@@ -17,6 +18,7 @@ pub mod volume;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use profiles::Profile;
 use romcopy::CopyPlan;
@@ -1057,14 +1059,17 @@ fn flash_os(
     );
     let log = std::env::temp_dir().join(format!("cfw-flash-ui-{unique}.txt"));
     let script_path = std::env::temp_dir().join(format!("cfw-flash-ui-{unique}.ps1"));
+    restore::write_new_nofollow(&log, b"")
+        .map_err(|error| format!("could not prepare the flash log: {error}"))?;
     let script = format!(
-        "& '{tool}' --image='{image}' --sha256='{sha}' --disk={disk_number} --confirm='{confirmation}' *>&1 | Tee-Object -FilePath '{log}'\r\nexit $LASTEXITCODE\r\n",
+        "& '{tool}' --image='{image}' --sha256='{sha}' --disk={disk_number} --confirm='{confirmation}' --log-file='{log}'\r\nexit $LASTEXITCODE\r\n",
         tool = tool.display().to_string().replace('\'', "''"),
         image = image_path.display().to_string().replace('\'', "''"),
         sha = image.sha256.replace('\'', ""),
         log = log.display().to_string().replace('\'', "''"),
+        confirmation = confirmation.replace('\'', ""),
     );
-    std::fs::write(&script_path, script)
+    restore::write_new_nofollow(&script_path, script.as_bytes())
         .map_err(|error| format!("could not write the launcher: {error}"))?;
     let launcher = format!(
         "Start-Process -FilePath powershell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
@@ -1077,7 +1082,7 @@ fn flash_os(
     // The launcher is "-Wait", so the elevated run has finished; remove the
     // script so no predictable elevated artifact lingers in %TEMP%.
     let _ = std::fs::remove_file(&script_path);
-    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let text = restore::read_nofollow_string(&log).unwrap_or_default();
     if !status.success() || !text.contains("RESULT=OK") {
         let reason = if text.trim().is_empty() {
             "the flash did not finish. The approval prompt may have been dismissed.".to_string()
@@ -1111,6 +1116,9 @@ impl Drop for StockBackupGuard {
 }
 
 fn begin_stock_backup() -> Result<StockBackupGuard, String> {
+    if RESTORE_RUNNING.load(Ordering::SeqCst) {
+        return Err("a backup restore is already running".into());
+    }
     if STOCK_BACKUP_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("a stock-card backup is already running".into());
     }
@@ -1291,6 +1299,398 @@ fn backup_stock_card(
 #[tauri::command]
 fn cancel_stock_backup() {
     STOCK_BACKUP_CANCEL.store(true, Ordering::SeqCst);
+}
+
+static RESTORE_RUNNING: AtomicBool = AtomicBool::new(false);
+static RESTORE_CANCEL: AtomicBool = AtomicBool::new(false);
+static RESTORE_CANCEL_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+struct RestoreGuard;
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        RESTORE_RUNNING.store(false, Ordering::SeqCst);
+        *restore_cancel_slot() = None;
+    }
+}
+
+fn restore_cancel_slot() -> std::sync::MutexGuard<'static, Option<PathBuf>> {
+    RESTORE_CANCEL_FILE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn begin_restore() -> Result<RestoreGuard, String> {
+    if STOCK_BACKUP_RUNNING.load(Ordering::SeqCst) {
+        return Err("a stock-card backup is already running".into());
+    }
+    if RESTORE_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err("a backup restore is already running".into());
+    }
+    RESTORE_CANCEL.store(false, Ordering::SeqCst);
+    Ok(RestoreGuard)
+}
+
+fn signal_restore_cancel() {
+    RESTORE_CANCEL.store(true, Ordering::SeqCst);
+    if let Some(path) = restore_cancel_slot().clone() {
+        let _ = restore::signal_cancel_file(&path);
+    }
+}
+
+/// Read-only `Get-Disk`. This does not open `\\.\PhysicalDriveN`.
+fn query_restore_disk(number: u32) -> Result<restore::RestoreDisk, String> {
+    if number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    let script = backup::disk_query_script(number);
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|error| format!("could not inspect the disk: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find(|line| line.contains('|'))
+        .ok_or("no disk info")?;
+    restore::parse_restore_disk(line, number)
+}
+
+fn powershell_literal(text: &str) -> Result<String, String> {
+    if text.chars().any(|ch| matches!(ch, '\n' | '\r' | '\0')) {
+        return Err("a restore path contains a newline".into());
+    }
+    Ok(text.replace('\'', "''"))
+}
+
+struct RestoreTemps {
+    script: PathBuf,
+    log: PathBuf,
+    cancel: PathBuf,
+    progress: PathBuf,
+}
+
+impl Drop for RestoreTemps {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.script);
+        let _ = std::fs::remove_file(&self.log);
+        let _ = std::fs::remove_file(&self.cancel);
+        let _ = std::fs::remove_file(&self.progress);
+    }
+}
+
+fn restore_temp_paths() -> RestoreTemps {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    );
+    let dir = std::env::temp_dir();
+    RestoreTemps {
+        script: dir.join(format!("cfw-restore-ui-{unique}.ps1")),
+        log: dir.join(format!("cfw-restore-ui-{unique}.txt")),
+        cancel: dir.join(format!("cfw-restore-cancel-{unique}.txt")),
+        progress: dir.join(format!("cfw-restore-progress-{unique}.txt")),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreReportView {
+    status: String,
+    sha256: String,
+    card_sha256: String,
+    bytes: u64,
+    detail: String,
+}
+
+fn restore_view_from_verdict(
+    verdict: restore::HelperVerdict,
+    image_bytes: u64,
+) -> Result<RestoreReportView, String> {
+    match verdict {
+        restore::HelperVerdict::Passed {
+            sha256,
+            bytes,
+            detail,
+        } => Ok(RestoreReportView {
+            status: "pass".into(),
+            card_sha256: sha256.clone(),
+            sha256,
+            bytes: if bytes == 0 { image_bytes } else { bytes },
+            detail,
+        }),
+        restore::HelperVerdict::Failed {
+            expected,
+            actual,
+            bytes,
+            detail,
+        } => Ok(RestoreReportView {
+            status: "fail".into(),
+            sha256: expected,
+            card_sha256: actual,
+            bytes: if bytes == 0 { image_bytes } else { bytes },
+            detail,
+        }),
+        restore::HelperVerdict::Cancelled { detail } => Ok(RestoreReportView {
+            status: "cancelled".into(),
+            sha256: String::new(),
+            card_sha256: String::new(),
+            bytes: 0,
+            detail,
+        }),
+        restore::HelperVerdict::Incomplete { detail } => Err(detail),
+    }
+}
+
+/// Restore a verified `.img.gz` backup by launching `cfw-flash`.
+///
+/// The helper is the only process that opens a physical drive for writing.
+/// This command refuses the disk before that launch.
+#[tauri::command]
+fn restore_backup(
+    app: tauri::AppHandle,
+    disk_number: u32,
+    displayed_bytes: u64,
+    displayed_model: String,
+    confirmation: String,
+    image_path: String,
+) -> Result<RestoreReportView, String> {
+    let _guard = begin_restore()?;
+    if disk_number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    if confirmation != "FLASH" {
+        return Err(restore::RestoreBlock::Confirmation.message().into());
+    }
+    let tool = flash_tool()?;
+    let image = PathBuf::from(&image_path);
+    let disk = query_restore_disk(disk_number)?;
+    let target = restore::RestoreTarget {
+        disk: &disk,
+        confirmed_number: disk_number,
+        confirmation: &confirmation,
+        displayed_bytes,
+        displayed_model: &displayed_model,
+    };
+    let mut last_emit = 0u64;
+    let inspected = match restore::prepare_restore(&image, &target, &RESTORE_CANCEL, |progress| {
+        let boundary = progress.bytes_total > 0 && progress.bytes_done == progress.bytes_total;
+        if boundary || progress.bytes_done.saturating_sub(last_emit) >= 1024 * 1024 {
+            last_emit = progress.bytes_done;
+            let _ = app.emit("restore-progress", &progress);
+        }
+    }) {
+        Ok(inspected) => inspected,
+        Err(restore::RestoreError::Cancelled { bytes_written }) => {
+            return Ok(RestoreReportView {
+                status: "cancelled".into(),
+                sha256: String::new(),
+                card_sha256: String::new(),
+                bytes: bytes_written,
+                detail: restore::cancel_detail(bytes_written),
+            });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if RESTORE_CANCEL.load(Ordering::SeqCst) {
+        return Ok(RestoreReportView {
+            status: "cancelled".into(),
+            sha256: String::new(),
+            card_sha256: String::new(),
+            bytes: 0,
+            detail: restore::cancel_detail(0),
+        });
+    }
+    if !restore::is_sha256_hex(&inspected.compressed_sha256)
+        || !restore::is_sha256_hex(&inspected.sha256)
+    {
+        return Err("checksum is not a SHA-256 hex string".into());
+    }
+
+    let temps = restore_temp_paths();
+    restore::write_new_nofollow(&temps.cancel, b"")
+        .map_err(|error| format!("could not prepare cancel: {error}"))?;
+    restore::write_new_nofollow(
+        &temps.progress,
+        format!("write 0 {}\n", inspected.image_bytes).as_bytes(),
+    )
+    .map_err(|error| format!("could not prepare progress: {error}"))?;
+    restore::write_new_nofollow(&temps.log, b"")
+        .map_err(|error| format!("could not prepare the restore log: {error}"))?;
+    *restore_cancel_slot() = Some(temps.cancel.clone());
+
+    let model = powershell_literal(&displayed_model)?;
+    let script = format!(
+        "& '{tool}' --image='{image}' --sha256='{sha}' --disk={disk_number} --confirm='FLASH' --restore --sidecar-sha256='{sidecar}' --uncompressed-bytes={image_bytes} --expected-bytes={displayed_bytes} --expected-model='{model}' --cancel-file='{cancel}' --progress-file='{progress}' --log-file='{log}'\r\nexit $LASTEXITCODE\r\n",
+        tool = powershell_literal(&tool.display().to_string())?,
+        image = powershell_literal(&image.display().to_string())?,
+        sha = inspected.compressed_sha256,
+        sidecar = inspected.sha256,
+        image_bytes = inspected.image_bytes,
+        cancel = powershell_literal(&temps.cancel.display().to_string())?,
+        progress = powershell_literal(&temps.progress.display().to_string())?,
+        log = powershell_literal(&temps.log.display().to_string())?,
+    );
+    restore::write_new_nofollow(&temps.script, script.as_bytes())
+        .map_err(|error| format!("could not write the launcher: {error}"))?;
+
+    let _ = app.emit(
+        "restore-progress",
+        restore::RestoreProgress {
+            phase: "write".into(),
+            bytes_done: 0,
+            bytes_total: inspected.image_bytes,
+        },
+    );
+    let model_log = displayed_model.replace(['\n', '\r'], " ");
+    diag::log(
+        "INFO",
+        "restore_start",
+        &format!("disk={disk_number} bytes={displayed_bytes} model={model_log}"),
+    );
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let stop_flag = std::sync::Arc::clone(&stop);
+    let progress_path = temps.progress.clone();
+    let app_progress = app.clone();
+    let poller = std::thread::spawn(move || {
+        let mut last = String::new();
+        loop {
+            if let Ok(text) = restore::read_nofollow_string(&progress_path) {
+                if text != last {
+                    if let Some(progress) = restore::parse_progress_line(&text) {
+                        let _ = app_progress.emit("restore-progress", &progress);
+                    }
+                    last = text;
+                }
+            }
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
+
+    let launcher = format!(
+        "$p = Start-Process -FilePath powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'; if ($null -eq $p -or $null -eq $p.ExitCode) {{ exit 1 }}; exit $p.ExitCode",
+        temps.script.display().to_string().replace('\'', "''")
+    );
+    let status = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &launcher])
+        .status();
+    stop.store(true, Ordering::SeqCst);
+    let _ = poller.join();
+    let text = restore::read_nofollow_string(&temps.log)
+        .unwrap_or_else(|error| format!("could not read the restore log: {error}"));
+    let status = status.map_err(|error| format!("could not start the flash tool: {error}"))?;
+    let exit_code = restore::parse_exit_code(&text)
+        .or_else(|| status.code())
+        .unwrap_or(-1);
+    match restore::classify_helper_stop(exit_code, &text) {
+        restore::StopKind::CancelledUntouched => {
+            diag::log("INFO", "restore_cancelled", &format!("disk={disk_number}"));
+            return Ok(RestoreReportView {
+                status: "cancelled".into(),
+                sha256: String::new(),
+                card_sha256: String::new(),
+                bytes: 0,
+                detail: restore::cancel_detail(0),
+            });
+        }
+        restore::StopKind::CancelledErased => {
+            diag::log("INFO", "restore_cancelled", &format!("disk={disk_number}"));
+            return Ok(RestoreReportView {
+                status: "cancelled".into(),
+                sha256: String::new(),
+                card_sha256: String::new(),
+                bytes: 0,
+                detail: restore::cancel_detail(1),
+            });
+        }
+        restore::StopKind::FailedAfterClear { detail } => {
+            diag::log(
+                "ERROR",
+                "restore_failed",
+                &format!("disk={disk_number}: {detail}"),
+            );
+            return Err(detail);
+        }
+        restore::StopKind::Other => {}
+    }
+    if RESTORE_CANCEL.load(Ordering::SeqCst)
+        && !text.contains("RESULT=OK")
+        && !text.contains("verify=fail")
+    {
+        diag::log("INFO", "restore_cancelled", &format!("disk={disk_number}"));
+        if text.trim().is_empty() {
+            return Ok(RestoreReportView {
+                status: "cancelled".into(),
+                sha256: String::new(),
+                card_sha256: String::new(),
+                bytes: 0,
+                detail: restore::cancel_detail(0),
+            });
+        }
+        return Err(format!("{text}\nThe card was not written."));
+    }
+
+    let verdict = restore::judge_helper_log(&text, &inspected.sha256);
+    let passed = matches!(verdict, restore::HelperVerdict::Passed { .. });
+    if passed && !status.success() {
+        diag::log(
+            "ERROR",
+            "restore_failed",
+            &format!("disk={disk_number}: {text}"),
+        );
+        return Err(if text.trim().is_empty() {
+            "the restore did not finish. The approval prompt may have been dismissed.".into()
+        } else {
+            text
+        });
+    }
+    match restore_view_from_verdict(verdict, inspected.image_bytes) {
+        Ok(view) => {
+            let event = match view.status.as_str() {
+                "pass" => "restore_done",
+                "fail" => "restore_verify_failed",
+                _ => "restore_cancelled",
+            };
+            let level = if view.status == "fail" {
+                "ERROR"
+            } else {
+                "INFO"
+            };
+            diag::log(
+                level,
+                event,
+                &format!(
+                    "disk={disk_number} status={} bytes={}",
+                    view.status, view.bytes
+                ),
+            );
+            Ok(view)
+        }
+        Err(detail) => {
+            diag::log(
+                "ERROR",
+                "restore_failed",
+                &format!("disk={disk_number}: {detail}"),
+            );
+            Err(detail)
+        }
+    }
+}
+
+#[tauri::command]
+fn cancel_restore() {
+    signal_restore_cancel();
 }
 
 #[derive(Serialize)]
@@ -1775,6 +2175,8 @@ pub fn run() {
             flash_os,
             backup_stock_card,
             cancel_stock_backup,
+            restore_backup,
+            cancel_restore,
             list_volumes,
             firstboot_state,
             prepare_card,
