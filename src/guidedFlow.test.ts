@@ -437,6 +437,26 @@ describe("device confirmation and boot-once", () => {
     expect(commands(confirmed)).toEqual(["backup_stock_card", "probe_card", "full_check_card", "detect_stock_device"]);
   });
 
+  it("lets the user confirm a handheld after skipping detection and flash", () => {
+    const skipped = skipStep(skipStep(reach("detect")));
+    expect(skipped.step).toBe("bootOnce");
+    expect(skipped.confirmedProfileId).toBe("");
+    const pickedEarly = chooseDevice(skipped, "darkos-rgb10x-os");
+    expect(pickedEarly.step).toBe("bootOnce");
+    expect(pickedEarly.confirmedProfileId).toBe("darkos-rgb10x-os");
+    const checked = recheck(pickedEarly, noMatch);
+    expect(planCopy(checked, { volumeId: "E" }).ok).toBe(true);
+
+    const stillWaiting = recheck(skipped, noMatch);
+    expect(stillWaiting.step).toBe("copy");
+    expect(planCopy(stillWaiting, { volumeId: "E" }).ok).toBe(false);
+    const pickedLate = chooseDevice(stillWaiting, "darkos-rgb10x-os");
+    expect(pickedLate.step).toBe("copy");
+    expect(pickedLate.confirmedProfileId).toBe("darkos-rgb10x-os");
+    expect(planCopy(pickedLate, { volumeId: "E" }).ok).toBe(true);
+    expect(chooseDevice(checked, "r36s-clone-card")).toBe(checked);
+  });
+
   it("uses the handheld the user picks when they decline the suggestion", () => {
     const ready = reach("detect");
     const call = take(planDetect(ready));

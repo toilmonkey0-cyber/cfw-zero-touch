@@ -832,6 +832,17 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
               <li key={line}>{line}</li>
             ))}
           </ol>
+          {flow.confirmedProfileId.length === 0 ? (
+            <div>
+              <p>Choose the handheld. Copy stays off until you do.</p>
+              <ProfileList
+                profiles={profiles}
+                suggestedId={flow.suggestedProfileId}
+                busy={busy}
+                onPick={(id) => setFlow(chooseDevice(flow, id))}
+              />
+            </div>
+          ) : null}
           <button disabled={busy} onClick={() => void cardIsBack()}>
             The card is back
           </button>
@@ -845,6 +856,21 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
             Copy stays off until the card is back in this computer and the card has been checked
             again.
           </p>
+          {flow.confirmedProfileId.length === 0 ? (
+            <div>
+              <p>Choose the handheld before copying.</p>
+              <ProfileList
+                profiles={profiles}
+                suggestedId={flow.suggestedProfileId}
+                busy={busy}
+                onPick={(id) => {
+                  const next = chooseDevice(flow, id);
+                  setFlow(next);
+                  if (next.identityRechecked && next.step === "copy") void findReadyVolume(next);
+                }}
+              />
+            </div>
+          ) : null}
           {!flow.identityRechecked ? (
             <button disabled={busy} onClick={() => void cardIsBack()}>
               The card is back

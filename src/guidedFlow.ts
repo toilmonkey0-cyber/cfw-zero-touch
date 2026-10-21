@@ -423,8 +423,19 @@ export function confirmSuggestedDevice(flow: GuidedFlow): GuidedFlow {
 export function chooseDevice(flow: GuidedFlow, profileId: string): GuidedFlow {
   const id = profileId.trim();
   if (flow.stopped || id.length === 0) return flow;
-  if (flow.step !== "detect" && flow.step !== "flash") return flow;
-  return { ...flow, confirmedProfileId: id, step: "flash" };
+  if (flow.step === "detect" || flow.step === "flash") {
+    return { ...flow, confirmedProfileId: id, step: "flash" };
+  }
+  // Skipping detection and flash still has to leave a way to name the handheld.
+  // A choice made after flash does not rewind the wizard, and it does not replace
+  // a handheld that was already confirmed.
+  if (
+    (flow.step === "bootOnce" || flow.step === "copy") &&
+    flow.confirmedProfileId.length === 0
+  ) {
+    return { ...flow, confirmedProfileId: id };
+  }
+  return flow;
 }
 
 export function finishFlash(flow: GuidedFlow, call: FlowCall, result: WriteOutcome): GuidedFlow {
