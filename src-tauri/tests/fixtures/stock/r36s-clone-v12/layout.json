@@ -1,0 +1,6 @@
+{
+  "partitions": [
+    { "type": "0c", "label": "BOOT", "sizeBytes": 67108864 },
+    { "type": "0c", "label": "ROMS", "sizeBytes": 1073741824 }
+  ]
+}

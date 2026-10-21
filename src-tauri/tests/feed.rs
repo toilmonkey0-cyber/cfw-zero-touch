@@ -234,6 +234,8 @@ fn checked_in_feed_matches_shipped_profiles() {
         assert!(remote.version >= 1);
     }
     assert!(!feed.app.version.is_empty());
+    cfw_zero_touch_lib::detect::audit_stock_fingerprints(&feed.profiles)
+        .expect("every profile needs a fingerprint or manualOnly, with no collisions");
 }
 
 #[test]

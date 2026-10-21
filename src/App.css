@@ -65,6 +65,10 @@ button:disabled {
   gap: 6px;
 }
 
+.card.suggested {
+  border-color: #c9a15b;
+}
+
 .card span, .volumes span, .systems span {
   display: block;
   color: #b7b0a4;

@@ -27,5 +27,8 @@
     "sha256": "f2b35e9feeef1a2ba2a40298614c1e9d67349ffd98e8498449e8815107ab82cc",
     "compressed": "gz"
   },
-  "version": 2
+  "version": 3,
+  "stockFingerprint": {
+    "manualOnly": true
+  }
 }
