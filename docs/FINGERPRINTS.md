@@ -76,4 +76,4 @@ scripts/hash-dtb.sh /mnt/boot
 node -e "const fs=require('fs'),path=require('path');const dir='profiles';const profiles=fs.readdirSync(dir).filter(f=>f.endsWith('.json')).sort().map(f=>JSON.parse(fs.readFileSync(path.join(dir,f),'utf8')));const feed={feedVersion:1,app:{version:'0.1.0',releaseUrl:'https://github.com/toilmonkey0-cyber/cfw-zero-touch/releases'},profiles:profiles.map(p=>({...p,version:p.version??1}))};fs.writeFileSync('profiles-feed.json',JSON.stringify(feed,null,2)+'\n');"
 ```
 
-The anti-drift check fails when a shipped hash equals the sha256 of any file under `src-tauri/tests/fixtures`.
+The anti-drift check fails when a shipped hash equals the sha256 of any file under `src-tauri/tests/fixtures`. Those fixture files are marked binary in `.gitattributes`, so Windows and Linux hash the committed bytes.
