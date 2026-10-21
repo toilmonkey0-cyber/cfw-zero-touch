@@ -22,11 +22,13 @@ import {
   planFlash,
   planFullCheck,
   planProbe,
+  chooseReadyVolume,
   planRestore,
   probeRouteFlag,
   skipStep,
   skipWarning,
   startGuidedFlow,
+  type DiskIdentity,
   type FlowCall,
   type GuidedFlow,
   type GuidedStep,
@@ -36,10 +38,15 @@ import {
 const DISK = 2;
 const SERIAL = "card-a";
 const SIZE = 64_000_000_000;
+const TABLE = "gpt:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const BACKUP = "stock.img.gz";
 
 function onCard<T extends Record<string, unknown>>(input: T) {
-  return { diskNumber: DISK, serial: SERIAL, sizeBytes: SIZE, ...input };
+  return { diskNumber: DISK, serial: SERIAL, sizeBytes: SIZE, partitionTableId: TABLE, ...input };
+}
+
+function games(flow: GuidedFlow, volumeId = "E") {
+  return { volumeId, disk: flow.reinsertedDisk ?? onCard({}) };
 }
 
 const matched: StockDetection = {
@@ -117,24 +124,25 @@ function flash(flow: GuidedFlow): GuidedFlow {
   expect(call.profileId).toBe(flow.confirmedProfileId);
   expect(call.confirmation).toBe("FLASH");
   expect(call.command).toBe("flash_os");
-  const flashed = finishFlash(flow, call, { ok: true, summary: "RESULT=OK" });
+  const flashed = finishFlash(flow, call, { ok: true, summary: "RESULT=OK" }, onCard({}));
   expect(flashed.flashDisk).toEqual(onCard({}));
+  expect(flashed.pinnedDisk?.partitionTableId).toBe(TABLE);
   return flashed;
 }
 
 function recheck(
   flow: GuidedFlow,
   detection: StockDetection = noMatch,
-  presented: { diskNumber: number; serial: string; sizeBytes: number } | null = onCard({}),
+  presented: DiskIdentity | null = onCard({}),
 ): GuidedFlow {
   const returned = markCardReturned(flow);
-  expect(planCopy(returned, { volumeId: "E" }).ok).toBe(false);
+  expect(planCopy(returned, games(returned)).ok).toBe(false);
   const call = take(planDetect(returned));
   return applyDetection(returned, call, detection, presented ?? undefined);
 }
 
 function copy(flow: GuidedFlow): GuidedFlow {
-  const call = take(planCopy(flow, { volumeId: "E" }));
+  const call = take(planCopy(flow, games(flow)));
   expect(call.command).toBe("copy_roms");
   expect(call.profileId).toBe(flow.confirmedProfileId);
   expect(call.confirmation).toBe("");
@@ -304,6 +312,9 @@ describe("guided flow skip paths", () => {
     expect(planBackup(startGuidedFlow(), onCard({ serial: " ", destination: BACKUP })).ok).toBe(
       false,
     );
+    expect(
+      planBackup(startGuidedFlow(), onCard({ partitionTableId: " ", destination: BACKUP })).ok,
+    ).toBe(false);
   });
 });
 
@@ -325,7 +336,7 @@ describe("guided flow stops", () => {
       false,
     );
     expect(planFlash(stopped, onCard({ confirmation: "FLASH" })).ok).toBe(false);
-    expect(planCopy(stopped, { volumeId: "E" }).ok).toBe(false);
+    expect(planCopy(stopped, games(stopped)).ok).toBe(false);
     expect(commands(stopped)).toEqual(["backup_stock_card", "probe_card"]);
   });
 
@@ -433,7 +444,7 @@ describe("guided flow stops", () => {
         expect(stopped.status).not.toContain("OVERWRITTEN");
         expect(stopped.status).toMatch(/did not say whether the card was overwritten/i);
       } else {
-        const call = take(planCopy(ready, { volumeId: "E" }));
+        const call = take(planCopy(ready, games(ready)));
         stopped = finishCopy(ready, call, {
           ok: false,
           summary: "the copy stopped",
@@ -450,7 +461,7 @@ describe("guided flow stops", () => {
         false,
       );
       expect(planFlash(stopped, onCard({ confirmation: "FLASH" })).ok).toBe(false);
-      expect(planCopy(stopped, { volumeId: "E" }).ok).toBe(false);
+      expect(planCopy(stopped, games(stopped)).ok).toBe(false);
       expect(planBackup(stopped, onCard({ destination: BACKUP })).ok).toBe(false);
     },
   );
@@ -481,15 +492,15 @@ describe("device confirmation and boot-once", () => {
     expect(pickedEarly.step).toBe("bootOnce");
     expect(pickedEarly.confirmedProfileId).toBe("darkos-rgb10x-os");
     const checked = recheck(pickedEarly, noMatch);
-    expect(planCopy(checked, { volumeId: "E" }).ok).toBe(true);
+    expect(planCopy(checked, games(checked)).ok).toBe(true);
 
     const stillWaiting = recheck(skipped, noMatch);
     expect(stillWaiting.step).toBe("copy");
-    expect(planCopy(stillWaiting, { volumeId: "E" }).ok).toBe(false);
+    expect(planCopy(stillWaiting, games(stillWaiting)).ok).toBe(false);
     const pickedLate = chooseDevice(stillWaiting, "darkos-rgb10x-os");
     expect(pickedLate.step).toBe("copy");
     expect(pickedLate.confirmedProfileId).toBe("darkos-rgb10x-os");
-    expect(planCopy(pickedLate, { volumeId: "E" }).ok).toBe(true);
+    expect(planCopy(pickedLate, games(pickedLate)).ok).toBe(true);
     expect(chooseDevice(checked, "r36s-clone-card")).toBe(checked);
   });
 
@@ -507,17 +518,17 @@ describe("device confirmation and boot-once", () => {
 
   it("copies only after the card is back and detect has run again", () => {
     const booting = reach("bootOnce");
-    expect(planCopy(booting, { volumeId: "E" }).ok).toBe(false);
+    expect(planCopy(booting, games(booting)).ok).toBe(false);
     expect(markCardReturned(reach("flash")).cardReinserted).toBe(false);
     const returned = markCardReturned(booting);
     expect(returned.cardReinserted).toBe(true);
     expect(returned.identityRechecked).toBe(false);
     expect(returned.step).toBe("bootOnce");
-    expect(planCopy(returned, { volumeId: "E" }).ok).toBe(false);
-    if (!planCopy(returned, { volumeId: "E" }).ok) {
-      expect(planCopy(returned, { volumeId: "E" }).ok).toBe(false);
+    expect(planCopy(returned, games(returned)).ok).toBe(false);
+    if (!planCopy(returned, games(returned)).ok) {
+      expect(planCopy(returned, games(returned)).ok).toBe(false);
     }
-    const refused = planCopy(returned, { volumeId: "E" });
+    const refused = planCopy(returned, games(returned));
     expect(refused.ok).toBe(false);
     if (!refused.ok) {
       expect(refused.reason).toMatch(/recognized/i);
@@ -526,23 +537,23 @@ describe("device confirmation and boot-once", () => {
     const same = applyDetection(returned, call, matched, onCard({}));
     expect(same.step).toBe("copy");
     expect(same.identityRechecked).toBe(true);
-    expect(planCopy(same, { volumeId: "E" }).ok).toBe(true);
+    expect(planCopy(same, games(same)).ok).toBe(true);
 
     const recognized = applyDetection(returned, call, noMatch, onCard({}));
     expect(recognized.stopped).toBe(false);
     expect(recognized.step).toBe("copy");
-    expect(planCopy(recognized, { volumeId: "E" }).ok).toBe(true);
+    expect(planCopy(recognized, games(recognized)).ok).toBe(true);
 
     const unknown = applyDetection(returned, call, noMatch);
     expect(unknown.stopped).toBe(true);
     expect(unknown.status).toMatch(/not recognized/i);
-    expect(planCopy(unknown, { volumeId: "E" }).ok).toBe(false);
+    expect(planCopy(unknown, games(unknown)).ok).toBe(false);
     expect(planFlash(unknown, onCard({ confirmation: "FLASH" })).ok).toBe(false);
 
     const mismatch = applyDetection(returned, call, otherMatch, onCard({}));
     expect(mismatch.stopped).toBe(true);
     expect(mismatch.status).toMatch(/different handheld/i);
-    expect(planCopy(mismatch, { volumeId: "E" }).ok).toBe(false);
+    expect(planCopy(mismatch, games(mismatch)).ok).toBe(false);
     expect(planFlash(mismatch, onCard({ confirmation: "FLASH" })).ok).toBe(false);
   });
 
@@ -552,13 +563,83 @@ describe("device confirmation and boot-once", () => {
     const swapped = applyDetection(returned, call, noMatch, onCard({ serial: "other-card" }));
     expect(swapped.stopped).toBe(true);
     expect(swapped.status).toMatch(/not recognized/i);
-    expect(planCopy(swapped, { volumeId: "E" }).ok).toBe(false);
+    expect(planCopy(swapped, games(swapped)).ok).toBe(false);
     const renumbered = applyDetection(returned, call, matched, onCard({ diskNumber: 4 }));
     expect(renumbered.stopped).toBe(true);
-    expect(planCopy(renumbered, { volumeId: "E" }).ok).toBe(false);
+    expect(planCopy(renumbered, games(renumbered)).ok).toBe(false);
     const resized = applyDetection(returned, call, matched, onCard({ sizeBytes: SIZE + 512 }));
     expect(resized.stopped).toBe(true);
     expect(planFlash(resized, onCard({ confirmation: "FLASH" })).ok).toBe(false);
+    const otherTable = applyDetection(returned, call, matched, onCard({ partitionTableId: "mbr:00ab12cd" }));
+    expect(otherTable.stopped).toBe(true);
+    expect(otherTable.status).toMatch(/partition table/i);
+    expect(planCopy(otherTable, games(otherTable)).ok).toBe(false);
+  });
+
+  it("records the partition table after flash and requires that id when the card comes back", () => {
+    const ready = reach("flash");
+    const call = take(planFlash(ready, onCard({ confirmation: "FLASH" })));
+    const after = onCard({ partitionTableId: "mbr:00ab12cd" });
+    const flashed = finishFlash(ready, call, { ok: true, summary: "RESULT=OK" }, after);
+    expect(flashed.stopped).toBe(false);
+    expect(flashed.step).toBe("bootOnce");
+    expect(flashed.flashDisk).toEqual(after);
+    expect(flashed.pinnedDisk?.partitionTableId).toBe("mbr:00ab12cd");
+    const returned = markCardReturned(flashed);
+    const detect = take(planDetect(returned));
+    const stale = applyDetection(returned, detect, noMatch, onCard({}));
+    expect(stale.stopped).toBe(true);
+    expect(stale.status).toMatch(/partition table/i);
+    const recognized = applyDetection(returned, detect, noMatch, after);
+    expect(recognized.stopped).toBe(false);
+    expect(recognized.step).toBe("copy");
+    const missing = finishFlash(ready, call, { ok: true, summary: "RESULT=OK" }, null);
+    expect(missing.stopped).toBe(true);
+    expect(missing.status).toMatch(/partition table/i);
+    expect(planCopy(missing, games(missing)).ok).toBe(false);
+  });
+
+  it("copies only to the checked disk when two cards have the games partition", () => {
+    const ready = recheck(reach("bootOnce"));
+    const card = ready.reinsertedDisk;
+    expect(card).toEqual(onCard({}));
+    const volumes = [
+      { id: "E:", label: "EASYROMS", decision: "ready" as const, diskNumber: DISK, serial: SERIAL },
+      { id: "F:", label: "EASYROMS", decision: "ready" as const, diskNumber: 4, serial: "other-card" },
+    ];
+    const chosen = chooseReadyVolume(volumes, card, "EASYROMS");
+    expect(chosen.ok).toBe(true);
+    if (chosen.ok) {
+      expect(chosen.volume.id).toBe("E:");
+      expect(chosen.volume.diskNumber).toBe(DISK);
+      expect(planCopy(ready, { volumeId: chosen.volume.id, disk: card ?? onCard({}) }).ok).toBe(true);
+    }
+    const onlyOther = chooseReadyVolume(
+      [{ id: "F:", label: "EASYROMS", decision: "ready", diskNumber: 4, serial: "other-card" }],
+      card,
+      "EASYROMS",
+    );
+    expect(onlyOther.ok).toBe(false);
+    if (!onlyOther.ok) expect(onlyOther.reason).toMatch(/setup checked/i);
+    expect(
+      planCopy(ready, { volumeId: "F:", disk: onCard({ diskNumber: 4, serial: "other-card" }) }).ok,
+    ).toBe(false);
+    const sameSlotWrongSerial = chooseReadyVolume(
+      [{ id: "E:", label: "EASYROMS", decision: "ready", diskNumber: DISK, serial: "other-card" }],
+      card,
+      "EASYROMS",
+    );
+    expect(sameSlotWrongSerial.ok).toBe(false);
+    const sharedReaderSerial = chooseReadyVolume(
+      [
+        { id: "E:", label: "EASYROMS", decision: "ready", diskNumber: DISK, serial: SERIAL },
+        { id: "F:", label: "EASYROMS", decision: "ready", diskNumber: 4, serial: SERIAL },
+      ],
+      card,
+      "EASYROMS",
+    );
+    expect(sharedReaderSerial.ok).toBe(true);
+    if (sharedReaderSerial.ok) expect(sharedReaderSerial.volume.id).toBe("E:");
   });
 });
 
@@ -630,7 +711,7 @@ describe("confirmations stay separate", () => {
     expect(after.stopped).toBe(true);
     expect(commands(after)).toContain("restore_backup");
     expect(planFlash(after, onCard({ confirmation: "FLASH" })).ok).toBe(false);
-    expect(planCopy(after, { volumeId: "E" }).ok).toBe(false);
+    expect(planCopy(after, games(after)).ok).toBe(false);
     expect(planFullCheck(after, onCard({ confirmation: "FULL", route: "blank" })).ok).toBe(
       false,
     );

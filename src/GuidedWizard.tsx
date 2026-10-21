@@ -11,7 +11,9 @@ import {
   GUIDED_STEPS,
   STEP_TITLES,
   applyDetection,
+  chooseReadyVolume,
   chooseDevice,
+  sameDisk,
   confirmSuggestedDevice,
   failIssued,
   finishBackup,
@@ -62,6 +64,7 @@ type Volume = {
   letter: string;
   label: string;
   decision: "ready" | "needs_format" | "rejected";
+  diskNumber: number;
 };
 
 type Firstboot = { state: "safe" | "armed" | "unknown"; reason: string };
@@ -101,6 +104,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
   const [included, setIncluded] = useState<string[]>([]);
   const [planView, setPlanView] = useState<PlanView | null>(null);
   const [volume, setVolume] = useState<Volume | null>(null);
+  const [copyDisk, setCopyDisk] = useState<DiskIdentity | null>(null);
   const [progress, setProgress] = useState("");
   const [identities, setIdentities] = useState<Record<number, DiskIdentity>>({});
   const [identityChecked, setIdentityChecked] = useState<Record<number, boolean>>({});
@@ -227,7 +231,14 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
   const profile = profiles.find((item) => item.id === flow.confirmedProfileId) ?? null;
 
   function knownIdentity(disk: Disk): DiskIdentity {
-    return identities[disk.number] ?? { diskNumber: disk.number, serial: "", sizeBytes: 0 };
+    return (
+      identities[disk.number] ?? {
+        diskNumber: disk.number,
+        serial: "",
+        sizeBytes: 0,
+        partitionTableId: "",
+      }
+    );
   }
 
   async function freshIdentity(diskNumber: number): Promise<DiskIdentity | null> {
@@ -247,6 +258,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
     setNotice("");
     setProgress("");
     setVolume(null);
+    setCopyDisk(null);
     setPlanView(null);
     setLibrary("");
     setRestoreImage("");
@@ -460,7 +472,15 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
         diskNumber: identity.diskNumber,
         confirmation: planned.call.confirmation,
       });
-      setFlow(finishFlash(snapshot, planned.call, { ok: true, summary: log }));
+      let recorded: DiskIdentity | null = null;
+      try {
+        recorded = await invoke<DiskIdentity>("read_disk_identity", {
+          diskNumber: identity.diskNumber,
+        });
+      } catch (cause) {
+        setNotice(String(cause));
+      }
+      setFlow(finishFlash(snapshot, planned.call, { ok: true, summary: log }, recorded));
     } catch (cause) {
       setFlow(
         finishFlash(snapshot, planned.call, {
@@ -497,6 +517,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
     setNotice("");
     setFlow(returned);
     setVolume(null);
+    setCopyDisk(null);
     setPlanView(null);
     const unrecognized: StockDetection = {
       status: "none",
@@ -517,6 +538,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
             diskNumber: disk.number,
             serial: "",
             sizeBytes: 0,
+            partitionTableId: "",
           }),
         );
         return;
@@ -538,6 +560,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
 
   async function findReadyVolume(current: GuidedFlow) {
     setVolume(null);
+    setCopyDisk(null);
     const chosen = profiles.find((item) => item.id === current.confirmedProfileId);
     if (!chosen) {
       setNotice("Choose the handheld before copying.");
@@ -546,26 +569,49 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
     try {
       const found = await invoke<Volume[]>("list_volumes", { profileId: chosen.id });
       const label = chosen.romSchema.volumeLabel ?? "";
-      const ready = found.find((item) => {
-        if (item.decision !== "ready") return false;
-        if (label.length === 0) return true;
-        return item.label.toLowerCase() === label.toLowerCase();
-      });
-      if (!ready) {
-        setNotice(
-          `${label || "The games partition"} is not on a removable card yet. Boot the handheld once, shut it down, then put the card back.`,
-        );
+      const card = current.reinsertedDisk;
+      let matchedDisk: DiskIdentity | null = null;
+      let readError = "";
+      const annotated = [];
+      for (const item of found) {
+        let serial = "";
+        if (card && item.diskNumber > 0 && item.diskNumber === card.diskNumber) {
+          try {
+            const identity = await invoke<DiskIdentity>("read_disk_identity", {
+              diskNumber: item.diskNumber,
+            });
+            if (sameDisk(identity, card)) {
+              serial = identity.serial;
+              matchedDisk = identity;
+            }
+          } catch (cause) {
+            readError = String(cause);
+          }
+        }
+        annotated.push({
+          id: item.id,
+          label: item.label,
+          decision: item.decision,
+          diskNumber: item.diskNumber,
+          serial,
+        });
+      }
+      const picked = chooseReadyVolume(annotated, card, label);
+      if (!picked.ok) {
+        setNotice(readError || picked.reason);
         return;
       }
       const state = await invoke<Firstboot>("firstboot_state", {
         profileId: chosen.id,
-        volumeId: ready.id,
+        volumeId: picked.volume.id,
       });
       if (state.state !== "safe") {
         setNotice(state.reason);
         return;
       }
-      setVolume(ready);
+      const source = found.find((item) => item.id === picked.volume.id);
+      setVolume(source ?? { ...picked.volume, letter: "" });
+      setCopyDisk(matchedDisk);
       setNotice("");
     } catch (cause) {
       setNotice(String(cause));
@@ -582,7 +628,9 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
 
   async function previewCopy() {
     if (!profile || !volume || !library) return;
-    const planned = planCopy(flow, { volumeId: volume.id });
+    const identity = await freshIdentity(volume.diskNumber);
+    if (!identity) return;
+    const planned = planCopy(flow, { volumeId: volume.id, disk: identity });
     if (!planned.ok) {
       setNotice(planned.reason);
       return;
@@ -610,7 +658,9 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
   async function runCopy() {
     if (!volume || !library) return;
     const snapshot = flow;
-    const planned = planCopy(snapshot, { volumeId: volume.id });
+    const identity = await freshIdentity(volume.diskNumber);
+    if (!identity) return;
+    const planned = planCopy(snapshot, { volumeId: volume.id, disk: identity });
     if (!planned.ok) {
       setNotice(planned.reason);
       return;
@@ -628,6 +678,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
       if (state.state !== "safe") {
         setNotice(state.reason);
         setVolume(null);
+        setCopyDisk(null);
         return;
       }
       const report = await invoke<CopyReport>("copy_roms", {
@@ -1014,7 +1065,8 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
                     busy ||
                     !planView ||
                     planView.copyCount + planView.skipCount === 0 ||
-                    !planCopy(flow, { volumeId: volume.id }).ok
+                    !copyDisk ||
+                    !planCopy(flow, { volumeId: volume.id, disk: copyDisk }).ok
                   }
                   onClick={() => void runCopy()}
                 >

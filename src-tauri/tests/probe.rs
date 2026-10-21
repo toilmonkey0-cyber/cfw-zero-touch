@@ -8,11 +8,11 @@ use cfw_zero_touch_lib::block_device::{is_physical_disk_path, FakeBlockDevice, F
 use cfw_zero_touch_lib::probe::{
     accept_read_only_identity, app_precheck, authorize_probe, cancel_summary, card_is_blank,
     format_failed_log, format_probe_log, helper_launch_command, identity_path,
-    interpret_helper_log, live_identity_matches, load_identity, overwritten_flag, parse_probe_log,
-    plain_summary, prefix_sha256, run_probe, sample_block_hashes, sample_offsets, write_identity,
-    AppPrecheck, BackupSession, CardIdentity, CardKind, HelperFollowup, ProbeBlock, ProbeDisk,
-    ProbeError, ProbePlan, ProbeReport, ProbeRequest, ProbeStatus, SessionBackup,
-    PREFIX_IDENTITY_BYTES, PROBE_BLOCK,
+    interpret_helper_log, live_identity_matches, load_identity, normalize_partition_table_id,
+    overwritten_flag, parse_probe_log, plain_summary, prefix_sha256, run_probe,
+    sample_block_hashes, sample_offsets, write_identity, AppPrecheck, BackupSession, CardIdentity,
+    CardKind, HelperFollowup, ProbeBlock, ProbeDisk, ProbeError, ProbePlan, ProbeReport,
+    ProbeRequest, ProbeStatus, SessionBackup, PREFIX_IDENTITY_BYTES, PROBE_BLOCK,
 };
 use cfw_zero_touch_lib::restore::signal_cancel_file;
 
@@ -934,6 +934,18 @@ fn two_cards_with_the_same_first_4_mib_but_different_sample_blocks_are_refused()
     );
     assert_eq!(other.writes, 0);
     assert_eq!(std::fs::read(other.inner.path()).unwrap(), before);
+}
+
+#[test]
+fn a_partition_table_id_is_the_gpt_guid_or_the_mbr_signature() {
+    let gpt = normalize_partition_table_id("GPT|{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}").unwrap();
+    assert_eq!(gpt, "gpt:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+    let mbr = normalize_partition_table_id("MBR|00ab12cd").unwrap();
+    assert_eq!(mbr, "mbr:00ab12cd");
+    for raw in ["RAW|", "GPT|", "MBR|00000000", "MBR|zz", ""] {
+        let error = normalize_partition_table_id(raw).unwrap_err();
+        assert!(error.contains("partition table id"), "{raw}: {error}");
+    }
 }
 
 #[test]

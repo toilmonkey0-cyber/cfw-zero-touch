@@ -91,6 +91,16 @@ export type DiskIdentity = {
   diskNumber: number;
   serial: string;
   sizeBytes: number;
+  /** `gpt:<guid>` or `mbr:<8 hex digits>`. USB readers often report their own serial. */
+  partitionTableId: string;
+};
+
+export type GamesVolume = {
+  id: string;
+  label: string;
+  decision: "ready" | "needs_format" | "rejected";
+  diskNumber: number;
+  serial: string;
 };
 
 export type FlowCall = {
@@ -100,6 +110,7 @@ export type FlowCall = {
   diskNumber: number;
   serial: string;
   sizeBytes: number;
+  partitionTableId: string;
   profileId: string;
   volumeId: string;
   destination: string;
@@ -189,7 +200,13 @@ export function normalizeSerial(serial: string): string {
   return serial.replace(/\s+/g, "").toLowerCase();
 }
 
-export function sameDisk(left: DiskIdentity, right: DiskIdentity): boolean {
+/** GPT guid or MBR signature. Braces and surrounding spaces are ignored. */
+export function normalizePartitionTableId(value: string): string {
+  return value.trim().toLowerCase().replace(/[{}]/g, "");
+}
+
+/** Disk number, serial, and size. The partition-table id is compared by [`sameDisk`]. */
+export function sameCardBody(left: DiskIdentity, right: DiskIdentity): boolean {
   const serial = normalizeSerial(left.serial);
   return (
     serial.length > 0 &&
@@ -199,6 +216,61 @@ export function sameDisk(left: DiskIdentity, right: DiskIdentity): boolean {
     left.sizeBytes === right.sizeBytes &&
     left.sizeBytes > 0
   );
+}
+
+export function sameDisk(left: DiskIdentity, right: DiskIdentity): boolean {
+  const partition = normalizePartitionTableId(left.partitionTableId);
+  return (
+    sameCardBody(left, right) &&
+    partition.length > 0 &&
+    partition === normalizePartitionTableId(right.partitionTableId)
+  );
+}
+
+/**
+ * The games partition on the rechecked card.
+ * Two ready volumes with the same name are not interchangeable: the disk
+ * number and the serial both have to be the card this setup already checked.
+ */
+export function chooseReadyVolume(
+  volumes: GamesVolume[],
+  card: DiskIdentity | null,
+  expectedLabel: string,
+): { ok: true; volume: GamesVolume } | { ok: false; reason: string } {
+  if (!card || !sameDisk(card, card)) {
+    return { ok: false, reason: "Copy stays off until the same card is recognized again." };
+  }
+  const label = expectedLabel.trim().toLowerCase();
+  const named = volumes.filter((volume) => {
+    if (volume.decision !== "ready") return false;
+    if (label.length === 0) return true;
+    return volume.label.trim().toLowerCase() === label;
+  });
+  const matched = named.filter(
+    (volume) =>
+      volume.diskNumber === card.diskNumber &&
+      normalizeSerial(volume.serial).length > 0 &&
+      normalizeSerial(volume.serial) === normalizeSerial(card.serial),
+  );
+  if (matched.length === 1) return { ok: true, volume: matched[0] };
+  if (matched.length > 1) {
+    return {
+      ok: false,
+      reason: "More than one games partition on the checked card matches. Copy stays off.",
+    };
+  }
+  if (named.length > 0) {
+    return {
+      ok: false,
+      reason:
+        "The games partition is not on the card this setup checked. Copy stays off.",
+    };
+  }
+  const name = expectedLabel.trim() || "The games partition";
+  return {
+    ok: false,
+    reason: `${name} is not on the checked card yet. Boot the handheld once, shut it down, then put the card back.`,
+  };
 }
 
 export function skipWarning(flow: GuidedFlow): string {
@@ -321,7 +393,10 @@ export function planFlash(
   });
 }
 
-export function planCopy(flow: GuidedFlow, input: { volumeId: string }): Plan {
+export function planCopy(
+  flow: GuidedFlow,
+  input: { volumeId: string; disk: DiskIdentity },
+): Plan {
   if (flow.stopped) return { ok: false, reason: flow.status || "This setup has stopped." };
   if (!flow.cardReinserted) {
     return { ok: false, reason: "Copy stays off until you put the card back in this computer." };
@@ -334,6 +409,12 @@ export function planCopy(flow: GuidedFlow, input: { volumeId: string }): Plan {
     return {
       ok: false,
       reason: "Copy stays off until the same card is recognized again.",
+    };
+  }
+  if (!sameDisk(flow.reinsertedDisk, input.disk)) {
+    return {
+      ok: false,
+      reason: "The games partition is not on the card this setup checked. Copy stays off.",
     };
   }
   if (flow.step !== "copy") return { ok: false, reason: "This step is not the current one." };
@@ -356,6 +437,7 @@ export function planCopy(flow: GuidedFlow, input: { volumeId: string }): Plan {
     command: "copy_roms",
     volumeId: input.volumeId.trim(),
     profileId: flow.confirmedProfileId,
+    ...normalizedIdentity(input.disk),
   });
 }
 
@@ -480,14 +562,48 @@ export function chooseDevice(flow: GuidedFlow, profileId: string): GuidedFlow {
   return flow;
 }
 
-export function finishFlash(flow: GuidedFlow, call: FlowCall, result: WriteOutcome): GuidedFlow {
+export function finishFlash(
+  flow: GuidedFlow,
+  call: FlowCall,
+  result: WriteOutcome,
+  recordedAfter?: DiskIdentity | null,
+): GuidedFlow {
   if (!matches(flow, call)) return flow;
   if (result.ok) {
+    const after = recordedAfter ? identityOf(presentedAsCall(recordedAfter)) : null;
+    const planned = identityOf(call);
+    const recorded =
+      after !== null && normalizePartitionTableId(after.partitionTableId).length > 0;
+    if (!after || !recorded) {
+      return {
+        ...recordIssued(flow, call),
+        stopped: true,
+        step: "flash",
+        note: result.summary,
+        status:
+          "Stopped. The flash finished, but this setup could not record the card's partition table. Copy stays off.",
+      };
+    }
+    if (!sameCardBody(planned, after)) {
+      return {
+        ...recordIssued(flow, call),
+        stopped: true,
+        step: "flash",
+        note: result.summary,
+        status:
+          "Stopped. The card after flashing does not match the disk number, serial, and size this setup recorded. Copy stays off.",
+      };
+    }
+    const issued = recordIssued(flow, call);
+    const pinned = issued.pinnedDisk
+      ? { ...issued.pinnedDisk, partitionTableId: after.partitionTableId }
+      : after;
     return {
-      ...recordIssued(flow, call),
+      ...issued,
+      pinnedDisk: pinned,
+      flashDisk: after,
       step: "bootOnce",
       note: result.summary,
-      flashDisk: identityOf(call),
     };
   }
   return halt(flow, call, result.outcome, result.overwritten, result.summary);
@@ -552,7 +668,7 @@ function applyRecheck(
       reinsertedDisk: null,
       note: detectionNotice(detection, false).message,
       status:
-        "Stopped. This card was not recognized. The disk number, serial, or size does not match the card this setup recorded. Copy stays off.",
+        "Stopped. This card was not recognized. The disk number, serial, size, or partition table does not match the card this setup recorded. Copy stays off.",
     };
   }
   const profileId = detection.status === "matched" ? detection.profileId : "";
@@ -581,7 +697,7 @@ function applyRecheck(
     note:
       profileId.length > 0
         ? detectionNotice(detection, false).message
-        : "The card is back. The disk number, serial, and size match the card this setup recorded.",
+        : "The card is back. The disk number, serial, size, and partition table match the card this setup recorded.",
   };
 }
 
@@ -666,7 +782,7 @@ function replan(flow: GuidedFlow, call: FlowCall): Plan {
         imagePath: call.imagePath,
       });
     case "copy_roms":
-      return planCopy(flow, { volumeId: call.volumeId });
+      return planCopy(flow, { volumeId: call.volumeId, disk: identityOf(call) });
   }
 }
 
@@ -678,6 +794,7 @@ function sameCall(left: FlowCall, right: FlowCall): boolean {
     left.diskNumber === right.diskNumber &&
     left.serial === right.serial &&
     left.sizeBytes === right.sizeBytes &&
+    left.partitionTableId === right.partitionTableId &&
     left.profileId === right.profileId &&
     left.volumeId === right.volumeId &&
     left.destination === right.destination &&
@@ -716,6 +833,9 @@ function refuseIdentity(flow: GuidedFlow, identity: DiskIdentity): string | null
   if (normalizeSerial(identity.serial).length === 0) {
     return "This card did not report a serial, so it cannot be recognized.";
   }
+  if (normalizePartitionTableId(identity.partitionTableId).length === 0) {
+    return "This card did not report a partition table id, so it cannot be recognized.";
+  }
   if (flow.pinnedDisk && !sameDisk(flow.pinnedDisk, identity)) {
     return "This setup is already using another card. Start over to use a different card.";
   }
@@ -726,15 +846,20 @@ function normalizedIdentity(identity: DiskIdentity): DiskIdentity {
   return identityOf(presentedAsCall(identity));
 }
 
-function identityOf(call: Pick<FlowCall, "diskNumber" | "serial" | "sizeBytes">): DiskIdentity {
+function identityOf(
+  call: Pick<FlowCall, "diskNumber" | "serial" | "sizeBytes" | "partitionTableId">,
+): DiskIdentity {
   return {
     diskNumber: call.diskNumber,
     serial: normalizeSerial(call.serial),
     sizeBytes: call.sizeBytes,
+    partitionTableId: normalizePartitionTableId(call.partitionTableId),
   };
 }
 
-function presentedAsCall(identity: DiskIdentity): Pick<FlowCall, "diskNumber" | "serial" | "sizeBytes"> {
+function presentedAsCall(
+  identity: DiskIdentity,
+): Pick<FlowCall, "diskNumber" | "serial" | "sizeBytes" | "partitionTableId"> {
   return identity;
 }
 
@@ -794,6 +919,7 @@ function okCall(partial: Partial<FlowCall> & { command: CommandName }): Plan {
       diskNumber: partial.diskNumber ?? 0,
       serial: partial.serial ?? "",
       sizeBytes: partial.sizeBytes ?? 0,
+      partitionTableId: partial.partitionTableId ?? "",
       profileId: partial.profileId ?? "",
       volumeId: partial.volumeId ?? "",
       destination: partial.destination ?? "",

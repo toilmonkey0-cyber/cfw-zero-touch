@@ -883,10 +883,62 @@ fn sanitize_precheck_error(error: &str) -> String {
 }
 
 /// `Get-Disk` UniqueId, then SerialNumber. Does not open the disk.
+///
+/// USB card readers often report their own serial for every card in that
+/// reader. [`partition_table_script`] is the partition-table id that
+/// distinguishes those cards.
 pub fn disk_serial_script(number: u32) -> String {
     format!(
         "$d = Get-Disk -Number {number}; $id = [string]$d.UniqueId; if ([string]::IsNullOrWhiteSpace($id)) {{ $id = [string]$d.SerialNumber }}; $id = $id -replace '\\|','/'; $id = $id -replace \"[`r`n]\",' '; Write-Output $id.Trim()"
     )
+}
+
+/// GPT disk GUID, or MBR disk signature, from `Get-Disk`. Does not open the disk.
+///
+/// The line is `GPT|<guid>` or `MBR|<8 hex digits>`. A RAW disk or a missing
+/// id is an empty id after the style.
+pub fn partition_table_script(number: u32) -> String {
+    format!(
+        "$d = Get-Disk -Number {number}; $style = [string]$d.PartitionStyle; $id = ''; if ($style -eq 'GPT') {{ $id = [string]$d.Guid }} elseif ($style -eq 'MBR') {{ $id = '{{0:x8}}' -f [uint32]$d.Signature }}; $id = $id -replace '[{{}}]',''; Write-Output ($style.Trim() + '|' + $id.Trim())"
+    )
+}
+
+/// `gpt:<guid>` or `mbr:<8 hex digits>`. Empty, RAW, and signature 0 are refused.
+pub fn normalize_partition_table_id(raw: &str) -> Result<String, String> {
+    let missing = "This card did not report a partition table id, so it cannot be recognized.";
+    let Some((style, id)) = raw.trim().split_once('|') else {
+        return Err(missing.into());
+    };
+    let id = id.trim().trim_matches(|ch| ch == '{' || ch == '}').trim();
+    if style.trim().eq_ignore_ascii_case("GPT") {
+        let id = id.to_ascii_lowercase();
+        if !is_gpt_guid(&id) {
+            return Err(missing.into());
+        }
+        return Ok(format!("gpt:{id}"));
+    }
+    if style.trim().eq_ignore_ascii_case("MBR") {
+        let signature = u32::from_str_radix(id, 16).map_err(|_| missing.to_string())?;
+        if signature == 0 {
+            return Err(missing.into());
+        }
+        return Ok(format!("mbr:{signature:08x}"));
+    }
+    Err(missing.into())
+}
+
+fn is_gpt_guid(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let widths = [8, 4, 4, 4, 12];
+    for width in widths {
+        let Some(part) = parts.next() else {
+            return false;
+        };
+        if part.len() != width || !part.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    parts.next().is_none()
 }
 
 pub fn prefix_len(card_bytes: u64) -> u64 {
