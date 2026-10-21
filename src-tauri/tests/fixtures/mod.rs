@@ -24,10 +24,14 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod capacity;
 mod card;
 pub mod exfat;
 pub mod fat16;
 
+pub use capacity::{
+    fake_card, genuine_card, CapacityFixture, CAPACITY_SCALE, FAKE_CLAIM_BYTES, FAKE_REAL_BYTES,
+};
 pub use card::{
     boot_file, build_card, build_wrap_card, classify_dtb, extract_boot, lettered_volumes,
     probe_image, read_easyroms, wrap_reported_len, BuiltCard, CardOptions, DtbSet, Probe,

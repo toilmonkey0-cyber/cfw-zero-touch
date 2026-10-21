@@ -1,11 +1,16 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 use cfw_zero_touch_lib::backup::{self, disk_query_script};
+use cfw_zero_touch_lib::block_device::{is_physical_disk_path, FakeBlockDevice};
 use cfw_zero_touch_lib::flash::{
     authorize_flash, sha256_prefix, sha256_reader, write_gzip, FlashDisk, FlashPlan, SectorWriter,
+};
+use cfw_zero_touch_lib::probe::{
+    self, ProbeDisk, ProbePlan, ProbeRequest, ProbeStatus, SessionBackup,
 };
 use cfw_zero_touch_lib::restore::{
     self, cancel_file_requests_stop, hashes_match, image_fits, same_model, BoundedWrite,
@@ -46,6 +51,10 @@ fn flag_present_in(args: &[String], name: &str) -> bool {
 fn restore_requested() -> bool {
     let args: Vec<String> = std::env::args().collect();
     args_request_restore(&args)
+}
+
+fn args_request_probe(args: &[String]) -> bool {
+    flag_present_in(args, "probe")
 }
 
 /// In restore mode both flags are mandatory. `Ok(None)` is an OS flash.
@@ -193,6 +202,16 @@ impl RunLog {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    // Probe is its own mode. `--expected-bytes` also marks a restore, so this
+    // branch has to win before `arg("image")` or the helper would wipe the card.
+    if args_request_probe(&args) {
+        if flag_present_in(&args, "restore") {
+            eprintln!("probe and restore cannot run together");
+            std::process::exit(2);
+        }
+        run_probe_mode();
+    }
     let image = arg("image");
     let expected = arg("sha256");
     let disk_number: u32 = arg("disk").parse().expect("disk number");
@@ -464,6 +483,40 @@ fn hash_physical(number: u32, length: u64) -> Result<String, String> {
     sha256_prefix(open_drive(number)?, length)
 }
 
+/// Read-only open used to hash the card before any write handle is taken.
+fn open_drive_read(number: u32) -> Result<File, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(format!(r"\\.\PhysicalDrive{number}"))
+            .map_err(|error| format!("could not read physical drive {number}: {error}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = number;
+        Err("physical disk flashing is implemented for Windows".into())
+    }
+}
+
+/// Serial, prefix, and sample blocks must match the backup. No write handle yet.
+///
+/// The app may skip its own read when the card cannot be opened without admin.
+/// This check still runs before any lock or write.
+fn live_card_matches(number: u32, disk: &ProbeDisk, backup: &SessionBackup) -> Result<(), String> {
+    if probe::normalize_serial(&backup.identity.serial) != probe::normalize_serial(&disk.serial) {
+        return Err(probe::ProbeBlock::Backup.message().into());
+    }
+    let file = open_drive_read(number)?;
+    let mut device = DriveDevice {
+        file,
+        len: disk.size_bytes,
+    };
+    probe::live_identity_matches(&mut device, &backup.identity).map_err(|error| error.to_string())
+}
+
 fn open_drive(number: u32) -> Result<File, String> {
     #[cfg(windows)]
     {
@@ -481,6 +534,406 @@ fn open_drive(number: u32) -> Result<File, String> {
     {
         let _ = number;
         Err("physical disk flashing is implemented for Windows".into())
+    }
+}
+
+/// Seek the logical offset. A counterfeit card aliases in its own controller;
+/// this wrapper does not wrap the address in software.
+struct DriveDevice {
+    file: File,
+    len: u64,
+}
+
+impl FakeBlockDevice for DriveDevice {
+    fn reported_len(&self) -> u64 {
+        self.len
+    }
+
+    fn stored_len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(buf)
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(data)?;
+        self.file.flush()
+    }
+}
+
+fn probe_fail(log: &mut RunLog, code: i32, overwritten: bool, message: &str) -> ! {
+    for line in probe::format_failed_log(overwritten, message).lines() {
+        log.line(line);
+    }
+    log.exit(code);
+}
+
+/// Quick probe. Rechecks size, model, and card identity after the approval
+/// prompt, then writes patterns. Does not call Clear-Disk. Every exit writes
+/// `OVERWRITTEN=yes` or `OVERWRITTEN=no`.
+fn run_probe_mode() -> ! {
+    let mut log = RunLog::open(optional_arg("log-file").as_deref());
+    let disk_number: u32 = match arg("disk").parse() {
+        Ok(number) => number,
+        Err(_) => probe_fail(&mut log, 2, false, "bad disk number"),
+    };
+    let confirmation = arg("confirm");
+    let expected_bytes = match parse_u64_flag("expected-bytes", optional_arg("expected-bytes")) {
+        Ok(Some(value)) => value,
+        Ok(None) => probe_fail(&mut log, 2, false, "probe requires --expected-bytes"),
+        Err(error) => probe_fail(&mut log, 2, false, &error),
+    };
+    let Some(expected_model) = optional_arg("expected-model") else {
+        probe_fail(&mut log, 2, false, "probe requires --expected-model");
+    };
+    let backup_image = optional_arg("backup-image");
+    let backup_sha = optional_arg("backup-sha256");
+    let backup_prefix = optional_arg("backup-prefix-sha256");
+    let backup_serial = optional_arg("backup-serial");
+    let cancel_file = optional_arg("cancel-file");
+    match (&backup_image, &backup_sha, &backup_prefix, &backup_serial) {
+        (Some(_), Some(_), Some(_), Some(_)) | (None, None, None, None) => {}
+        _ => probe_fail(
+            &mut log,
+            2,
+            false,
+            "a probe backup needs the image, checksum, and card identity from this session",
+        ),
+    }
+    if let Some(path) = &backup_image {
+        if is_physical_disk_path(Path::new(path)) {
+            probe_fail(
+                &mut log,
+                3,
+                false,
+                "refusing to read a backup from a physical disk path",
+            );
+        }
+    }
+    if let Some(path) = &cancel_file {
+        if is_physical_disk_path(Path::new(path)) {
+            probe_fail(
+                &mut log,
+                3,
+                false,
+                "refusing to read a cancel flag from a physical disk path",
+            );
+        }
+    }
+
+    let (disk, model) = match read_disk(disk_number) {
+        Ok(disk) => disk,
+        Err(error) => probe_fail(&mut log, 2, false, &error),
+    };
+    log.line(&format!(
+        "target disk {} {} {} bytes model {model}",
+        disk.number, disk.bus, disk.size_bytes
+    ));
+    if let Err(error) = shown_disk_matches(
+        disk.size_bytes,
+        &model,
+        Some(expected_bytes),
+        Some(expected_model.as_str()),
+    ) {
+        probe_fail(&mut log, 3, false, &error);
+    }
+    let live_serial = if backup_image.is_some() {
+        match read_serial(disk_number) {
+            Ok(serial) => serial,
+            Err(error) => probe_fail(&mut log, 2, false, &error),
+        }
+    } else {
+        String::new()
+    };
+    let probe_disk = ProbeDisk {
+        number: disk.number,
+        bus: disk.bus,
+        size_bytes: disk.size_bytes,
+        system_disk: disk.system_disk,
+        model: model.clone(),
+        serial: live_serial,
+    };
+    let plan = ProbePlan {
+        confirmation,
+        disk_number,
+        displayed_bytes: expected_bytes,
+        displayed_model: expected_model,
+    };
+    if let Err(block) = probe::authorize_probe(&probe_disk, &plan) {
+        probe_fail(&mut log, 3, false, block.message());
+    }
+    if let Some(path) = &cancel_file {
+        match cancel_file_requests_stop(Path::new(path)) {
+            Ok(true) => {
+                let status = ProbeStatus::Cancelled {
+                    overwritten: false,
+                    summary: probe::cancel_summary(false, backup_image.is_some()),
+                };
+                for line in probe::format_probe_log(&status).lines() {
+                    log.line(line);
+                }
+                log.exit(9);
+            }
+            Ok(false) => {}
+            Err(error) => probe_fail(&mut log, 2, false, &error),
+        }
+    }
+
+    let backup = match (backup_image, backup_sha, backup_prefix, backup_serial) {
+        (Some(path), Some(sha), Some(prefix), Some(serial)) => {
+            match recorded_backup(&path, &sha, &prefix, &serial) {
+                Ok(backup) => Some(backup),
+                Err(error) => probe_fail(&mut log, 3, false, &error),
+            }
+        }
+        _ => None,
+    };
+    // Re-read this card and compare it to the backup before locking or writing.
+    if let Some(backup) = &backup {
+        if let Err(error) = live_card_matches(disk_number, &probe_disk, backup) {
+            probe_fail(&mut log, 3, false, &error);
+        }
+    }
+    // Backup route only: lock and dismount volumes before any raw write.
+    // Handles stay open until this function exits so Windows does not remount.
+    let _volume_locks = if backup.is_some() {
+        match lock_disk_volumes(disk_number) {
+            Ok(locks) => Some(locks),
+            Err(error) => {
+                let message = probe::backup_write_allowed(Err(error)).unwrap_err();
+                probe_fail(&mut log, 3, false, &message);
+            }
+        }
+    } else {
+        None
+    };
+    let file = match open_drive(disk_number) {
+        Ok(file) => file,
+        Err(error) => probe_fail(&mut log, 2, false, &error),
+    };
+    let mut device = DriveDevice {
+        file,
+        len: probe_disk.size_bytes,
+    };
+    let request = ProbeRequest {
+        disk: &probe_disk,
+        plan: &plan,
+        backup: backup.as_ref(),
+    };
+    let cancel_path = cancel_file.as_ref().map(PathBuf::from);
+    match probe::run_probe(
+        &mut device,
+        &request,
+        &AtomicBool::new(false),
+        cancel_path.as_deref(),
+    ) {
+        Ok(status) => {
+            let code = match &status {
+                ProbeStatus::Cancelled { .. } => 9,
+                ProbeStatus::Finished(_) => 0,
+            };
+            for line in probe::format_probe_log(&status).lines() {
+                log.line(line);
+            }
+            log.exit(code);
+        }
+        Err(probe::ProbeError::Blocked(block)) => probe_fail(&mut log, 3, false, block.message()),
+        Err(probe::ProbeError::Failed {
+            message,
+            overwritten,
+        }) => probe_fail(&mut log, 6, overwritten, &message),
+    }
+}
+
+/// Identity comes from the backup's `.identity` file, not from the live disk.
+fn recorded_backup(
+    image: &str,
+    sha: &str,
+    prefix: &str,
+    serial: &str,
+) -> Result<SessionBackup, String> {
+    let image = PathBuf::from(image);
+    let stored = probe::load_identity(&image)?;
+    let claimed = probe::CardIdentity {
+        serial: serial.to_string(),
+        prefix_sha256: prefix.to_string(),
+        bytes: stored.bytes,
+        model: stored.model.clone(),
+        samples: stored.samples.clone(),
+    };
+    if !probe::same_identity(&stored, &claimed) {
+        return Err(
+            "the backup identity passed to the helper does not match the identity file. The card was not written."
+                .into(),
+        );
+    }
+    Ok(SessionBackup {
+        image,
+        size_bytes: stored.bytes,
+        model: stored.model.clone(),
+        sha256: sha.to_string(),
+        identity: stored,
+    })
+}
+
+fn read_serial(number: u32) -> Result<String, String> {
+    let script = probe::disk_serial_script(number);
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|error| format!("could not read the disk serial: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read the disk serial: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    Ok(probe::normalize_serial(line))
+}
+
+/// Turn a `Get-Volume` path into a `CreateFile` path, or refuse it.
+fn volume_open_path(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        return Err("empty volume path".into());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("physicaldrive") || lower.contains("globalroot") {
+        return Err(format!("refusing to lock {trimmed}"));
+    }
+    if let Some(index) = lower.find("volume{") {
+        let rest = &trimmed[index..];
+        if !rest.contains('}') {
+            return Err(format!("refusing to lock {trimmed}"));
+        }
+        return Ok(format!(r"\\.\{rest}"));
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() == 6
+        && (trimmed.starts_with(r"\\.\") || trimmed.starts_with(r"\\?/"))
+        && bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+    {
+        return Ok(trimmed.to_string());
+    }
+    Err(format!(
+        "refusing to lock an unexpected volume path {trimmed}"
+    ))
+}
+
+fn lock_disk_volumes(number: u32) -> Result<Vec<File>, String> {
+    #[cfg(windows)]
+    {
+        let paths = volume_paths(number)?;
+        let mut files = Vec::new();
+        for path in paths {
+            let file = open_volume(&path)?;
+            lock_and_dismount(&file)?;
+            files.push(file);
+        }
+        Ok(files)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = number;
+        // The Windows path is the only production caller. Keep the parser in
+        // this build so the fixture tests can refuse physical-disk paths.
+        let _ = volume_open_path;
+        Err("volume lock is implemented for Windows".into())
+    }
+}
+
+#[cfg(windows)]
+fn volume_paths(number: u32) -> Result<Vec<String>, String> {
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Get-Partition -DiskNumber {number} -ErrorAction SilentlyContinue | ForEach-Object {{ $v = $_ | Get-Volume -ErrorAction SilentlyContinue; if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v.Path)) {{ Write-Output ([string]$v.Path) }} }}"
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|error| format!("could not list volumes: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not list volumes: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut paths = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        paths.push(volume_open_path(line)?);
+    }
+    Ok(paths)
+}
+
+#[cfg(windows)]
+fn open_volume(path: &str) -> Result<File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(path)
+        .map_err(|error| format!("could not open {path} to lock it: {error}"))
+}
+
+#[cfg(windows)]
+fn lock_and_dismount(file: &File) -> Result<(), String> {
+    const FSCTL_LOCK_VOLUME: u32 = 0x0009_0018;
+    const FSCTL_DISMOUNT_VOLUME: u32 = 0x0009_0020;
+    ioctl(file, FSCTL_LOCK_VOLUME)?;
+    ioctl(file, FSCTL_DISMOUNT_VOLUME)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ioctl(file: &File, code: u32) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn DeviceIoControl(
+            handle: *mut core::ffi::c_void,
+            code: u32,
+            in_buf: *mut core::ffi::c_void,
+            in_len: u32,
+            out_buf: *mut core::ffi::c_void,
+            out_len: u32,
+            bytes: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+    let mut bytes = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            code,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(format!(
+            "could not lock the volume ({code:#x}): {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -552,6 +1005,19 @@ mod tests {
     }
 
     #[test]
+    fn probe_flag_is_its_own_mode() {
+        let args = [
+            "cfw-flash".to_string(),
+            "--probe".to_string(),
+            "--expected-bytes=4096".to_string(),
+            "--expected-model=Samsung EVO".to_string(),
+        ];
+        assert!(args_request_probe(&args));
+        assert!(!flag_present_in(&args, "restore"));
+        assert!(!flag_present_in(&args, "image"));
+    }
+
+    #[test]
     fn log_file_alone_stays_an_os_flash() {
         let os_flash = [
             "cfw-flash".to_string(),
@@ -598,5 +1064,216 @@ mod tests {
         file.read_to_end(&mut got).unwrap();
         assert_eq!(got, payload);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regular files only. Dropped at the end of the test.
+    struct Tmp(std::path::PathBuf);
+
+    impl Tmp {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cfw-flash-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            assert!(
+                !is_physical_disk_path(&path),
+                "helper tests must use a regular directory"
+            );
+            Self(path)
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_card(
+        dir: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> cfw_zero_touch_lib::block_device::FileBlockDevice {
+        let path = dir.join(name);
+        let len = bytes.len() as u64;
+        let mut device =
+            cfw_zero_touch_lib::block_device::FileBlockDevice::create(&path, len, len).unwrap();
+        device.write_at(0, bytes).unwrap();
+        device
+    }
+
+    #[test]
+    fn unpartitioned_data_is_not_blank_and_an_all_zero_card_is() {
+        let tmp = Tmp::new("blank");
+        let mut data = vec![0u8; 8192];
+        data[600] = 0xAB;
+        let mut device = write_card(&tmp.0, "data.img", &data);
+        assert!(
+            !probe::card_is_blank(&mut device).unwrap(),
+            "no partition table does not make leftover bytes blank"
+        );
+        let mut zeros = write_card(&tmp.0, "zero.img", &vec![0u8; 8192]);
+        assert!(probe::card_is_blank(&mut zeros).unwrap());
+    }
+
+    #[test]
+    fn a_backup_from_another_card_of_the_same_model_and_size_is_refused() {
+        let tmp = Tmp::new("identity");
+        let size = 8192usize;
+        let model = "Generic SD";
+        let serial = "reader-1";
+        let mut card_a = vec![0u8; size];
+        card_a[0] = 0x11;
+        card_a[510] = 0x55;
+        card_a[511] = 0xAA;
+        let mut card_b = card_a.clone();
+        card_b[0] = 0x22;
+
+        let mut source = write_card(&tmp.0, "a.img", &card_a);
+        let prefix = probe::prefix_sha256(&mut source).unwrap();
+        let samples = probe::sample_block_hashes(&mut source).unwrap();
+        let dest = tmp.0.join("a.img.gz");
+        let outcome = backup::backup_image(
+            &mut source,
+            &dest,
+            u64::MAX,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let cfw_zero_touch_lib::backup::BackupOutcome::Complete {
+            image,
+            sha256,
+            bytes,
+            ..
+        } = outcome
+        else {
+            panic!("backup fixture was cancelled");
+        };
+        let identity = probe::CardIdentity {
+            serial: serial.into(),
+            prefix_sha256: prefix,
+            bytes,
+            model: model.into(),
+            samples,
+        };
+        probe::write_identity(&image, &identity).unwrap();
+        let recorded = recorded_backup(
+            image.to_str().unwrap(),
+            &sha256,
+            &identity.prefix_sha256,
+            &identity.serial,
+        )
+        .unwrap();
+        assert_eq!(recorded.size_bytes, size as u64);
+        assert_eq!(recorded.model, model);
+
+        let mut other_prefix_device = write_card(&tmp.0, "b-hash.img", &card_b);
+        let other_prefix = probe::prefix_sha256(&mut other_prefix_device).unwrap();
+        let mismatch = recorded_backup(
+            image.to_str().unwrap(),
+            &sha256,
+            &other_prefix,
+            &identity.serial,
+        )
+        .unwrap_err();
+        assert!(mismatch.contains("identity"));
+
+        let disk = ProbeDisk {
+            number: 2,
+            bus: "USB".into(),
+            size_bytes: size as u64,
+            system_disk: false,
+            model: model.into(),
+            serial: serial.into(),
+        };
+        let plan = ProbePlan {
+            confirmation: "PROBE".into(),
+            disk_number: 2,
+            displayed_bytes: size as u64,
+            displayed_model: model.into(),
+        };
+        let request = ProbeRequest {
+            disk: &disk,
+            plan: &plan,
+            backup: Some(&recorded),
+        };
+        let b_path = tmp.0.join("b.img");
+        {
+            let mut live = write_card(&tmp.0, "b.img", &card_b);
+            let error =
+                probe::run_probe(&mut live, &request, &AtomicBool::new(false), None).unwrap_err();
+            assert!(matches!(
+                error,
+                probe::ProbeError::Blocked(probe::ProbeBlock::Backup)
+            ));
+        }
+        assert_eq!(
+            std::fs::read(&b_path).unwrap(),
+            card_b,
+            "a same-model, same-size card with different contents must not be written"
+        );
+    }
+
+    #[test]
+    fn every_probe_exit_records_whether_the_card_was_overwritten() {
+        let finished = probe::format_probe_log(&ProbeStatus::Finished(probe::ProbeReport {
+            kind: probe::CardKind::Genuine,
+            claimed_bytes: 8192,
+            real_bytes: 8192,
+            read_mbps: 1.0,
+            write_mbps: 1.0,
+            aliased: false,
+            summary: "done".into(),
+        }));
+        assert!(finished.contains("OVERWRITTEN=yes"));
+        assert!(finished.contains("RESULT=OK"));
+        assert!(probe::overwritten_flag(&finished).unwrap());
+        assert!(probe::parse_probe_log(&finished).unwrap().overwritten);
+
+        let cancelled_yes = probe::format_probe_log(&ProbeStatus::Cancelled {
+            overwritten: true,
+            summary: probe::cancel_summary(true, true),
+        });
+        assert!(cancelled_yes.contains("OVERWRITTEN=yes"));
+        assert!(cancelled_yes.contains("RESULT=CANCELLED"));
+        let cancelled_no = probe::format_probe_log(&ProbeStatus::Cancelled {
+            overwritten: false,
+            summary: probe::cancel_summary(false, false),
+        });
+        assert!(cancelled_no.contains("OVERWRITTEN=no"));
+
+        assert!(probe::format_failed_log(true, "write failed").contains("OVERWRITTEN=yes"));
+        let refused = probe::format_failed_log(false, "refused before a write");
+        assert!(refused.contains("OVERWRITTEN=no"));
+        assert!(refused.contains("RESULT=FAIL"));
+
+        let missing = "RESULT=CANCELLED\nSUMMARY=Cancelled.\n";
+        assert!(probe::overwritten_flag(missing)
+            .unwrap_err()
+            .contains("missing"));
+        assert!(probe::parse_probe_log(missing).is_err());
+        let error = probe::interpret_helper_log(Some(9), missing, true, true).unwrap_err();
+        assert!(error.contains("did not say whether"));
+        assert!(!error.contains("Nothing on the card was overwritten"));
+    }
+
+    #[test]
+    fn volume_lock_paths_are_volume_paths_and_a_lock_failure_writes_nothing() {
+        assert_eq!(
+            volume_open_path(r"\\?\Volume{12345678-abcd-ef}\").unwrap(),
+            r"\\.\Volume{12345678-abcd-ef}"
+        );
+        assert_eq!(volume_open_path(r"\\.\E:").unwrap(), r"\\.\E:");
+        assert!(volume_open_path(r"\\.\PhysicalDrive2").is_err());
+        assert!(volume_open_path(r"\\.\GLOBALROOT\device\harddisk2").is_err());
+        let message = probe::backup_write_allowed(Err("busy".into())).unwrap_err();
+        assert!(message.contains("nothing was written"));
+        assert!(probe::format_failed_log(false, &message).contains("OVERWRITTEN=no"));
     }
 }
