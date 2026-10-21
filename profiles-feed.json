@@ -59,7 +59,10 @@
           }
         ]
       },
-      "version": 2
+      "version": 3,
+      "stockFingerprint": {
+        "manualOnly": true
+      }
     },
     {
       "id": "darkos-rgb10x-os",
@@ -130,7 +133,10 @@
           }
         ]
       },
-      "version": 2
+      "version": 3,
+      "stockFingerprint": {
+        "manualOnly": true
+      }
     },
     {
       "id": "r35s-stock-card",
@@ -187,7 +193,10 @@
           }
         ]
       },
-      "version": 2
+      "version": 3,
+      "stockFingerprint": {
+        "manualOnly": true
+      }
     },
     {
       "id": "r36s-clone-card",
@@ -317,7 +326,22 @@
           }
         ]
       },
-      "version": 2
+      "version": 3,
+      "stockFingerprint": {
+        "manualOnly": false,
+        "source": "https://dtbvault.com/en/file/rk3326-evb-lp3-v12-linux-IYZchb-P",
+        "variants": [
+          {
+            "device": "R36S clone (board G80CA-MB V1.3)",
+            "dtbs": [
+              {
+                "name": "rk3326-evb-lp3-v12-linux.dtb",
+                "sha256": "8c4b6b738bfd5af9638db9c6e9a3ac49884ca4b773c4053a31d1a934b69246b0"
+              }
+            ]
+          }
+        ]
+      }
     },
     {
       "id": "rocknix-rgb10x-os",
@@ -348,7 +372,10 @@
         "sha256": "f2b35e9feeef1a2ba2a40298614c1e9d67349ffd98e8498449e8815107ab82cc",
         "compressed": "gz"
       },
-      "version": 2
+      "version": 3,
+      "stockFingerprint": {
+        "manualOnly": true
+      }
     },
     {
       "id": "rocknix-roms-card",
@@ -413,7 +440,10 @@
           }
         ]
       },
-      "version": 2
+      "version": 3,
+      "stockFingerprint": {
+        "manualOnly": true
+      }
     }
   ]
 }

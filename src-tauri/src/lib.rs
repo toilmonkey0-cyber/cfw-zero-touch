@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod block_device;
+pub mod detect;
 pub mod diag;
 pub mod feed;
 pub mod firstboot;
@@ -287,6 +288,31 @@ struct CopyProgress {
     total: usize,
     relative_dest: String,
     done: bool,
+}
+
+#[tauri::command]
+fn detect_stock_device(app: tauri::AppHandle) -> Result<detect::DetectionView, String> {
+    let profiles = load_all(&app)?;
+    let detection = match detect::scan_observations() {
+        Ok(observations) => detect::identify(&profiles, &observations),
+        Err(error) => {
+            diag::log("WARN", "detect_failed", &error);
+            detect::Detection::None
+        }
+    };
+    if let detect::Detection::Match {
+        profile_id,
+        device,
+        screen,
+    } = &detection
+    {
+        diag::log(
+            "INFO",
+            "detect_match",
+            &format!("profile={profile_id} device={device} screen={screen}"),
+        );
+    }
+    Ok(detect::view(&profiles, detection))
 }
 
 #[tauri::command]
@@ -2861,6 +2887,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             list_profiles,
+            detect_stock_device,
             list_flash_disks,
             list_probe_disks,
             flash_os,

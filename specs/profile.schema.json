@@ -88,6 +88,69 @@
         "required": { "type": "boolean" },
         "selector": { "enum": ["manual_copy", "archr_style_overlay", "external_tool"] }
       }
+    },
+    "stockFingerprint": {
+      "type": "object",
+      "description": "Read-only stock-card identity. A non-manual fingerprint cites a real DTB hash. Screen and partition layout are optional and are stored only when recorded from a real card.",
+      "additionalProperties": false,
+      "required": ["manualOnly"],
+      "properties": {
+        "manualOnly": { "type": "boolean" },
+        "source": { "type": "string", "minLength": 1 },
+        "variants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["device", "dtbs"],
+            "properties": {
+              "device": { "type": "string", "minLength": 1 },
+              "screen": { "type": "string", "minLength": 1 },
+              "dtbs": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "sha256"],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*\\.dtb$"
+                    },
+                    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                  }
+                }
+              },
+              "partitions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["type", "label", "sizeBytes"],
+                  "properties": {
+                    "type": { "type": "string", "pattern": "^[0-9a-f]{2}$" },
+                    "label": { "type": "string", "minLength": 1 },
+                    "sizeBytes": { "type": "integer", "minimum": 0 }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "manualOnly": { "const": false } },
+            "required": ["manualOnly"]
+          },
+          "then": {
+            "required": ["source", "variants"],
+            "properties": { "variants": { "minItems": 1 } }
+          }
+        }
+      ]
     }
   }
 }

@@ -24,6 +24,7 @@ fn profile(layout: &str, bios: Option<&str>, systems: &[(&str, &str)]) -> Profil
                 .collect(),
         },
         image: None,
+        stock_fingerprint: None,
     }
 }
 

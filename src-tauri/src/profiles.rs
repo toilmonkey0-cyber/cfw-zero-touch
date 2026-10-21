@@ -45,6 +45,53 @@ pub struct Profile {
     pub rom_schema: RomSchema,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageSource>,
+    /// Read-only stock-card identity. Absent on profiles built by older tests.
+    /// Shipped profiles are `manualOnly` or carry a cited DTB hash. Screen and
+    /// partition layout are recorded only when they came from a real card.
+    #[serde(
+        rename = "stockFingerprint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stock_fingerprint: Option<StockFingerprint>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StockFingerprint {
+    pub manual_only: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<StockVariant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StockVariant {
+    pub device: String,
+    /// Panel name when one was recorded. Empty means the user confirms the screen.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub screen: String,
+    pub dtbs: Vec<StockDtb>,
+    /// Present only when a real partition table was recorded for this variant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partitions: Vec<StockPartition>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct StockDtb {
+    pub name: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StockPartition {
+    #[serde(rename = "type")]
+    pub type_code: String,
+    pub label: String,
+    pub size_bytes: u64,
 }
 
 fn default_version() -> u32 {
@@ -203,6 +250,18 @@ pub fn load_profiles(dir: &Path, schema_path: &Path) -> Result<Vec<Profile>, Pro
             if !is_safe_folder(bios) {
                 return Err(ProfileError::new(format!(
                     "{file_name} has an unsafe bios folder: {bios}"
+                )));
+            }
+        }
+        if let Some(fingerprint) = &profile.stock_fingerprint {
+            if fingerprint.manual_only && !fingerprint.variants.is_empty() {
+                return Err(ProfileError::new(format!(
+                    "{file_name} is manual-only but still has fingerprints"
+                )));
+            }
+            if !fingerprint.manual_only && fingerprint.variants.is_empty() {
+                return Err(ProfileError::new(format!(
+                    "{file_name} is not manual-only and has no fingerprints"
                 )));
             }
         }

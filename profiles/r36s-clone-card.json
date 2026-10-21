@@ -126,5 +126,20 @@
       }
     ]
   },
-  "version": 2
+  "version": 3,
+  "stockFingerprint": {
+    "manualOnly": false,
+    "source": "https://dtbvault.com/en/file/rk3326-evb-lp3-v12-linux-IYZchb-P",
+    "variants": [
+      {
+        "device": "R36S clone (board G80CA-MB V1.3)",
+        "dtbs": [
+          {
+            "name": "rk3326-evb-lp3-v12-linux.dtb",
+            "sha256": "8c4b6b738bfd5af9638db9c6e9a3ac49884ca4b773c4053a31d1a934b69246b0"
+          }
+        ]
+      }
+    ]
+  }
 }

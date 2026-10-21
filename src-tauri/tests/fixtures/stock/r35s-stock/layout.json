@@ -1,0 +1,6 @@
+{
+  "partitions": [
+    { "type": "0e", "label": "BOOT", "sizeBytes": 33554432 },
+    { "type": "0b", "label": "GAMES", "sizeBytes": 2147483648 }
+  ]
+}

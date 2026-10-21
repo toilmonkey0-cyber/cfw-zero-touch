@@ -5,6 +5,11 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import "./App.css";
 import { stockImagePath } from "./backupPath";
+import {
+  detectionNotice,
+  profileAfterConfirm,
+  type StockDetection,
+} from "./detectDevice";
 import { formatBytes } from "./formatBytes";
 import { fullConfirmPrompt, fullProgressLabel } from "./fullCheckPath";
 import { probeConfirmPrompt } from "./probePath";
@@ -254,11 +259,16 @@ export default function App() {
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [doctorBusy, setDoctorBusy] = useState(false);
   const [doctorEngine, setDoctorEngine] = useState(false);
+  const [detection, setDetection] = useState<StockDetection | null>(null);
+  const [detectionDismissed, setDetectionDismissed] = useState(false);
 
   useEffect(() => {
     invoke<Profile[]>("list_profiles")
       .then(setProfiles)
       .catch((cause: unknown) => setError(String(cause)));
+    invoke<StockDetection>("detect_stock_device")
+      .then(setDetection)
+      .catch(() => setDetection(null));
   }, []);
 
   useEffect(() => {
@@ -468,6 +478,13 @@ export default function App() {
     }
     setStep("card");
     await refreshVolumes(next);
+  }
+
+  async function confirmDetected() {
+    const id = profileAfterConfirm(detection, true);
+    const next = profiles.find((item) => item.id === id);
+    if (!next) return;
+    await chooseProfile(next);
   }
 
   async function openBackup() {
@@ -970,6 +987,8 @@ export default function App() {
     );
   }
 
+  const deviceNotice = detectionNotice(detection, detectionDismissed);
+
   return (
     <main>
       <header>
@@ -1045,9 +1064,28 @@ export default function App() {
             </button>
           </div>
           {profiles.length === 0 ? <p>No ROMs-card profiles found.</p> : null}
+          {deviceNotice.message ? (
+            <div className="feed">
+              <p>{deviceNotice.message}</p>
+              {deviceNotice.showConfirm ? (
+                <div className="row">
+                  <button disabled={busy} onClick={() => void confirmDetected()}>
+                    Use this device
+                  </button>
+                  <button disabled={busy} onClick={() => setDetectionDismissed(true)}>
+                    Choose a different layout
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           <div className="cards">
             {profiles.map((item) => (
-              <button key={item.id} className="card" onClick={() => void chooseProfile(item)}>
+              <button
+                key={item.id}
+                className={item.id === deviceNotice.suggestedProfileId ? "card suggested" : "card"}
+                onClick={() => void chooseProfile(item)}
+              >
                 <strong>{item.name}</strong>
                 <span>
                   {item.image

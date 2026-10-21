@@ -1,0 +1,2 @@
+# Stock-card fixtures are hashed byte for byte. Do not rewrite line endings on checkout.
+src-tauri/tests/fixtures/** -text
