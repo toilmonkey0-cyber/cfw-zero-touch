@@ -9,6 +9,7 @@ pub mod folder_map;
 pub mod format_gate;
 pub mod fullcheck;
 pub mod igir;
+pub mod license;
 pub mod needle;
 pub mod prepare;
 pub mod probe;
@@ -2953,6 +2954,67 @@ fn stage_library(
     })
 }
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn with_license<T>(body: impl FnOnce(&license::Session<license::UreqTransport>) -> T) -> T {
+    let _guard = license::session_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let session = license::production_session();
+    body(&session)
+}
+
+fn log_license(event: &str, status: &license::LicenseStatus) {
+    // `log_detail` is a fixed set of reason codes. It never includes the key.
+    diag::log("INFO", event, &status.log_detail());
+}
+
+#[tauri::command]
+async fn license_status() -> license::LicenseView {
+    // The Gumroad call is blocking. It runs off the UI thread so a 15s timeout
+    // during launch cannot freeze the window. The command still returns a view
+    // and never a Tauri error, so a panic payload cannot echo the key.
+    match tauri::async_runtime::spawn_blocking(|| {
+        with_license(|session| session.status(now_unix()))
+    })
+    .await
+    {
+        Ok(status) => {
+            log_license("license_status", &status);
+            status.to_view(None)
+        }
+        Err(_) => {
+            let status = license::worker_stopped_status();
+            log_license("license_status", &status);
+            status.to_view(None)
+        }
+    }
+}
+
+#[tauri::command]
+async fn activate_license(license_key: String) -> license::LicenseView {
+    match tauri::async_runtime::spawn_blocking(move || {
+        with_license(|session| session.activate(&license_key, now_unix()))
+    })
+    .await
+    {
+        Ok(outcome) => {
+            log_license("license_activate", &outcome.stored);
+            outcome.to_view()
+        }
+        Err(_) => {
+            let status = license::worker_stopped_status();
+            log_license("license_activate", &status);
+            status.to_view(None)
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     std::panic::set_hook(Box::new(|info| {
@@ -2995,7 +3057,9 @@ pub fn run() {
             needle_status,
             needle_acquire,
             classify_library,
-            diagnose_card
+            diagnose_card,
+            license_status,
+            activate_license
         ])
         .build(tauri::generate_context!())
         .expect("error while building the application")

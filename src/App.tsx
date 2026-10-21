@@ -13,6 +13,12 @@ import {
 import { formatBytes } from "./formatBytes";
 import { GuidedWizard } from "./GuidedWizard";
 import { fullConfirmPrompt, fullProgressLabel } from "./fullCheckPath";
+import {
+  commercialUnlocked,
+  safetyNote,
+  statusText,
+  type LicenseView,
+} from "./license";
 import { probeConfirmPrompt } from "./probePath";
 import {
   isFinishedBackupName,
@@ -263,6 +269,9 @@ export default function App() {
   const [doctorEngine, setDoctorEngine] = useState(false);
   const [detection, setDetection] = useState<StockDetection | null>(null);
   const [detectionDismissed, setDetectionDismissed] = useState(false);
+  const [licenseKey, setLicenseKey] = useState("");
+  const [licenseView, setLicenseView] = useState<LicenseView | null>(null);
+  const [licenseBusy, setLicenseBusy] = useState(false);
 
   useEffect(() => {
     invoke<Profile[]>("list_profiles")
@@ -287,6 +296,12 @@ export default function App() {
     invoke<string>("diagnostics_path")
       .then(setDiagPath)
       .catch(() => setDiagPath(""));
+  }, []);
+
+  useEffect(() => {
+    invoke<LicenseView>("license_status")
+      .then(setLicenseView)
+      .catch(() => setLicenseView(null));
   }, []);
 
   useEffect(() => {
@@ -351,6 +366,31 @@ export default function App() {
       setError(String(cause));
     } finally {
       setDoctorBusy(false);
+    }
+  }
+
+  async function activateLicense() {
+    setLicenseBusy(true);
+    try {
+      const view = await invoke<LicenseView>("activate_license", { licenseKey });
+      setLicenseView(view);
+      if (view.state === "active") {
+        setLicenseKey("");
+      }
+    } catch (cause) {
+      setLicenseView({
+        state: "inactive",
+        reason: "unreachable",
+        message: statusText(String(cause), licenseKey),
+        uses: null,
+        overSoftLimit: false,
+        stale: false,
+        signedUpdates: false,
+        support: false,
+        safetyOpen: true,
+      });
+    } finally {
+      setLicenseBusy(false);
     }
   }
 
@@ -1000,6 +1040,41 @@ export default function App() {
           Your ROMs and BIOS stay on this PC. This app never downloads games. Formatting erases the
           removable card you select.
         </p>
+        <section className="license">
+          <h2>License</h2>
+          <p>{safetyNote()}</p>
+          <p className="legal">
+            A Gumroad license covers signed builds and support for this computer. Three computers
+            are included. More than that still works, and this app shows a warning.
+          </p>
+          <label>
+            License key
+            <input
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              value={licenseKey}
+              onChange={(event) => setLicenseKey(event.target.value)}
+            />
+          </label>
+          <div className="row">
+            <button
+              disabled={licenseBusy || licenseKey.trim().length === 0}
+              onClick={() => void activateLicense()}
+            >
+              Activate this computer
+            </button>
+          </div>
+          <p>
+            {statusText(
+              licenseView?.message ?? "Checking this computer's license…",
+              licenseKey,
+            )}
+          </p>
+          {commercialUnlocked(licenseView).updates ? (
+            <p>Signed builds and support are unlocked on this computer.</p>
+          ) : null}
+        </section>
         {appVersion ? <p className="path">Card Studio {appVersion}</p> : null}
         {feedCheck?.appUpdate ? (
           <p>
@@ -1053,6 +1128,7 @@ export default function App() {
               </div>
             </div>
           ) : null}
+          {/* Safety actions stay available with or without a license. */}
           <div className="row">
             <button disabled={busy} onClick={() => setStep("guided")}>
               Guided setup

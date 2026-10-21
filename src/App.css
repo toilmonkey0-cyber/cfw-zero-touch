@@ -114,7 +114,7 @@ progress {
   height: 10px;
 }
 
-input[type="text"], input:not([type]) {
+input[type="text"], input[type="password"], input:not([type]) {
   display: block;
   margin-top: 6px;
   width: 100%;
@@ -170,6 +170,19 @@ ol {
 .review thead th {
   background: #f6f7fa;
 }
+.license {
+  border: 1px solid #4a4338;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 16px 0;
+  display: grid;
+  gap: 8px;
+}
+
+.license h2 {
+  font-size: 1.05rem;
+}
+
 .doctor {
   border: 1px solid #4a4338;
   border-radius: 10px;

@@ -95,8 +95,9 @@ The design and its accepted limits are written up in [`SECURITY.md`](SECURITY.md
 - **This app never ships or downloads ROMs or BIOS files.** You point it at files you already own; nothing game-related is fetched, bundled, or uploaded.
 - DAT files for the optional igir sort are yours to supply (No-Intro's datomatic, for example).
 - The local-AI tier downloads software only — an Apache-2.0 engine and its weights — and only after you accept, verified against SHA-256 pins compiled into the app. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-- The profile feed is fetched from `raw.githubusercontent.com` on launch; that is the only automatic network request. Flashing downloads images only when you ask it to. `CFW_FEED_URL` overrides the feed for development.
-- Everything else stays local: no telemetry, no accounts, no analytics, and filenames never leave your machine.
+- The profile feed is fetched from `raw.githubusercontent.com` on launch. Flashing downloads images only when you ask it to. `CFW_FEED_URL` overrides the feed for development.
+- A saved Gumroad license is re-checked over HTTPS when it is older than 7 days. That request sends the product id and the license key, and a network failure does not turn the saved license off. Card backup, restore, tests, and disk safeguards do not need a license. See [`docs/LICENSING.md`](docs/LICENSING.md).
+- There is no telemetry and no analytics, and filenames never leave your machine. Signed release builds can set `CFW_GUMROAD_PRODUCT_ID` at compile time. The default placeholder does not call Gumroad.
 
 ## Requirements
 
@@ -132,6 +133,7 @@ Build a release bundle with `npm run tauri build`. CI runs `cargo fmt --check`, 
 | [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) | Phased plan and phase-by-phase status |
 | [`docs/FIRSTBOOT.md`](docs/FIRSTBOOT.md) | What ArkOS/dArkOS first boot does to `EASYROMS`, and the disarm logic |
 | [`docs/QA-PHASE1.md`](docs/QA-PHASE1.md) | Hardware QA checklist for a spare card |
+| [`docs/LICENSING.md`](docs/LICENSING.md) | Gumroad license check, offline cache, and what it does not lock |
 | [`specs/profile.schema.json`](specs/profile.schema.json) | The profile schema every layout validates against |
 
 ## Project status
