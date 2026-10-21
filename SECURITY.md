@@ -23,7 +23,7 @@ The app performs privileged or network-touching work, and each kind has its own 
 | Flashing an OS image | The published SHA-256 in the profile, checked on the downloaded artifact before any write, and again by reading the card back after the write |
 | Profile updates (the feed) | `main` on this repository, fetched over HTTPS from `raw.githubusercontent.com`; the feed's `releaseUrl` must be `https://` or it is rejected |
 | Local-AI engine and weights | SHA-256 pins compiled into `src-tauri/src/needle/manifest.rs`, verified on download; only fetched after you consent |
-| Optional license check | `POST https://api.gumroad.com/v2/licenses/verify` over HTTPS with certificate validation. The body is the public product id and the license key. No API token is compiled in. See [`docs/LICENSING.md`](docs/LICENSING.md) |
+| Optional license check | `POST https://api.gumroad.com/v2/licenses/verify` over HTTPS with certificate validation. The body is the public product id and the license key. No API token is compiled in. Release builds refuse Gumroad test purchases. The call runs off the UI thread. See [`docs/LICENSING.md`](docs/LICENSING.md) |
 
 Because `main` is the profile-feed trust anchor, the repository's branch protection and account security are part of the app's security model, not just project hygiene.
 

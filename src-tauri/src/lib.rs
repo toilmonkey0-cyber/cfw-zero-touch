@@ -2975,17 +2975,44 @@ fn log_license(event: &str, status: &license::LicenseStatus) {
 }
 
 #[tauri::command]
-fn license_status() -> license::LicenseView {
-    let status = with_license(|session| session.status(now_unix()));
-    log_license("license_status", &status);
-    status.to_view(None)
+async fn license_status() -> license::LicenseView {
+    // The Gumroad call is blocking. It runs off the UI thread so a 15s timeout
+    // during launch cannot freeze the window. The command still returns a view
+    // and never a Tauri error, so a panic payload cannot echo the key.
+    match tauri::async_runtime::spawn_blocking(|| {
+        with_license(|session| session.status(now_unix()))
+    })
+    .await
+    {
+        Ok(status) => {
+            log_license("license_status", &status);
+            status.to_view(None)
+        }
+        Err(_) => {
+            let status = license::worker_stopped_status();
+            log_license("license_status", &status);
+            status.to_view(None)
+        }
+    }
 }
 
 #[tauri::command]
-fn activate_license(license_key: String) -> license::LicenseView {
-    let outcome = with_license(|session| session.activate(&license_key, now_unix()));
-    log_license("license_activate", &outcome.stored);
-    outcome.to_view()
+async fn activate_license(license_key: String) -> license::LicenseView {
+    match tauri::async_runtime::spawn_blocking(move || {
+        with_license(|session| session.activate(&license_key, now_unix()))
+    })
+    .await
+    {
+        Ok(outcome) => {
+            log_license("license_activate", &outcome.stored);
+            outcome.to_view()
+        }
+        Err(_) => {
+            let status = license::worker_stopped_status();
+            log_license("license_activate", &status);
+            status.to_view(None)
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

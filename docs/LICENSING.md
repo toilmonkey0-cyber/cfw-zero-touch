@@ -6,9 +6,9 @@ This is not DRM. The verification code ships in the open repository. A person wh
 
 ## What Gumroad is asked
 
-Activation and re-checks are `POST https://api.gumroad.com/v2/licenses/verify` with three form fields: `product_id`, `license_key`, and `increment_uses_count` (`true` or `false`). There is no API token in the app. Gumroad's public verify response is read for `success`, `uses`, and `purchase.refunded`, `purchase.chargebacked`, `purchase.disputed`, and `purchase.product_id`. Other purchase fields, including the echoed license key and the buyer email, are ignored and are not stored.
+Activation and re-checks are `POST https://api.gumroad.com/v2/licenses/verify` with three form fields: `product_id`, `license_key`, and `increment_uses_count` (`true` or `false`). There is no API token in the app. Gumroad's public verify response is read for `success`, `uses`, and `purchase.refunded`, `purchase.chargebacked`, `purchase.disputed`, `purchase.dispute_won`, `purchase.test`, and `purchase.product_id`. Other purchase fields, including the echoed license key and the buyer email, are ignored and are not stored.
 
-`increment_uses_count` is `false` on the first look and on every later re-check. It is `true` only for the second call of a new activation on this computer, after the first call has already shown a usable purchase. A refunded, chargebacked, disputed, unrecognized, or mismatched response never increments. Launching the app does not increment.
+`increment_uses_count` is `false` on the first look and on every later re-check. It is `true` only for the second call of a new activation on this computer, after the first call has already shown a usable purchase. A refunded, chargebacked, still-open dispute, release-build test purchase, unrecognized, or mismatched response never increments. Launching the app does not increment.
 
 The product id is compiled in with `CFW_GUMROAD_PRODUCT_ID`. When that is unset, the binary contains the placeholder `REPLACE_WITH_GUMROAD_PRODUCT_ID` and activation does not call Gumroad. Do not put a seller token in the build.
 
@@ -19,7 +19,8 @@ A key is refused, in plain language and without repeating the key, when:
 - Gumroad reports `success: false` (the key is not recognized).
 - `purchase.refunded` is true.
 - `purchase.chargebacked` is true.
-- `purchase.disputed` is true, including when `dispute_won` is also true. A filed dispute is not a usable key. A response with `disputed: false` and `dispute_won: true` is accepted, because the dispute flag is clear.
+- `purchase.disputed` is true and `purchase.dispute_won` is false. The sale is still in dispute. When both are true, the seller kept the sale and the key is accepted. `disputed: false` with `dispute_won: true` is accepted too. If `disputed` is true and `dispute_won` is missing, the response is unreadable.
+- `purchase.test` is true and this is a release build. Debug builds (`debug_assertions`, including a local `tauri dev` build) accept a test purchase so a Gumroad test key can be tried. The installer is a release build and leaves the key inactive. A missing `test` flag is unreadable, not treated as a real purchase.
 - `purchase.product_id` is not the id this build asked about.
 - The key is not 8 to 128 letters, digits, and hyphens.
 - A required purchase flag is missing. A missing flag is not treated as false.
@@ -34,7 +35,9 @@ The machine material is `/etc/machine-id` on Linux and the Windows `MachineGuid`
 
 On Unix the cache directory is mode `0700` and the file is mode `0600`. On Windows the file lives in the per-user LocalAppData profile. This unit does not add a custom DACL; the profile directory is already private to the user.
 
-For 7 days after a successful check the app does not contact Gumroad. After that, the next launch tries one re-check with `increment_uses_count=false`. A HTTP 200 or a Gumroad `success: false` / refund / chargeback / dispute updates or removes the cache. A timeout, DNS failure, TLS failure, HTTP 5xx, redirect, or a body this app cannot read leaves the cache in place. The same is true after 90 days. The 90 days is only when the wording changes to say the last check was a long time ago. A network failure never turns a saved license off.
+For 7 days after a successful check the app does not contact Gumroad. After that, the next launch tries one re-check with `increment_uses_count=false`. A HTTP 200 or a Gumroad `success: false` / refund / chargeback / open dispute / release-build test purchase updates or removes the cache. A timeout, DNS failure, TLS failure, HTTP 5xx, redirect, or a body this app cannot read leaves the cache in place. The same is true after 90 days. The 90 days is only when the wording changes to say the last check was a long time ago. A network failure never turns a saved license off.
+
+`license_status` and `activate_license` are async commands. The verify call runs on a blocking worker (`spawn_blocking`), so an offline re-check can take the full timeout without freezing the window. Launch does not wait on the network before the rest of the UI can run. A cache younger than 7 days does not open a connection.
 
 A timestamp in the future is treated as due for a re-check. Turning the clock back, or recomputing the HMAC, is the same class of bypass as editing the program.
 
@@ -62,6 +65,6 @@ The license screen is the commercial entitlement for signed builds and support. 
 
 ## Network posture
 
-The verify URL is fixed to `https://api.gumroad.com/v2/licenses/verify`. Any other URL is refused before a request is built. The HTTP client is ureq with the existing `tls` feature (rustls and the webpki root set), certificate validation left on, `https_only`, zero redirects, no proxy from the environment, a 5 second connect timeout, and a 15 second overall timeout. ureq can still let a slow DNS lookup run past that overall timeout; that limitation is in the HTTP library. Redirects are not followed, including a 307 that would otherwise replay a POST.
+The verify URL is fixed to `https://api.gumroad.com/v2/licenses/verify`. Any other URL is refused before a request is built. The HTTP client is ureq with the existing `tls` feature (rustls and the webpki root set), certificate validation left on, `https_only`, zero redirects, no proxy from the environment, a 5 second connect timeout, and a 15 second overall timeout. ureq can still let a slow DNS lookup run past that overall timeout; that limitation is in the HTTP library. Redirects are not followed, including a 307 that would otherwise replay a POST. That wait happens on the blocking pool, not on the UI thread.
 
 License keys are not written to the diagnostics log. Log lines are reason codes (`refunded`, `unreachable`, `active`, and so on). Debug formatting of a verify call prints `****` instead of the key and does not print response bodies. Gumroad's own error text is not shown, because it can echo the key.

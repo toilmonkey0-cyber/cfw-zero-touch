@@ -44,6 +44,8 @@ const MSG_UNRECOGNIZED: &str =
 const MSG_REFUNDED: &str = "This license was refunded, so it can't be used.";
 const MSG_CHARGEBACKED: &str = "This license was charged back, so it can't be used.";
 const MSG_DISPUTED: &str = "This license is in a payment dispute, so it can't be used.";
+const MSG_TEST: &str =
+    "This is a Gumroad test purchase. Release builds leave it inactive. Card tools still work.";
 const MSG_PRODUCT_MISMATCH: &str =
     "Gumroad's response didn't match this app's product, so the license was not accepted.";
 const MSG_MALFORMED: &str =
@@ -102,6 +104,7 @@ pub enum Reason {
     Refunded,
     Chargebacked,
     Disputed,
+    TestPurchase,
     ProductMismatch,
     MalformedKey,
     ProductUnconfigured,
@@ -121,6 +124,7 @@ impl Reason {
             Self::Refunded => "refunded",
             Self::Chargebacked => "chargebacked",
             Self::Disputed => "disputed",
+            Self::TestPurchase => "test_purchase",
             Self::ProductMismatch => "product_mismatch",
             Self::MalformedKey => "malformed_key",
             Self::ProductUnconfigured => "product_unconfigured",
@@ -345,6 +349,8 @@ pub struct Session<T: LicenseTransport> {
     verify_url: String,
     machine_material: String,
     timeout: Duration,
+    /// Release builds refuse `purchase.test`. Debug builds allow it.
+    allow_test_purchases: bool,
 }
 
 impl<T: LicenseTransport> Session<T> {
@@ -355,6 +361,26 @@ impl<T: LicenseTransport> Session<T> {
         machine_material: impl Into<String>,
         timeout: Duration,
     ) -> Self {
+        Self::with_test_purchases(
+            transport,
+            cache_path,
+            product_id,
+            machine_material,
+            timeout,
+            cfg!(debug_assertions),
+        )
+    }
+
+    /// `allow_test_purchases` is `cfg!(debug_assertions)` for a normal session.
+    /// Tests pass `false` to exercise the release refusal.
+    pub fn with_test_purchases(
+        transport: T,
+        cache_path: PathBuf,
+        product_id: impl Into<String>,
+        machine_material: impl Into<String>,
+        timeout: Duration,
+        allow_test_purchases: bool,
+    ) -> Self {
         Self {
             transport,
             cache_path,
@@ -362,6 +388,7 @@ impl<T: LicenseTransport> Session<T> {
             verify_url: VERIFY_URL.to_string(),
             machine_material: machine_material.into(),
             timeout,
+            allow_test_purchases,
         }
     }
 
@@ -497,7 +524,12 @@ impl<T: LicenseTransport> Session<T> {
             return Err(Failure::Unreachable("insecure"));
         }
         match self.transport.verify(&call) {
-            Ok(reply) => interpret(&reply.body, reply.status, &self.product_id),
+            Ok(reply) => interpret(
+                &reply.body,
+                reply.status,
+                &self.product_id,
+                self.allow_test_purchases,
+            ),
             Err(error) => Err(Failure::Unreachable(error.kind)),
         }
     }
@@ -540,6 +572,13 @@ impl<T: LicenseTransport> Session<T> {
         // not trust the previous activation. The replacement has no key.
         let _ = fs::write(&self.cache_path, b"revoked");
     }
+}
+
+/// Status used when the blocking worker itself stops. The text is fixed.
+pub fn worker_stopped_status() -> LicenseStatus {
+    let mut status = inactive(Reason::Unreachable, MSG_OFFLINE);
+    status.network_kind = Some("worker");
+    status
 }
 
 pub fn production_session() -> Session<UreqTransport> {
@@ -661,6 +700,7 @@ fn message_for(reason: Reason) -> &'static str {
         Reason::Refunded => MSG_REFUNDED,
         Reason::Chargebacked => MSG_CHARGEBACKED,
         Reason::Disputed => MSG_DISPUTED,
+        Reason::TestPurchase => MSG_TEST,
         Reason::ProductMismatch => MSG_PRODUCT_MISMATCH,
         Reason::MalformedKey => MSG_MALFORMED,
         Reason::ProductUnconfigured => MSG_NO_PRODUCT,
@@ -718,7 +758,12 @@ fn https_verify_url(url: &str) -> bool {
         && !url.bytes().any(|byte| byte.is_ascii_whitespace())
 }
 
-fn interpret(body: &str, status: u16, expected_product: &str) -> Result<Verified, Failure> {
+fn interpret(
+    body: &str,
+    status: u16,
+    expected_product: &str,
+    allow_test_purchases: bool,
+) -> Result<Verified, Failure> {
     if !(200..300).contains(&status) && !matches!(status, 400 | 404 | 422) {
         return Err(Failure::Unreachable("http"));
     }
@@ -744,6 +789,7 @@ fn interpret(body: &str, status: u16, expected_product: &str) -> Result<Verified
     let refunded = flag(purchase, "refunded")?;
     let chargebacked = flag(purchase, "chargebacked")?;
     let disputed = flag(purchase, "disputed")?;
+    let test_purchase = flag(purchase, "test")?;
     if refunded {
         return Err(Failure::Rejected(Reason::Refunded));
     }
@@ -751,7 +797,14 @@ fn interpret(body: &str, status: u16, expected_product: &str) -> Result<Verified
         return Err(Failure::Rejected(Reason::Chargebacked));
     }
     if disputed {
-        return Err(Failure::Rejected(Reason::Disputed));
+        // A missing `dispute_won` is unreadable. It is not treated as a loss or a win.
+        let won = flag(purchase, "dispute_won")?;
+        if !won {
+            return Err(Failure::Rejected(Reason::Disputed));
+        }
+    }
+    if test_purchase && !allow_test_purchases {
+        return Err(Failure::Rejected(Reason::TestPurchase));
     }
     let uses = value
         .get("uses")
@@ -1150,12 +1203,13 @@ mod tests {
         let dir = scratch();
         let script = Script::new(replies);
         let calls = Arc::clone(&script.calls);
-        let session = Session::new(
+        let session = Session::with_test_purchases(
             script,
             dir.join("license").join("activation.json"),
             product,
             machine,
             REQUEST_TIMEOUT,
+            false,
         );
         Lab {
             session,
@@ -1168,6 +1222,25 @@ mod tests {
         lab_with(MACHINE, PRODUCT, replies)
     }
 
+    fn lab_allowing_test_purchases(replies: Vec<Result<RawReply, TransportError>>) -> Lab {
+        let dir = scratch();
+        let script = Script::new(replies);
+        let calls = Arc::clone(&script.calls);
+        let session = Session::with_test_purchases(
+            script,
+            dir.join("license").join("activation.json"),
+            PRODUCT,
+            MACHINE,
+            REQUEST_TIMEOUT,
+            true,
+        );
+        Lab {
+            session,
+            calls,
+            dir,
+        }
+    }
+
     fn calls_of(lab: &Lab) -> Vec<VerifyCall> {
         lab.calls.lock().expect("calls").clone()
     }
@@ -1178,7 +1251,9 @@ mod tests {
             "refunded.json" => include_str!("../tests/fixtures/gumroad/refunded.json"),
             "chargebacked.json" => include_str!("../tests/fixtures/gumroad/chargebacked.json"),
             "disputed.json" => include_str!("../tests/fixtures/gumroad/disputed.json"),
+            "dispute-open.json" => include_str!("../tests/fixtures/gumroad/dispute-open.json"),
             "dispute-won.json" => include_str!("../tests/fixtures/gumroad/dispute-won.json"),
+            "test-purchase.json" => include_str!("../tests/fixtures/gumroad/test-purchase.json"),
             "unrecognized.json" => include_str!("../tests/fixtures/gumroad/unrecognized.json"),
             other => panic!("unknown fixture {other}"),
         }
@@ -1212,11 +1287,11 @@ mod tests {
     }
 
     #[test]
-    fn refunded_chargebacked_and_disputed_keys_are_rejected() {
+    fn refunded_chargebacked_and_open_disputes_are_rejected() {
         for (name, reason, message) in [
             ("refunded.json", Reason::Refunded, MSG_REFUNDED),
             ("chargebacked.json", Reason::Chargebacked, MSG_CHARGEBACKED),
-            ("disputed.json", Reason::Disputed, MSG_DISPUTED),
+            ("dispute-open.json", Reason::Disputed, MSG_DISPUTED),
         ] {
             let lab = lab(vec![reply_file(name, 200)]);
             let outcome = lab.session.activate(KEY, NOW);
@@ -1232,11 +1307,73 @@ mod tests {
     }
 
     #[test]
-    fn a_dispute_the_seller_won_is_accepted_only_when_disputed_is_false() {
-        let lab = lab(vec![reply_file("dispute-won.json", 200), reply_uses(1)]);
+    fn a_dispute_the_seller_won_is_accepted() {
+        for name in ["disputed.json", "dispute-won.json"] {
+            let lab = lab(vec![reply_file(name, 200), reply_file(name, 200)]);
+            let outcome = lab.session.activate(KEY, NOW);
+            assert_eq!(outcome.stored.state, LicenseState::Active, "{name}");
+            assert!(!outcome.stored.over_soft_limit, "{name}");
+            let calls = calls_of(&lab);
+            assert_eq!(calls.len(), 2, "{name}");
+            assert!(!calls[0].increment_uses_count, "{name}");
+            assert!(calls[1].increment_uses_count, "{name}");
+        }
+
+        let mut open =
+            serde_json::from_str::<serde_json::Value>(recorded("disputed.json")).unwrap();
+        open["purchase"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dispute_won");
+        let lab = lab(vec![Ok(RawReply {
+            status: 200,
+            body: serde_json::to_string(&open).unwrap(),
+        })]);
         let outcome = lab.session.activate(KEY, NOW);
+        assert_eq!(outcome.stored.reason, Reason::Unreadable);
+        assert!(!cache_file(&lab).exists());
+        assert_eq!(calls_of(&lab).len(), 1);
+    }
+
+    #[test]
+    fn release_builds_refuse_gumroad_test_purchases() {
+        let release = lab(vec![reply_file("test-purchase.json", 200)]);
+        let outcome = release.session.activate(KEY, NOW);
+        assert_eq!(outcome.stored.state, LicenseState::Inactive);
+        assert_eq!(outcome.stored.reason, Reason::TestPurchase);
+        assert_eq!(outcome.stored.message, MSG_TEST);
+        assert_secret_free(&outcome.stored.message);
+        assert_secret_free(&outcome.stored.log_detail());
+        assert!(!cache_file(&release).exists());
+        let calls = calls_of(&release);
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].increment_uses_count);
+
+        let mut missing =
+            serde_json::from_str::<serde_json::Value>(recorded("valid.json")).unwrap();
+        missing["purchase"].as_object_mut().unwrap().remove("test");
+        let lab = lab(vec![Ok(RawReply {
+            status: 200,
+            body: serde_json::to_string(&missing).unwrap(),
+        })]);
+        assert_eq!(
+            lab.session.activate(KEY, NOW).stored.reason,
+            Reason::Unreadable
+        );
+
+        let debug = lab_allowing_test_purchases(vec![
+            reply_file("test-purchase.json", 200),
+            reply_file("test-purchase.json", 200),
+        ]);
+        let outcome = debug.session.activate(KEY, NOW);
         assert_eq!(outcome.stored.state, LicenseState::Active);
-        assert!(!outcome.stored.over_soft_limit);
+        assert!(debug.session.allow_test_purchases);
+        let shipped = production_session();
+        assert_eq!(
+            shipped.allow_test_purchases,
+            cfg!(debug_assertions),
+            "release builds compile this flag off"
+        );
     }
 
     #[test]
@@ -1648,7 +1785,7 @@ mod tests {
 
     #[test]
     fn safety_commands_do_not_consult_the_license_module() {
-        let src = include_str!("lib.rs");
+        let src = include_str!("lib.rs").replace("\r\n", "\n");
         for name in [
             "backup_stock_card",
             "cancel_stock_backup",
@@ -1666,12 +1803,104 @@ mod tests {
             "firstboot_state",
             "read_disk_identity",
         ] {
-            let body = command_body(src, name);
+            let body = command_body(&src, name);
             assert!(
                 !body.contains("license::"),
                 "{name} consults the license module"
             );
         }
+        let mut outside = src.clone();
+        for name in [
+            "with_license",
+            "log_license",
+            "license_status",
+            "activate_license",
+        ] {
+            outside = remove_function(&outside, name);
+        }
+        assert!(
+            !outside.contains("license::"),
+            "license:: is referenced outside the license commands:\n{outside}"
+        );
+    }
+
+    fn remove_function(src: &str, name: &str) -> String {
+        let marker = format!("fn {name}");
+        let start = src
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        let open = src[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("{name} has no body"))
+            + start;
+        let bytes = src.as_bytes();
+        let mut depth = 0;
+        let mut end = open;
+        for (index, byte) in bytes.iter().enumerate().skip(open) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = index + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_ne!(end, open, "{name} body did not close");
+        let mut out = String::with_capacity(src.len());
+        out.push_str(&src[..start]);
+        out.push_str(&src[end..]);
+        out
+    }
+
+    #[test]
+    fn license_commands_run_the_network_off_the_calling_thread() {
+        let src = include_str!("lib.rs").replace("\r\n", "\n");
+        for name in ["license_status", "activate_license"] {
+            let marker = format!("fn {name}(");
+            let start = src
+                .find(&marker)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let prefix = &src[start.saturating_sub(6)..start];
+            assert!(
+                prefix.contains("async"),
+                "{name} must be an async command so launch does not block the window"
+            );
+            let body = command_body(&src, name);
+            let pooled = body
+                .find("spawn_blocking")
+                .unwrap_or_else(|| panic!("{name} must use spawn_blocking"));
+            let call = if name == "license_status" {
+                body.find(".status(")
+            } else {
+                body.find(".activate(")
+            }
+            .unwrap_or_else(|| panic!("{name} does not call the session"));
+            assert!(
+                pooled < call,
+                "{name} calls Gumroad on the command task instead of the blocking pool"
+            );
+        }
+
+        let caller = std::thread::current().id();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let handle = tauri::async_runtime::spawn_blocking(move || {
+            let _ = started_tx.send(std::thread::current().id());
+            let _ = release_rx.recv();
+        });
+        let worker = started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocking worker started");
+        assert_ne!(
+            worker, caller,
+            "a re-check on the calling thread would freeze the window for the timeout"
+        );
+        let _ = release_tx.send(());
+        tauri::async_runtime::block_on(handle).expect("blocking worker finished");
     }
 
     fn command_body<'a>(src: &'a str, name: &str) -> &'a str {

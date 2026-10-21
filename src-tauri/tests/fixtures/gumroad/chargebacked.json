@@ -8,6 +8,7 @@
     "refunded": false,
     "disputed": false,
     "dispute_won": false,
-    "chargebacked": true
+    "chargebacked": true,
+    "test": false
   }
 }
