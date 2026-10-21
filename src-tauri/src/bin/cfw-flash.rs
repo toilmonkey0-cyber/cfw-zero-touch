@@ -501,7 +501,10 @@ fn open_drive_read(number: u32) -> Result<File, String> {
     }
 }
 
-/// Serial and the on-card prefix must match the backup. No write handle yet.
+/// Serial, prefix, and sample blocks must match the backup. No write handle yet.
+///
+/// The app may skip its own read when the card cannot be opened without admin.
+/// This check still runs before any lock or write.
 fn live_card_matches(number: u32, disk: &ProbeDisk, backup: &SessionBackup) -> Result<(), String> {
     if probe::normalize_serial(&backup.identity.serial) != probe::normalize_serial(&disk.serial) {
         return Err(probe::ProbeBlock::Backup.message().into());
@@ -511,11 +514,7 @@ fn live_card_matches(number: u32, disk: &ProbeDisk, backup: &SessionBackup) -> R
         file,
         len: disk.size_bytes,
     };
-    match probe::prefix_sha256(&mut device) {
-        Ok(live) if hashes_match(&live, &backup.identity.prefix_sha256) => Ok(()),
-        Ok(_) => Err(probe::ProbeBlock::Backup.message().into()),
-        Err(error) => Err(error.to_string()),
-    }
+    probe::live_identity_matches(&mut device, &backup.identity).map_err(|error| error.to_string())
 }
 
 fn open_drive(number: u32) -> Result<File, String> {
@@ -764,6 +763,7 @@ fn recorded_backup(
         prefix_sha256: prefix.to_string(),
         bytes: stored.bytes,
         model: stored.model.clone(),
+        samples: stored.samples.clone(),
     };
     if !probe::same_identity(&stored, &claimed) {
         return Err(
@@ -1136,6 +1136,7 @@ mod tests {
 
         let mut source = write_card(&tmp.0, "a.img", &card_a);
         let prefix = probe::prefix_sha256(&mut source).unwrap();
+        let samples = probe::sample_block_hashes(&mut source).unwrap();
         let dest = tmp.0.join("a.img.gz");
         let outcome = backup::backup_image(
             &mut source,
@@ -1159,6 +1160,7 @@ mod tests {
             prefix_sha256: prefix,
             bytes,
             model: model.into(),
+            samples,
         };
         probe::write_identity(&image, &identity).unwrap();
         let recorded = recorded_backup(

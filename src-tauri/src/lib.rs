@@ -1246,11 +1246,18 @@ fn backup_stock_card(
                 "backup_done",
                 &format!("disk={disk_number} bytes={bytes}"),
             );
+            let samples = probe::sample_block_hashes(&mut source).map_err(|error| {
+                format!(
+                    "{error} The backup file is {} but this session will not use it for a card test.",
+                    image.display()
+                )
+            })?;
             let identity = probe::CardIdentity {
                 serial,
                 prefix_sha256,
                 bytes,
                 model: info.model.clone(),
+                samples,
             };
             probe::write_identity(&image, &identity).map_err(|error| {
                 format!(
@@ -1890,10 +1897,12 @@ fn list_probe_disks() -> Result<Vec<FlashDiskView>, String> {
 /// Test a removable card for fake capacity. Writes go through `cfw-flash`.
 ///
 /// A backup of this card from the current process, or a blank card, is
-/// required. The backup matches serial and a hash of the card contents, not
-/// only size and model. Opening the card for that check must succeed. The
-/// helper rechecks size, model, bus, system/boot, and card identity after the
-/// approval prompt, and locks volumes before a backup-route write.
+/// required. The backup matches serial, a hash of the first 4 MiB, and the
+/// sample blocks the probe overwrites, not only size and model. If the card
+/// cannot be read without admin, that read is logged and skipped. The helper
+/// still rechecks size, model, bus, system/boot, blank-or-identity, and the
+/// sample blocks after the approval prompt, and locks volumes before a
+/// backup-route write.
 #[tauri::command]
 fn probe_card(
     app: tauri::AppHandle,
@@ -1914,12 +1923,7 @@ fn probe_card(
     let remembered = session_backups()
         .find(live.size_bytes, &live.model)
         .cloned();
-    let serial = if remembered.is_some() {
-        query_disk_serial(disk_number)?
-    } else {
-        String::new()
-    };
-    let probe_disk = probe_disk_from_restore(&live, serial);
+    let probe_disk = probe_disk_from_restore(&live, String::new());
     let plan = probe::ProbePlan {
         confirmation: confirmation.clone(),
         disk_number,
@@ -1947,25 +1951,41 @@ fn probe_card(
             }
             Err(error) => return Err(error.to_string()),
         }
-        let file = open_stock_disk_read_only(disk_number)?;
-        let mut source = backup::ReadOnlyFile::new(file, live.size_bytes);
-        match probe::verify_session_backup(backup, &probe_disk, &mut source, &PROBE_CANCEL) {
-            Ok(()) => {}
-            Err(probe::ProbeError::Failed {
-                overwritten,
-                message,
-            }) if !overwritten
-                && (PROBE_CANCEL.load(Ordering::SeqCst) || message.starts_with("Cancelled.")) =>
-            {
-                return Ok(cancelled_probe_view(live.size_bytes, overwritten, message));
+    }
+
+    match open_stock_disk_read_only(disk_number) {
+        Ok(file) => {
+            let mut source = backup::ReadOnlyFile::new(file, live.size_bytes);
+            if let Some(backup) = &remembered {
+                let serial = query_disk_serial(disk_number)?;
+                let probe_disk = probe_disk_from_restore(&live, serial);
+                match probe::verify_session_backup(backup, &probe_disk, &mut source, &PROBE_CANCEL)
+                {
+                    Ok(()) => {}
+                    Err(probe::ProbeError::Failed {
+                        overwritten,
+                        message,
+                    }) if !overwritten
+                        && (PROBE_CANCEL.load(Ordering::SeqCst)
+                            || message.starts_with("Cancelled.")) =>
+                    {
+                        return Ok(cancelled_probe_view(live.size_bytes, overwritten, message));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            } else if !probe::card_is_blank(&mut source).map_err(|error| error.to_string())? {
+                return Err(probe::ProbeBlock::NotBlank.message().into());
             }
-            Err(error) => return Err(error.to_string()),
         }
-    } else {
-        let file = open_stock_disk_read_only(disk_number)?;
-        let mut source = backup::ReadOnlyFile::new(file, live.size_bytes);
-        if !probe::card_is_blank(&mut source).map_err(|error| error.to_string())? {
-            return Err(probe::ProbeBlock::NotBlank.message().into());
+        Err(error) => {
+            let probe::AppPrecheck::Deferred { note } = probe::app_precheck(Some(&error)) else {
+                return Err(error);
+            };
+            diag::log(
+                "WARN",
+                "probe_precheck_skipped",
+                &format!("disk={disk_number} {note}"),
+            );
         }
     }
 

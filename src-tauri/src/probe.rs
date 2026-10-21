@@ -146,18 +146,29 @@ pub enum ProbeStatus {
     Cancelled { overwritten: bool, summary: String },
 }
 
+/// sha256 of one 512-byte block the probe will overwrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleHash {
+    pub offset: u64,
+    pub sha256: String,
+}
+
 /// Identity captured when this process backed the card up.
 ///
 /// `bytes` and `model` are the disk at backup time. `prefix_sha256` is the
-/// first [`PREFIX_IDENTITY_BYTES`] of that card. `serial` is Windows
-/// `UniqueId`, or `SerialNumber` when UniqueId is empty. An empty serial means
-/// the disk did not report one.
+/// first [`PREFIX_IDENTITY_BYTES`] of that card. `samples` are the blocks at
+/// [`sample_offsets`] for that size, which are the blocks the probe overwrites.
+/// `serial` is Windows `UniqueId`, or `SerialNumber` when UniqueId is empty.
+/// An empty serial means the disk did not report one. USB readers often report
+/// their own serial, so the sample hashes distinguish two cards that share a
+/// reader and the same first 4 MiB.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardIdentity {
     pub serial: String,
     pub prefix_sha256: String,
     pub bytes: u64,
     pub model: String,
+    pub samples: Vec<SampleHash>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,7 +491,8 @@ fn cancelled(overwritten: bool, backed_up: bool) -> ProbeStatus {
 }
 
 /// The recorded backup must be this card: size, model, serial, prefix hash,
-/// gzip prefix, and sidecar. Size and model alone are not accepted.
+/// sample-block hashes, gzip bytes, and sidecar. Size and model alone are
+/// not accepted.
 pub fn verify_session_backup(
     backup: &SessionBackup,
     disk: &ProbeDisk,
@@ -513,10 +525,14 @@ pub fn verify_session_backup(
     if !restore::hashes_match(&image_prefix, &stored.prefix_sha256) {
         return Err(ProbeError::Blocked(ProbeBlock::Backup));
     }
-    let live_prefix = prefix_sha256(device)?;
-    if !restore::hashes_match(&live_prefix, &stored.prefix_sha256) {
+    let image_samples = match gzip_sample_hashes(&backup.image, stored.bytes) {
+        Ok(samples) => samples,
+        Err(_) => return Err(ProbeError::Blocked(ProbeBlock::Backup)),
+    };
+    if !samples_match(&stored.samples, &image_samples) {
         return Err(ProbeError::Blocked(ProbeBlock::Backup));
     }
+    live_identity_matches(device, &stored)?;
     let inspected = match restore::inspect_backup(&backup.image, cancel, |_| {}) {
         Ok(inspected) => inspected,
         Err(RestoreError::Cancelled { .. }) => {
@@ -762,9 +778,61 @@ pub fn normalize_serial(serial: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Prefix and serial only. Sample hashes stay in the identity file. The helper
+/// compares those to the gzip backup and to the live card, so the CLI does not
+/// carry them and an edited identity file cannot point at another card.
 pub fn same_identity(recorded: &CardIdentity, other: &CardIdentity) -> bool {
     restore::hashes_match(&recorded.prefix_sha256, &other.prefix_sha256)
         && normalize_serial(&recorded.serial) == normalize_serial(&other.serial)
+}
+
+/// What the app does with its own blank or identity read, before elevation.
+///
+/// [`AppPrecheck::Deferred`] skips only that read. The elevated helper still
+/// checks a blank card, or serial, prefix, and sample blocks, before it writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppPrecheck {
+    /// The card opened. A blank or identity failure still refuses the probe.
+    Enforce,
+    /// The card could not be read. Log `note` and let the helper be the gate.
+    Deferred { note: String },
+}
+
+/// `None` means the card opened. `Some` is the open error.
+pub fn app_precheck(open_error: Option<&str>) -> AppPrecheck {
+    match open_error {
+        None => AppPrecheck::Enforce,
+        Some(error) => AppPrecheck::Deferred {
+            note: unreadable_card_note(error),
+        },
+    }
+}
+
+pub fn unreadable_card_note(error: &str) -> String {
+    let error = sanitize_precheck_error(error);
+    format!(
+        "The card could not be read without admin ({error}). Skipping the app-side blank and identity check. The elevated helper will check the card before it writes."
+    )
+}
+
+/// Drop sentences that would claim the card was left untouched. The helper may
+/// still write after this note is logged.
+fn sanitize_precheck_error(error: &str) -> String {
+    let mut text = one_line(error);
+    for claim in [
+        "Nothing on the card was overwritten.",
+        "Nothing on the card was overwritten",
+        "The card was not written.",
+        "The card was not written",
+    ] {
+        text = text.replace(claim, "");
+    }
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        "the disk could not be opened".into()
+    } else {
+        text
+    }
 }
 
 /// `Get-Disk` UniqueId, then SerialNumber. Does not open the disk.
@@ -835,6 +903,120 @@ pub fn gzip_prefix_sha256(path: &Path, card_bytes: u64) -> Result<String, ProbeE
     Ok(hex_hash(hasher.finalize()))
 }
 
+/// Hash each block [`sample_offsets`] will overwrite on this card.
+pub fn sample_block_hashes(
+    device: &mut dyn FakeBlockDevice,
+) -> Result<Vec<SampleHash>, ProbeError> {
+    let offsets = sample_offsets(device.reported_len());
+    hash_blocks_at(device, &offsets)
+}
+
+fn hash_blocks_at(
+    device: &mut dyn FakeBlockDevice,
+    offsets: &[u64],
+) -> Result<Vec<SampleHash>, ProbeError> {
+    let mut block = vec![0u8; PROBE_BLOCK as usize];
+    let mut samples = Vec::with_capacity(offsets.len());
+    for offset in offsets {
+        device.read_at(*offset, &mut block).map_err(|error| {
+            fail(
+                false,
+                format!("could not read the card sample at {offset}: {error}"),
+            )
+        })?;
+        samples.push(SampleHash {
+            offset: *offset,
+            sha256: hash_block(&block),
+        });
+    }
+    Ok(samples)
+}
+
+/// Prefix and sample blocks on `device` must match the identity.
+pub fn live_identity_matches(
+    device: &mut dyn FakeBlockDevice,
+    identity: &CardIdentity,
+) -> Result<(), ProbeError> {
+    let live_prefix = prefix_sha256(device)?;
+    if !restore::hashes_match(&live_prefix, &identity.prefix_sha256) {
+        return Err(ProbeError::Blocked(ProbeBlock::Backup));
+    }
+    let live_samples = sample_block_hashes(device)?;
+    if !samples_match(&identity.samples, &live_samples) {
+        return Err(ProbeError::Blocked(ProbeBlock::Backup));
+    }
+    Ok(())
+}
+
+/// Sample hashes of the gzip image. One pass, in offset order.
+pub fn gzip_sample_hashes(path: &Path, card_bytes: u64) -> Result<Vec<SampleHash>, ProbeError> {
+    if is_physical_disk_path(path) {
+        return Err(fail(
+            false,
+            "refusing to read a backup from a physical disk path",
+        ));
+    }
+    let offsets = sample_offsets(card_bytes);
+    let file = File::open(path)
+        .map_err(|error| fail(false, format!("could not open {}: {error}", path.display())))?;
+    if offsets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut decoder = GzDecoder::new(file);
+    let mut pos = 0u64;
+    let mut skip = vec![0u8; 64 * 1024];
+    let mut block = vec![0u8; PROBE_BLOCK as usize];
+    let mut samples = Vec::with_capacity(offsets.len());
+    for offset in offsets {
+        if offset < pos {
+            return Err(fail(false, "sample offsets are out of order"));
+        }
+        while pos < offset {
+            let n = ((offset - pos) as usize).min(skip.len());
+            decoder.read_exact(&mut skip[..n]).map_err(|error| {
+                fail(
+                    false,
+                    format!("could not read the backup sample blocks: {error}"),
+                )
+            })?;
+            pos += n as u64;
+        }
+        decoder.read_exact(&mut block).map_err(|error| {
+            fail(
+                false,
+                format!("could not read the backup sample at {offset}: {error}"),
+            )
+        })?;
+        pos += PROBE_BLOCK;
+        samples.push(SampleHash {
+            offset,
+            sha256: hash_block(&block),
+        });
+    }
+    Ok(samples)
+}
+
+fn hash_block(block: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(block);
+    hex_hash(hasher.finalize())
+}
+
+pub fn samples_match(recorded: &[SampleHash], other: &[SampleHash]) -> bool {
+    recorded.len() == other.len()
+        && recorded.iter().zip(other).all(|(left, right)| {
+            left.offset == right.offset && restore::hashes_match(&left.sha256, &right.sha256)
+        })
+}
+
+fn samples_cover(bytes: u64, samples: &[SampleHash]) -> bool {
+    let expected = sample_offsets(bytes);
+    samples.len() == expected.len()
+        && samples.iter().zip(&expected).all(|(sample, offset)| {
+            sample.offset == *offset && restore::is_sha256_hex(&sample.sha256)
+        })
+}
+
 pub fn identity_path(image: &Path) -> PathBuf {
     let mut name = image.file_name().unwrap_or_default().to_os_string();
     name.push(".identity");
@@ -849,13 +1031,25 @@ pub fn write_identity(image: &Path, identity: &CardIdentity) -> Result<(), Strin
     if !restore::is_sha256_hex(&identity.prefix_sha256) {
         return Err("card identity prefix is not a sha256".into());
     }
+    if !samples_cover(identity.bytes, &identity.samples) {
+        return Err(
+            "card identity sample hashes do not cover the blocks this probe overwrites".into(),
+        );
+    }
     let serial = normalize_serial(&identity.serial);
     let model = one_line(&identity.model);
-    let body = format!(
+    let mut body = format!(
         "prefix-sha256={}\nserial={serial}\nbytes={}\nmodel={model}\n",
         identity.prefix_sha256.trim().to_ascii_lowercase(),
         identity.bytes,
     );
+    for sample in &identity.samples {
+        body.push_str(&format!(
+            "sample-sha256={}:{}\n",
+            sample.offset,
+            sample.sha256.trim().to_ascii_lowercase(),
+        ));
+    }
     restore::write_new_nofollow(&path, body.as_bytes())
         .map_err(|error| format!("could not write card identity: {error}"))
 }
@@ -875,6 +1069,7 @@ pub fn parse_identity(text: &str) -> Result<CardIdentity, String> {
     let mut serial = None;
     let mut bytes = None;
     let mut model = None;
+    let mut samples = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -893,6 +1088,8 @@ pub fn parse_identity(text: &str) -> Result<CardIdentity, String> {
             );
         } else if let Some(value) = line.strip_prefix("model=") {
             model = Some(one_line(value));
+        } else if let Some(value) = line.strip_prefix("sample-sha256=") {
+            samples.push(parse_sample_hash(value).map_err(|error| format!("{error} in {line}"))?);
         } else {
             return Err(format!("bad card identity line {line}"));
         }
@@ -901,12 +1098,35 @@ pub fn parse_identity(text: &str) -> Result<CardIdentity, String> {
     if !restore::is_sha256_hex(&prefix) {
         return Err("card identity prefix is not a sha256".into());
     }
+    let bytes = bytes.ok_or("card identity is missing bytes")?;
+    if !samples_cover(bytes, &samples) {
+        if samples.is_empty() {
+            return Err("card identity is missing sample-sha256".into());
+        }
+        return Err(
+            "card identity sample hashes do not cover the blocks this probe overwrites".into(),
+        );
+    }
     Ok(CardIdentity {
         prefix_sha256: prefix,
         serial: serial.unwrap_or_default(),
-        bytes: bytes.ok_or("card identity is missing bytes")?,
+        bytes,
         model: model.ok_or("card identity is missing model")?,
+        samples,
     })
+}
+
+fn parse_sample_hash(value: &str) -> Result<SampleHash, String> {
+    let (offset, hash) = value.split_once(':').ok_or("bad card identity sample")?;
+    let offset = offset
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "bad card identity sample offset")?;
+    let sha256 = hash.trim().to_ascii_lowercase();
+    if !restore::is_sha256_hex(&sha256) {
+        return Err("card identity sample is not a sha256".into());
+    }
+    Ok(SampleHash { offset, sha256 })
 }
 
 fn one_line(text: &str) -> String {

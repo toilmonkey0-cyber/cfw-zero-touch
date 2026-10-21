@@ -6,11 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use cfw_zero_touch_lib::backup::{backup_image, BackupOutcome};
 use cfw_zero_touch_lib::block_device::{is_physical_disk_path, FakeBlockDevice, FileBlockDevice};
 use cfw_zero_touch_lib::probe::{
-    authorize_probe, cancel_summary, card_is_blank, format_failed_log, format_probe_log,
-    helper_launch_command, interpret_helper_log, overwritten_flag, parse_probe_log, plain_summary,
-    prefix_sha256, run_probe, sample_offsets, write_identity, BackupSession, CardIdentity,
-    CardKind, HelperFollowup, ProbeBlock, ProbeDisk, ProbeError, ProbePlan, ProbeReport,
-    ProbeRequest, ProbeStatus, SessionBackup, PROBE_BLOCK,
+    app_precheck, authorize_probe, cancel_summary, card_is_blank, format_failed_log,
+    format_probe_log, helper_launch_command, identity_path, interpret_helper_log,
+    live_identity_matches, load_identity, overwritten_flag, parse_probe_log, plain_summary,
+    prefix_sha256, run_probe, sample_block_hashes, sample_offsets, write_identity, AppPrecheck,
+    BackupSession, CardIdentity, CardKind, HelperFollowup, ProbeBlock, ProbeDisk, ProbeError,
+    ProbePlan, ProbeReport, ProbeRequest, ProbeStatus, SessionBackup, PREFIX_IDENTITY_BYTES,
+    PROBE_BLOCK,
 };
 use cfw_zero_touch_lib::restore::signal_cancel_file;
 
@@ -183,6 +185,7 @@ fn finished_backup(dir: &Path, bytes: &[u8], model: &str) -> SessionBackup {
     drop(device);
     let mut source = FileBlockDevice::open_read_only(&image_path).unwrap();
     let prefix = prefix_sha256(&mut source).expect("fixture prefix");
+    let samples = sample_block_hashes(&mut source).expect("fixture samples");
     let dest = dir.join("stock.img.gz");
     let outcome = backup_image(
         &mut source,
@@ -204,6 +207,7 @@ fn finished_backup(dir: &Path, bytes: &[u8], model: &str) -> SessionBackup {
                 prefix_sha256: prefix,
                 bytes: size,
                 model: model.into(),
+                samples,
             };
             write_identity(&image, &identity).expect("fixture identity");
             SessionBackup {
@@ -531,6 +535,7 @@ fn physical_backup_paths_are_refused_before_the_card_is_written() {
             prefix_sha256: "ab".repeat(32),
             bytes: genuine.reported_len,
             model: "Stock R36S".into(),
+            samples: Vec::new(),
         },
     };
     let error = run_on(&mut device, &card, Some(&backup), &AtomicBool::new(false)).unwrap_err();
@@ -842,6 +847,109 @@ fn a_backup_of_a_different_card_with_the_same_model_and_size_is_refused() {
         "editing the identity file cannot retarget a backup to another card"
     );
     assert_eq!(forged_device.writes, 0);
+}
+
+#[test]
+fn two_cards_with_the_same_first_4_mib_but_different_sample_blocks_are_refused() {
+    let scratch = Scratch::new("probe-sample-identity");
+    let size: u64 = 8 * 1024 * 1024;
+    let model = "Generic SD";
+    let sample_at: u64 = 4 * 1024 * 1024;
+    assert!(sample_at >= PREFIX_IDENTITY_BYTES);
+    assert!(sample_offsets(size).contains(&sample_at));
+
+    let mut card_a = vec![0u8; size as usize];
+    card_a[100] = 0x11;
+    let mut card_b = card_a.clone();
+    card_b[sample_at as usize] = 0xAB;
+
+    let mut device_a =
+        FileBlockDevice::create(&scratch.path().join("hash-a.img"), size, size).unwrap();
+    device_a.write_at(0, &card_a).unwrap();
+    let mut device_b =
+        FileBlockDevice::create(&scratch.path().join("hash-b.img"), size, size).unwrap();
+    device_b.write_at(0, &card_b).unwrap();
+    let prefix_a = prefix_sha256(&mut device_a).unwrap();
+    let prefix_b = prefix_sha256(&mut device_b).unwrap();
+    assert_eq!(prefix_a, prefix_b, "the first 4 MiB match");
+    let samples_a = sample_block_hashes(&mut device_a).unwrap();
+    let samples_b = sample_block_hashes(&mut device_b).unwrap();
+    assert_ne!(samples_a, samples_b);
+    assert!(samples_a.iter().zip(&samples_b).any(|(left, right)| {
+        left.offset == right.offset
+            && left.offset >= PREFIX_IDENTITY_BYTES
+            && left.sha256 != right.sha256
+    }));
+
+    let backup = finished_backup(scratch.path(), &card_a, model);
+    let recorded = load_identity(&backup.image).unwrap();
+    assert_eq!(recorded.samples, samples_a);
+    assert!(std::fs::read_to_string(identity_path(&backup.image))
+        .unwrap()
+        .contains(&format!("sample-sha256={sample_at}:")));
+
+    let mut card = disk(2, "USB", size, false, model);
+    card.serial = FIXTURE_SERIAL.into();
+
+    let same = open_fixture(&scratch, &card_a, size);
+    let mut same = CountWrites {
+        inner: same,
+        writes: 0,
+    };
+    assert!(live_identity_matches(&mut same, &backup.identity).is_ok());
+    let status = run_on(&mut same, &card, Some(&backup), &AtomicBool::new(false)).unwrap();
+    assert!(matches!(status, ProbeStatus::Finished(_)));
+    assert!(same.writes > 0);
+
+    let other = open_fixture(&scratch, &card_b, size);
+    let before = std::fs::read(other.path()).unwrap();
+    let mut other = CountWrites {
+        inner: other,
+        writes: 0,
+    };
+    let mismatch = live_identity_matches(&mut other, &backup.identity).unwrap_err();
+    assert!(matches!(mismatch, ProbeError::Blocked(ProbeBlock::Backup)));
+    let error = run_on(&mut other, &card, Some(&backup), &AtomicBool::new(false)).unwrap_err();
+    assert!(matches!(error, ProbeError::Blocked(ProbeBlock::Backup)));
+    assert_eq!(other.writes, 0);
+    assert_eq!(std::fs::read(other.inner.path()).unwrap(), before);
+
+    let mut forged_identity = load_identity(&backup.image).unwrap();
+    forged_identity.samples = samples_b;
+    let identity_file = identity_path(&backup.image);
+    std::fs::remove_file(&identity_file).unwrap();
+    write_identity(&backup.image, &forged_identity).unwrap();
+    let mut forged = backup.clone();
+    forged.identity = forged_identity;
+    let other = open_fixture(&scratch, &card_b, size);
+    let before = std::fs::read(other.path()).unwrap();
+    let mut other = CountWrites {
+        inner: other,
+        writes: 0,
+    };
+    let error = run_on(&mut other, &card, Some(&forged), &AtomicBool::new(false)).unwrap_err();
+    assert!(
+        matches!(error, ProbeError::Blocked(ProbeBlock::Backup)),
+        "editing the sample hashes cannot retarget a backup to another card"
+    );
+    assert_eq!(other.writes, 0);
+    assert_eq!(std::fs::read(other.inner.path()).unwrap(), before);
+}
+
+#[test]
+fn an_unreadable_card_defers_the_app_precheck_to_the_elevated_helper() {
+    assert_eq!(app_precheck(None), AppPrecheck::Enforce);
+    let error = "could not open disk 2 read-only (Access is denied. (os error 5)). If Windows refused access, run Card Studio as administrator and try again. The card was not written.";
+    let AppPrecheck::Deferred { note } = app_precheck(Some(error)) else {
+        panic!("an open failure must not block elevation");
+    };
+    assert!(note.contains("without admin"));
+    assert!(note.contains("elevated helper"));
+    assert!(note.contains("before it writes"));
+    assert!(note.contains("Access is denied"));
+    assert!(!note.contains("was not written"));
+    assert!(!note.contains("Nothing on the card was overwritten"));
+    assert!(!note.contains("The card was not written"));
 }
 
 #[test]
