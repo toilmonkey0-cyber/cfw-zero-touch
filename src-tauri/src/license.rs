@@ -60,7 +60,7 @@ const MSG_UNREADABLE: &str =
 const MSG_STORE: &str =
     "The license checked out, but it could not be saved on this computer. Try again.";
 const MSG_NEEDS_LICENSE: &str = "Signed builds and support need a license. Backup, restore, card tests, and disk safeguards stay available.";
-const MSG_DEACTIVATED: &str = "This computer is no longer activated. Enter the license key from your Gumroad receipt to use signed builds and support again. Card tools still work.";
+const MSG_DEACTIVATED: &str = "This computer is no longer activated. This doesn't free up one of the 3 computers on Gumroad. Enter the license key from your Gumroad receipt to use signed builds and support again. Card tools still work.";
 const MSG_UNKNOWN_FEATURE: &str = "That feature is not available.";
 const MSG_SAFETY_OPEN: &str =
     "This does not need a license. Backup, restore, card tests, and disk safeguards stay available.";
@@ -2225,6 +2225,9 @@ mod tests {
         let status = lab.session.deactivate();
         assert_eq!(status.state, LicenseState::Inactive);
         assert!(status.message.contains("no longer activated"));
+        assert!(status
+            .message
+            .contains("doesn't free up one of the 3 computers on Gumroad"));
         assert_secret_free(&status.message);
         assert!(!cache_file(&lab).exists());
         assert_eq!(calls_of(&lab).len(), before);

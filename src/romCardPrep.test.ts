@@ -1,5 +1,45 @@
 import { describe, expect, it } from "vitest";
-import { runFreeRomCardPrep, type Invoke } from "./romCardPrep";
+import { copyPreparedRoms, planRomCopy, prepareAndSeed, type Invoke, type RomVolume } from "./romCardPrep";
+
+async function runFreeRomCardPrep(
+  invoke: Invoke,
+  input: {
+    profileId: string;
+    volumeId: string;
+    confirmation: string;
+    displayedBytes: number;
+    library: string;
+    include: string[];
+  },
+) {
+  const volumes = await invoke<RomVolume[]>("list_volumes", { profileId: input.profileId });
+  const volume = volumes.find((item) => item.id === input.volumeId);
+  if (!volume) {
+    throw new Error("That card is not available.");
+  }
+  if (volume.decision === "rejected") {
+    throw new Error(volume.reason || "That card cannot be prepared.");
+  }
+  const prepared = await prepareAndSeed(invoke, {
+    profileId: input.profileId,
+    volume,
+    confirmation: input.confirmation,
+    displayedBytes: input.displayedBytes,
+  });
+  const plan = await planRomCopy<{ copyCount: number }>(invoke, {
+    profileId: input.profileId,
+    volumeId: volume.id,
+    library: input.library,
+    include: input.include,
+  });
+  const report = await copyPreparedRoms(invoke, {
+    profileId: input.profileId,
+    volumeId: volume.id,
+    library: input.library,
+    include: input.include,
+  });
+  return { folders: prepared.folders, plan, report };
+}
 
 const ready = {
   id: "E:",

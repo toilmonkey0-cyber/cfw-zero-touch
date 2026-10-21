@@ -1,3 +1,25 @@
+import type { PaidFeature } from "./entitlements";
+
+type PaidFeatureButtonsProps = {
+  cardTaskRunning: boolean;
+  licenseBusy: boolean;
+  onPaid: (feature: PaidFeature) => void;
+};
+
+export function PaidFeatureButtons(props: PaidFeatureButtonsProps) {
+  const disabled = props.cardTaskRunning || props.licenseBusy;
+  return (
+    <>
+      <button type="button" disabled={disabled} onClick={() => props.onPaid("signed-updates")}>
+        Signed builds
+      </button>
+      <button type="button" disabled={disabled} onClick={() => props.onPaid("support")}>
+        Support
+      </button>
+    </>
+  );
+}
+
 type UnlockProps = {
   featureLabel: string;
   draft: string;

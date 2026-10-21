@@ -91,7 +91,7 @@ const tooMany: LicenseView = {
 const deactivated: LicenseView = {
   ...inactive,
   message:
-    "This computer is no longer activated. Enter the license key from your Gumroad receipt to use signed builds and support again. Card tools still work.",
+    "This computer is no longer activated. This doesn't free up one of the 3 computers on Gumroad. Enter the license key from your Gumroad receipt to use signed builds and support again. Card tools still work.",
 };
 
 function closedPaid(feature: "signed-updates" | "support"): LicenseUiState {
@@ -200,7 +200,31 @@ describe("unlock dialog", () => {
     });
     expect(next.dialog).toBe("unlock");
     expect(next.notice).not.toContain(key);
+    expect(next.view).toBeNull();
     expect(next.unlockedPanel).toBeNull();
+  });
+
+  it("keeps the current license when activation errors and shows the error only as a notice", async () => {
+    const saved = reduceLicense(applyStatus(initialLicenseUi(), active), {
+      type: "paid-result",
+      feature: "support",
+      open: true,
+      message: active.message,
+    });
+    const typing = { ...saved, dialog: "unlock" as const, draftKey: "NEW-KEY-0001", busy: true };
+    const next = await submitLicenseKey(typing, {
+      activate: async () => {
+        throw new Error("Couldn't reach the license check.");
+      },
+    });
+    expect(next.view).toEqual(active);
+    expect(next.unlockedPanel).toBe("support");
+    expect(next.dialog).toBe("unlock");
+    expect(next.pending).toBe("support");
+    expect(next.draftKey).toBe("NEW-KEY-0001");
+    expect(next.notice).toBe("Couldn't reach the license check.");
+    expect(next.busy).toBe(false);
+    expect(next.view?.state).toBe("active");
   });
 });
 
@@ -215,6 +239,7 @@ describe("view and deactivate", () => {
     expect(next.view?.state).toBe("inactive");
     expect(next.unlockedPanel).toBeNull();
     expect(next.notice).toContain("no longer activated");
+    expect(next.notice).toContain("doesn't free up one of the 3 computers on Gumroad");
     expect(next.view?.signedUpdates).toBe(false);
   });
 

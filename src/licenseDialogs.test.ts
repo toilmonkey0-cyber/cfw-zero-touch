@@ -1,7 +1,7 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { LicenseManager, UnlockDialog } from "./LicenseDialogs";
+import { LicenseManager, PaidFeatureButtons, UnlockDialog } from "./LicenseDialogs";
 
 describe("Enter key dialog", () => {
   it("renders the unlock dialog with a refunded result and the key field", () => {
@@ -55,5 +55,48 @@ describe("Enter key dialog", () => {
     );
     expect(html).toContain("Enter key");
     expect(html).not.toContain("Deactivate this computer");
+  });
+});
+
+describe("paid feature buttons", () => {
+  it("disables Signed builds and Support while a card task is running", () => {
+    const html = renderToStaticMarkup(
+      createElement(PaidFeatureButtons, {
+        cardTaskRunning: true,
+        licenseBusy: false,
+        onPaid: () => undefined,
+      }),
+    );
+    const buttons = html.match(/<button\b[^>]*>/g) ?? [];
+    expect(buttons).toHaveLength(2);
+    expect(buttons.every((tag) => tag.includes("disabled"))).toBe(true);
+    expect(html).toContain("Signed builds");
+    expect(html).toContain("Support");
+  });
+
+  it("leaves Signed builds and Support available when no card task is running", () => {
+    const html = renderToStaticMarkup(
+      createElement(PaidFeatureButtons, {
+        cardTaskRunning: false,
+        licenseBusy: false,
+        onPaid: () => undefined,
+      }),
+    );
+    const buttons = html.match(/<button\b[^>]*>/g) ?? [];
+    expect(buttons).toHaveLength(2);
+    expect(buttons.some((tag) => tag.includes("disabled"))).toBe(false);
+  });
+
+  it("disables Signed builds and Support while a license check is in progress", () => {
+    const html = renderToStaticMarkup(
+      createElement(PaidFeatureButtons, {
+        cardTaskRunning: false,
+        licenseBusy: true,
+        onPaid: () => undefined,
+      }),
+    );
+    const buttons = html.match(/<button\b[^>]*>/g) ?? [];
+    expect(buttons).toHaveLength(2);
+    expect(buttons.every((tag) => tag.includes("disabled"))).toBe(true);
   });
 });

@@ -197,20 +197,7 @@ export async function submitLicenseKey(
     return reduceLicense(state, { type: "activated", view });
   } catch (cause) {
     const message = statusText(cause instanceof Error ? cause.message : String(cause), state.draftKey);
-    return reduceLicense(state, {
-      type: "activated",
-      view: {
-        state: "inactive",
-        reason: "unreachable",
-        message,
-        uses: null,
-        overSoftLimit: false,
-        stale: false,
-        signedUpdates: false,
-        support: false,
-        safetyOpen: true,
-      },
-    });
+    return { ...state, busy: false, notice: message };
   }
 }
 

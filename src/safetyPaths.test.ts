@@ -1,5 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { runSafetyPaths, type SafetyInvoke } from "./safetyPaths";
+import { invokeSafety, type SafetyInvoke } from "./safetyPaths";
+
+async function runSafetyPaths(invoke: SafetyInvoke) {
+  let diskZero = "";
+  try {
+    await invokeSafety(invoke, "read_disk_identity", { diskNumber: 0 });
+  } catch (cause) {
+    diskZero = cause instanceof Error ? cause.message : String(cause);
+  }
+  const identity = await invokeSafety<{
+    serial: string;
+    partitionTableId: string;
+    sizeBytes: number;
+  }>(invoke, "read_disk_identity", { diskNumber: 2 });
+  const probe = await invokeSafety<{ overwritten: boolean; kind: string; summary: string }>(
+    invoke,
+    "probe_card",
+    { diskNumber: 2 },
+  );
+  const backup = await invokeSafety<{ status: string; image: string }>(invoke, "backup_stock_card", {
+    diskNumber: 2,
+  });
+  return { diskZero, identity, probe, backup };
+}
 
 describe("safety paths with no license", () => {
   it("runs identity, probe, overwritten reporting, and backup without waiting on a license", async () => {

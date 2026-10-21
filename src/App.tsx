@@ -13,7 +13,7 @@ import {
 import { formatBytes } from "./formatBytes";
 import { GuidedWizard } from "./GuidedWizard";
 import { fullConfirmPrompt, fullProgressLabel } from "./fullCheckPath";
-import { LicenseManager, UnlockDialog } from "./LicenseDialogs";
+import { LicenseManager, PaidFeatureButtons, UnlockDialog } from "./LicenseDialogs";
 import {
   deactivateThisComputer,
   initialLicenseUi,
@@ -1108,12 +1108,11 @@ export default function App() {
             <button type="button" onClick={() => dispatchLicense({ type: "manage" })}>
               View license
             </button>
-            <button type="button" disabled={licenseUi.busy} onClick={() => void onPaid("signed-updates")}>
-              Signed builds
-            </button>
-            <button type="button" disabled={licenseUi.busy} onClick={() => void onPaid("support")}>
-              Support
-            </button>
+            <PaidFeatureButtons
+              cardTaskRunning={busy}
+              licenseBusy={licenseUi.busy}
+              onPaid={(feature) => void onPaid(feature)}
+            />
           </div>
           {licenseUi.unlockedPanel ? (
             <p>{paidPanelCopy(licenseUi.unlockedPanel, licenseUi.view)}</p>

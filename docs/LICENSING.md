@@ -82,7 +82,7 @@ Paid. Choosing one with no key opens the Enter key dialog:
 - Signed builds
 - Support
 
-A valid key unlocks those two on this computer. A refunded, charged-back, or unrecognized key leaves them locked and shows the reason in plain language. More than 3 computers still unlocks, with a warning. After one activation, a failed re-check (offline) stays unlocked. Deactivate this computer from View license; that deletes the saved activation and does not call Gumroad. Card tools keep working.
+A valid key unlocks those two on this computer. A refunded, charged-back, or unrecognized key leaves them locked and shows the reason in plain language. More than 3 computers still unlocks, with a warning. After one activation, a failed re-check (offline) stays unlocked. Deactivate this computer from View license; that deletes the saved activation and does not call Gumroad. This doesn't free up one of the 3 computers on Gumroad. Card tools keep working.
 
 `paid_feature` is the command entry for signed builds and support. A safety name returns before any license session is opened, so the check cannot slow those paths. Disk writes are not hooked.
 
