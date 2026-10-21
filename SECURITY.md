@@ -24,6 +24,7 @@ The app performs privileged or network-touching work, and each kind has its own 
 | Profile updates (the feed) | `main` on this repository, fetched over HTTPS from `raw.githubusercontent.com`; the feed's `releaseUrl` must be `https://` or it is rejected |
 | Local-AI engine and weights | SHA-256 pins compiled into `src-tauri/src/needle/manifest.rs`, verified on download; only fetched after you consent |
 | Optional license check | `POST https://api.gumroad.com/v2/licenses/verify` over HTTPS with certificate validation. The body is the public product id and the license key. No API token is compiled in. Release builds refuse Gumroad test purchases. The call runs off the UI thread. See [`docs/LICENSING.md`](docs/LICENSING.md) |
+| Windows installers | A `v*` tag builds them in GitHub Actions and attaches them to a draft release. You publish the draft. Code signing stays off until `SIGNING_ENABLED` is exactly `true`. Signing material is stored as secrets on the `release` environment. See [`docs/RELEASING.md`](docs/RELEASING.md) |
 
 Because `main` is the profile-feed trust anchor, the repository's branch protection and account security are part of the app's security model, not just project hygiene.
 
@@ -48,6 +49,7 @@ These are known and intentionally out of scope, documented rather than hidden:
 - **The DAT sorting path shells out to your `igir`.** The app spawns `igir` (from `PATH` or `npx.cmd`) and validates the folders it is given, but the tool itself is a third-party dependency you supply.
 - **Nothing prevents you from confirming a write to a card that matters.** The confirmations are deliberately literal, and the app does not try to outsmart a determined user who types `FLASH` on the wrong card. The size and disk checks are the safety net; read them.
 - **The license check is a speed bump.** The app is open source. The cache HMAC is computed from a machine id and a label that ships in the source, so a determined person can forge a cache or skip the check. Card-safety commands do not consult it. Details and the three-computer soft limit are in [`docs/LICENSING.md`](docs/LICENSING.md).
+- **Installers are unsigned until signing is turned on.** SmartScreen will warn. Check `SHA256SUMS` before you run a download. [`docs/RELEASING.md`](docs/RELEASING.md) is the procedure for adding a certificate later.
 
 ## Out of scope
 

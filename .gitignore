@@ -19,6 +19,13 @@ Thumbs.db
 # Agent scratch for this plan (git history is the record)
 .superpowers/
 
+# Release workflow output. CI uploads this and does not commit it.
+/release/
+
+# Code-signing material stays out of the tree.
+*.pfx
+*.p12
+
 # Frontend
 dist-ssr
 *.local
