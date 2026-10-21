@@ -630,8 +630,53 @@ fn home_directories() -> Vec<String> {
     out
 }
 
-/// Windows 8.3 form of a path. Spaces and long names become `NAME~1`.
+/// Windows 8.3 form of a path. On Windows the real short name comes from
+/// `GetShortPathNameW`. The generated form is the fallback when that call
+/// cannot see the folder.
 fn dos_short_path(path: &str) -> Option<String> {
+    #[cfg(windows)]
+    if let Some(real) = windows_short_path(path) {
+        return Some(real);
+    }
+    guessed_dos_short_path(path)
+}
+
+#[cfg(windows)]
+fn windows_short_path(path: &str) -> Option<String> {
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(long_path: *const u16, short_path: *mut u16, buffer: u32) -> u32;
+    }
+
+    let back = path.replace('/', "\\");
+    let wide: Vec<u16> = OsStr::new(&back)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let needed = GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0);
+        if needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; needed as usize];
+        let written = GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), needed);
+        if written == 0 || written >= needed {
+            return None;
+        }
+        let short = OsString::from_wide(&buf[..written as usize]);
+        let text = short.to_string_lossy().into_owned();
+        if text.is_empty() || text.eq_ignore_ascii_case(&back) {
+            None
+        } else {
+            Some(text)
+        }
+    }
+}
+
+fn guessed_dos_short_path(path: &str) -> Option<String> {
     let replaced = path.replace('/', "\\");
     let back = strip_extended_prefix(&replaced);
     let unc = back.starts_with(r"\\");
@@ -874,6 +919,13 @@ fn collect_hits(text: &str, privacy: &Privacy) -> Vec<Hit> {
             replacement: "[path]",
         });
     }
+    for (start, end) in find_rom_words(text) {
+        hits.push(Hit {
+            start,
+            end,
+            replacement: "[rom]",
+        });
+    }
     for (start, end) in find_emails(text) {
         hits.push(Hit {
             start,
@@ -984,12 +1036,33 @@ fn discover_home_paths(text: &str) -> Vec<(usize, usize)> {
 }
 
 fn path_boundary(bytes: &[u8], index: usize) -> bool {
-    index == 0
-        || bytes[index - 1].is_ascii_whitespace()
+    if index == 0 {
+        return true;
+    }
+    let prev = bytes[index - 1];
+    if prev == b':' {
+        return !drive_letter_colon(bytes, index - 1);
+    }
+    prev.is_ascii_whitespace()
         || matches!(
-            bytes[index - 1],
-            b'=' | b'(' | b'[' | b',' | b';' | b'\'' | b'"'
+            prev,
+            b'=' | b'(' | b'[' | b',' | b';' | b'\'' | b'"' | b'`' | b'{' | b'<'
         )
+}
+
+/// `E:\` uses the colon as part of the drive letter. `note:D:\games` does not.
+fn drive_letter_colon(bytes: &[u8], colon_at: usize) -> bool {
+    if colon_at == 0 || colon_at + 1 >= bytes.len() {
+        return false;
+    }
+    let letter_at = colon_at - 1;
+    if !bytes[letter_at].is_ascii_alphabetic() {
+        return false;
+    }
+    if bytes[colon_at + 1] != b'\\' && bytes[colon_at + 1] != b'/' {
+        return false;
+    }
+    letter_at == 0 || !bytes[letter_at - 1].is_ascii_alphanumeric()
 }
 
 fn sensitive_path_end(text: &str, start: usize) -> Option<usize> {
@@ -1023,6 +1096,10 @@ fn path_prefix_len(rest: &str) -> Option<usize> {
         && bytes[1] == b':'
         && (bytes[2] == b'\\' || bytes[2] == b'/')
     {
+        // `E:\` by itself is a volume letter. A folder path has something after it.
+        if bytes.len() == 3 || is_path_stop(bytes[3]) || bytes[3].is_ascii_whitespace() {
+            return None;
+        }
         return Some(3);
     }
     for marker in ["/home/", "/users/", "\\home\\", "\\users\\"] {
@@ -1101,12 +1178,60 @@ fn path_end(text: &str, start: usize) -> usize {
     let bytes = text.as_bytes();
     let mut index = start;
     while index < bytes.len() && !is_path_stop(bytes[index]) {
+        if bytes[index] == b' ' && starts_with_ascii(&text[index..], " key=") {
+            break;
+        }
         index += 1;
     }
     while index > start && bytes[index - 1].is_ascii_whitespace() {
         index -= 1;
     }
     index
+}
+
+fn find_rom_words(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'.' {
+            let ext_start = index + 1;
+            let mut ext_end = ext_start;
+            while ext_end < bytes.len() && bytes[ext_end].is_ascii_alphanumeric() {
+                ext_end += 1;
+            }
+            if ext_end > ext_start
+                && is_rom_extension(&text[ext_start..ext_end])
+                && (ext_end == bytes.len() || !is_rom_name_byte(bytes[ext_end]))
+            {
+                let mut start = index;
+                while start > 0 && is_rom_name_byte(bytes[start - 1]) {
+                    start -= 1;
+                }
+                if start < index {
+                    found.push((start, ext_end));
+                    index = ext_end;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    found
+}
+
+fn is_rom_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'~' | b'(' | b')')
+}
+
+fn is_rom_extension(ext: &str) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        "7z", "bin", "chd", "cso", "cue", "gb", "gba", "gbc", "gen", "gg", "iso", "md", "ms",
+        "n64", "nes", "pbp", "pce", "sfc", "smc", "smd", "sms", "z64", "zip",
+    ];
+    EXTENSIONS
+        .iter()
+        .any(|known| ext.eq_ignore_ascii_case(known))
 }
 
 fn is_path_stop(byte: u8) -> bool {
@@ -1336,6 +1461,14 @@ mod scrub_tests {
             &text[..path_end(text, 0)],
             "C:\\Users\\Jane Doe\\My Games\\Super Mario.sfc"
         );
+    }
+
+    #[test]
+    fn path_end_stops_before_a_key_field_and_keeps_a_bare_drive() {
+        let text = r"D:\Games\Old Lib\Metroid.gba key=finished disk=2";
+        assert_eq!(&text[..path_end(text, 0)], r"D:\Games\Old Lib\Metroid.gba");
+        let bare = r"E:\";
+        assert_eq!(path_end(bare, 0), bare.len());
     }
 
     #[test]

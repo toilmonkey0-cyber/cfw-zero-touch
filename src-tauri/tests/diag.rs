@@ -509,6 +509,59 @@ fn support_zip_hides_old_libraries_and_unc_paths_by_pattern() {
     std::env::remove_var("CFW_STUDIO_DATA");
 }
 
+#[test]
+fn support_zip_redacts_bare_rom_names_and_stops_before_key_fields() {
+    let _env = env_lock();
+    let root = scratch_data("support-boundary");
+    let _profile = RestoreVar::remove("USERPROFILE");
+    let _home = RestoreVar::remove("HOME");
+    fs::write(
+        log_path(),
+        "\
+INFO colon:D:\\Hidden\\Zelda.sfc key=colon
+INFO tick`D:\\Hidden\\Mario.sfc key=tick
+INFO brace{D:\\Hidden\\Pokemon.sfc key=brace
+INFO angle<D:\\Hidden\\Kirby.sfc key=angle
+INFO skipped Metroid.gba
+INFO volume=E:\\
+INFO copied D:\\Games\\Old Lib\\Chrono.sfc key=finished disk=2
+",
+    )
+    .unwrap();
+
+    let zip = build_support_zip(&support_facts(None));
+    let files = read_stored_zip(&zip).expect("zip opens");
+    for secret in [
+        "Zelda",
+        "Mario.sfc",
+        "Pokemon",
+        "Kirby",
+        "Metroid.gba",
+        "Chrono",
+        "Old Lib",
+        r"D:\Hidden",
+        r"D:\Games",
+    ] {
+        assert_absent(&zip, &files, secret);
+    }
+    let notes = entry(&files, "logs/diagnostics.log");
+    assert!(notes.contains("[path]"), "{notes}");
+    assert!(notes.contains("[rom]"), "{notes}");
+    assert!(notes.contains("volume=E:\\"), "{notes}");
+    for kept in [
+        "key=colon",
+        "key=tick",
+        "key=brace",
+        "key=angle",
+        "key=finished",
+        "disk=2",
+    ] {
+        assert!(notes.contains(kept), "missing {kept} in {notes}");
+    }
+    let _ = fs::remove_dir_all(&root);
+    std::env::remove_var("CFW_STUDIO_DATA");
+}
+
 fn walk_files(root: &Path) -> Vec<String> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
