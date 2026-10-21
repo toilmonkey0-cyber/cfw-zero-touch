@@ -4,16 +4,43 @@ use cfw_zero_touch_lib::seed::seed_folders;
 use cfw_zero_touch_lib::volume::VolumeDecision;
 
 fn scratch() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("cfw-seed-{}-{}", std::process::id(), line()));
+    // Unique even when parallel tests scratch a directory within one clock
+    // tick. They share the pid, and Windows often reports the same
+    // subsec_nanos for that whole tick. One test's remove_dir_all then
+    // deletes another test's folders.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "cfw-seed-{}-{}-{seq}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
     fs::create_dir_all(&path).unwrap();
     path
 }
 
-fn line() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos()
+#[test]
+fn parallel_scratch_directories_are_distinct() {
+    let paths: Vec<_> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(scope.spawn(scratch));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("scratch thread"))
+            .collect()
+    });
+    let mut unique = paths.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), paths.len());
+    for path in paths {
+        let _ = fs::remove_dir_all(path);
+    }
 }
 
 #[test]

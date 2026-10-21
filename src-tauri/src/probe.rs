@@ -68,7 +68,7 @@ impl ProbeBlock {
     pub fn message(self) -> &'static str {
         match self {
             Self::Confirmation => {
-                "type PROBE to test the card shown, including its size and model"
+                "type the confirmation word shown for this card, including its size and model"
             }
             Self::NotRemovable => {
                 "only a removable USB or SD card can be tested, and system or boot disks are refused"
@@ -242,14 +242,24 @@ fn is_probe_bus(bus: &str) -> bool {
     bus.eq_ignore_ascii_case("USB") || bus.eq_ignore_ascii_case("SD")
 }
 
+/// Quick probe. The confirmation word is `PROBE`.
+pub fn authorize_probe(disk: &ProbeDisk, plan: &ProbePlan) -> Result<(), ProbeBlock> {
+    authorize_card_write(disk, plan, "PROBE")
+}
+
 /// Typed confirmation, USB or SD bus, and the U3 removable/system/boot/size gate.
 ///
-/// [`backup::authorize_backup`] only names a USB bus. An SD slot is the same
-/// removable class, so it is accepted here and then handed to that gate as USB
-/// after the real bus has been checked. System, boot, disk 0, and a size that
-/// changed since the screen was drawn still come from `authorize_backup`.
-pub fn authorize_probe(disk: &ProbeDisk, plan: &ProbePlan) -> Result<(), ProbeBlock> {
-    if plan.confirmation != "PROBE" {
+/// The quick probe and the full-card test both call this. [`backup::authorize_backup`]
+/// only names a USB bus. An SD slot is the same removable class, so it is
+/// accepted here and then handed to that gate as USB after the real bus has
+/// been checked. System, boot, disk 0, and a size that changed since the
+/// screen was drawn still come from `authorize_backup`.
+pub fn authorize_card_write(
+    disk: &ProbeDisk,
+    plan: &ProbePlan,
+    word: &str,
+) -> Result<(), ProbeBlock> {
+    if word.is_empty() || plan.confirmation != word {
         return Err(ProbeBlock::Confirmation);
     }
     if disk.number != plan.disk_number {
@@ -391,14 +401,18 @@ pub fn unknown_overwrite_summary() -> &'static str {
     "Cancelled. The log did not say whether the card was overwritten. Restore your backup, or format the card, before you use it."
 }
 
-pub fn run_probe(
+/// Blank-or-backup gate shared by the quick probe and the full-card test.
+///
+/// `word` is the typed confirmation (`PROBE` or `FULL`). Size, model, bus,
+/// system, boot, and disk 0 are the same checks as [`authorize_card_write`].
+/// A backup must match this card's serial, first 4 MiB, and sample hashes.
+pub fn gate_before_write(
     device: &mut dyn FakeBlockDevice,
     request: &ProbeRequest<'_>,
+    word: &str,
     cancel: &AtomicBool,
-    cancel_file: Option<&Path>,
-) -> Result<ProbeStatus, ProbeError> {
-    let backed_up = request.backup.is_some();
-    authorize_probe(request.disk, request.plan).map_err(ProbeError::Blocked)?;
+) -> Result<(), ProbeError> {
+    authorize_card_write(request.disk, request.plan, word).map_err(ProbeError::Blocked)?;
     if device.reported_len() != request.disk.size_bytes {
         return Err(ProbeError::Blocked(ProbeBlock::Size));
     }
@@ -407,6 +421,17 @@ pub fn run_probe(
     } else if !card_is_blank(device)? {
         return Err(ProbeError::Blocked(ProbeBlock::NotBlank));
     }
+    Ok(())
+}
+
+pub fn run_probe(
+    device: &mut dyn FakeBlockDevice,
+    request: &ProbeRequest<'_>,
+    cancel: &AtomicBool,
+    cancel_file: Option<&Path>,
+) -> Result<ProbeStatus, ProbeError> {
+    let backed_up = request.backup.is_some();
+    gate_before_write(device, request, "PROBE", cancel)?;
     if stop_requested(cancel, cancel_file, false)? {
         return Ok(cancelled(false, backed_up));
     }
@@ -549,7 +574,7 @@ pub fn verify_session_backup(
     Ok(())
 }
 
-fn stop_requested(
+pub fn stop_requested(
     cancel: &AtomicBool,
     cancel_file: Option<&Path>,
     overwritten: bool,
@@ -737,7 +762,7 @@ fn megabytes_per_second(bytes: u64, elapsed: std::time::Duration) -> f64 {
     (bytes as f64 / 1_000_000.0) / secs
 }
 
-fn format_capacity(bytes: u64) -> String {
+pub fn format_capacity(bytes: u64) -> String {
     if bytes >= 1_000_000_000 {
         return unit(bytes, 1_000_000_000, "GB");
     }
@@ -1151,35 +1176,36 @@ pub fn backup_write_allowed(locked: Result<(), String>) -> Result<(), String> {
     })
 }
 
-/// Arguments the app passes straight to the elevated `cfw-flash --probe` helper.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HelperRequest {
-    pub disk_number: u32,
-    pub confirmation: String,
-    pub displayed_bytes: u64,
-    pub displayed_model: String,
-    pub backup_image: Option<PathBuf>,
-    pub backup_sha256: Option<String>,
-    pub backup_prefix_sha256: Option<String>,
-    pub backup_serial: Option<String>,
-    pub cancel_file: PathBuf,
-    pub log_file: PathBuf,
-}
-
-/// One elevated `Start-Process` of `cfw-flash`. No temp script.
-pub fn helper_launch_command(tool: &Path, request: &HelperRequest) -> Result<String, String> {
-    for path in [
+/// One elevated `Start-Process` of `cfw-flash`. `verb` is `--probe` or `--full-check`.
+pub fn launch_command(
+    tool: &Path,
+    verb: &str,
+    request: &HelperRequest,
+    progress_file: Option<&Path>,
+) -> Result<String, String> {
+    if verb != "--probe" && verb != "--full-check" {
+        return Err("unknown card test".into());
+    }
+    let mut paths = vec![
         tool,
-        request.backup_image.as_deref().unwrap_or(Path::new("")),
         request.cancel_file.as_path(),
         request.log_file.as_path(),
-    ] {
+    ];
+    if let Some(image) = request.backup_image.as_deref() {
+        if !image.as_os_str().is_empty() {
+            paths.push(image);
+        }
+    }
+    if let Some(progress) = progress_file {
+        paths.push(progress);
+    }
+    for path in paths {
         if !path.as_os_str().is_empty() && is_physical_disk_path(path) {
             return Err("refusing a physical disk path".into());
         }
     }
     let mut args = vec![
-        "--probe".to_string(),
+        verb.to_string(),
         format!("--disk={}", request.disk_number),
         format!("--confirm={}", request.confirmation),
         format!("--expected-bytes={}", request.displayed_bytes),
@@ -1210,6 +1236,9 @@ pub fn helper_launch_command(tool: &Path, request: &HelperRequest) -> Result<Str
     }
     args.push(format!("--cancel-file={}", request.cancel_file.display()));
     args.push(format!("--log-file={}", request.log_file.display()));
+    if let Some(progress) = progress_file {
+        args.push(format!("--progress-file={}", progress.display()));
+    }
     for arg in &args {
         powershell_quote(arg)?;
     }
@@ -1222,6 +1251,26 @@ pub fn helper_launch_command(tool: &Path, request: &HelperRequest) -> Result<Str
         "$p = Start-Process -FilePath '{tool}' -Verb RunAs -Wait -PassThru -ArgumentList @({list}); if ($null -eq $p -or $null -eq $p.ExitCode) {{ exit 1 }}; exit $p.ExitCode",
         tool = powershell_quote(&tool.display().to_string())?,
     ))
+}
+
+/// Arguments the app passes straight to the elevated `cfw-flash --probe` helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperRequest {
+    pub disk_number: u32,
+    pub confirmation: String,
+    pub displayed_bytes: u64,
+    pub displayed_model: String,
+    pub backup_image: Option<PathBuf>,
+    pub backup_sha256: Option<String>,
+    pub backup_prefix_sha256: Option<String>,
+    pub backup_serial: Option<String>,
+    pub cancel_file: PathBuf,
+    pub log_file: PathBuf,
+}
+
+/// One elevated `Start-Process` of `cfw-flash --probe`. No temp script.
+pub fn helper_launch_command(tool: &Path, request: &HelperRequest) -> Result<String, String> {
+    launch_command(tool, "--probe", request, None)
 }
 
 fn powershell_quote(text: &str) -> Result<String, String> {

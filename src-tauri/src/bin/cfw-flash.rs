@@ -9,6 +9,7 @@ use cfw_zero_touch_lib::block_device::{is_physical_disk_path, FakeBlockDevice};
 use cfw_zero_touch_lib::flash::{
     authorize_flash, sha256_prefix, sha256_reader, write_gzip, FlashDisk, FlashPlan, SectorWriter,
 };
+use cfw_zero_touch_lib::fullcheck::{self, FullRun, FullStatus};
 use cfw_zero_touch_lib::probe::{
     self, ProbeDisk, ProbePlan, ProbeRequest, ProbeStatus, SessionBackup,
 };
@@ -55,6 +56,27 @@ fn restore_requested() -> bool {
 
 fn args_request_probe(args: &[String]) -> bool {
     flag_present_in(args, "probe")
+}
+
+fn args_request_full_check(args: &[String]) -> bool {
+    flag_present_in(args, "full-check")
+}
+
+#[derive(Debug)]
+enum CardTestMode {
+    Probe,
+    FullCheck,
+}
+
+/// Probe and full check are their own modes. `--expected-bytes` also marks a
+/// restore, so this has to win before `arg("image")`.
+fn card_test_mode(args: &[String]) -> Result<Option<CardTestMode>, &'static str> {
+    match (args_request_probe(args), args_request_full_check(args)) {
+        (true, true) => Err("probe and full check cannot run together"),
+        (true, false) => Ok(Some(CardTestMode::Probe)),
+        (false, true) => Ok(Some(CardTestMode::FullCheck)),
+        (false, false) => Ok(None),
+    }
 }
 
 /// In restore mode both flags are mandatory. `Ok(None)` is an OS flash.
@@ -203,14 +225,26 @@ impl RunLog {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // Probe is its own mode. `--expected-bytes` also marks a restore, so this
-    // branch has to win before `arg("image")` or the helper would wipe the card.
-    if args_request_probe(&args) {
-        if flag_present_in(&args, "restore") {
-            eprintln!("probe and restore cannot run together");
+    match card_test_mode(&args) {
+        Err(message) => {
+            eprintln!("{message}");
             std::process::exit(2);
         }
-        run_probe_mode();
+        Ok(Some(CardTestMode::Probe)) => {
+            if flag_present_in(&args, "restore") {
+                eprintln!("probe and restore cannot run together");
+                std::process::exit(2);
+            }
+            run_probe_mode();
+        }
+        Ok(Some(CardTestMode::FullCheck)) => {
+            if flag_present_in(&args, "restore") {
+                eprintln!("full check and restore cannot run together");
+                std::process::exit(2);
+            }
+            run_full_check_mode();
+        }
+        Ok(None) => {}
     }
     let image = arg("image");
     let expected = arg("sha256");
@@ -513,6 +547,8 @@ fn live_card_matches(number: u32, disk: &ProbeDisk, backup: &SessionBackup) -> R
     let mut device = DriveDevice {
         file,
         len: disk.size_bytes,
+        raw_read: None,
+        raw_disabled: true,
     };
     probe::live_identity_matches(&mut device, &backup.identity).map_err(|error| error.to_string())
 }
@@ -539,9 +575,42 @@ fn open_drive(number: u32) -> Result<File, String> {
 
 /// Seek the logical offset. A counterfeit card aliases in its own controller;
 /// this wrapper does not wrap the address in software.
+///
+/// `raw_read` is a `FILE_FLAG_NO_BUFFERING` handle used for the full-card
+/// read-back when the offset, length, and buffer are 4096-byte aligned.
+/// The quick probe leaves it empty. A 512-byte retry stays on `file`, because
+/// unbuffered I/O cannot use a short block.
 struct DriveDevice {
     file: File,
+    raw_read: Option<File>,
+    raw_disabled: bool,
     len: u64,
+}
+
+fn read_is_unbuffered(offset: u64, len: usize, ptr: usize) -> bool {
+    const ALIGN: u64 = 4096;
+    offset.is_multiple_of(ALIGN)
+        && (len as u64).is_multiple_of(ALIGN)
+        && (ptr as u64).is_multiple_of(ALIGN)
+}
+
+fn open_raw_read(number: u32) -> Result<File, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .custom_flags(FILE_FLAG_NO_BUFFERING)
+            .open(format!(r"\\.\PhysicalDrive{number}"))
+            .map_err(|error| format!("could not open drive {number} for unbuffered read: {error}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = number;
+        Err("unbuffered read-back is implemented for Windows".into())
+    }
 }
 
 impl FakeBlockDevice for DriveDevice {
@@ -554,6 +623,28 @@ impl FakeBlockDevice for DriveDevice {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut disable_raw = false;
+        let mut used_raw = false;
+        if !self.raw_disabled {
+            if let Some(raw) = self.raw_read.as_mut() {
+                if read_is_unbuffered(offset, buf.len(), buf.as_ptr() as usize) {
+                    raw.seek(SeekFrom::Start(offset))?;
+                    match raw.read_exact(buf) {
+                        Ok(()) => used_raw = true,
+                        // ERROR_INVALID_PARAMETER: this drive rejected the
+                        // unbuffered size. Later reads use the buffered handle.
+                        Err(error) if error.raw_os_error() == Some(87) => disable_raw = true,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        if disable_raw {
+            self.raw_disabled = true;
+        }
+        if used_raw {
+            return Ok(());
+        }
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(buf)
     }
@@ -572,42 +663,81 @@ fn probe_fail(log: &mut RunLog, code: i32, overwritten: bool, message: &str) -> 
     log.exit(code);
 }
 
-/// Quick probe. Rechecks size, model, and card identity after the approval
-/// prompt, then writes patterns. Does not call Clear-Disk. Every exit writes
-/// `OVERWRITTEN=yes` or `OVERWRITTEN=no`.
-fn run_probe_mode() -> ! {
-    let mut log = RunLog::open(optional_arg("log-file").as_deref());
+struct ArmedCard {
+    disk: ProbeDisk,
+    plan: ProbePlan,
+    backup: Option<SessionBackup>,
+    locks: Option<Vec<File>>,
+    device: DriveDevice,
+    cancel_path: Option<PathBuf>,
+}
+
+struct PrepareStop {
+    code: i32,
+    overwritten: bool,
+    message: String,
+}
+
+enum PreparedCard {
+    Ready(Box<ArmedCard>),
+    Cancelled { backed_up: bool },
+    Failed(PrepareStop),
+}
+
+fn stop(code: i32, overwritten: bool, message: impl Into<String>) -> PreparedCard {
+    PreparedCard::Failed(PrepareStop {
+        code,
+        overwritten,
+        message: message.into(),
+    })
+}
+
+/// Shared post-approval gate for `--probe` and `--full-check`.
+///
+/// Rechecks size and model, refuses system, boot, disk 0, and non USB/SD
+/// disks, re-reads serial plus the prefix and sample hashes on the backup
+/// route, and locks volumes before the drive is opened for write. Does not
+/// call `Clear-Disk`.
+fn prepare_destructive(log: &mut RunLog, word: &str) -> PreparedCard {
+    let label = if word == "PROBE" {
+        "probe"
+    } else {
+        "full check"
+    };
     let disk_number: u32 = match arg("disk").parse() {
         Ok(number) => number,
-        Err(_) => probe_fail(&mut log, 2, false, "bad disk number"),
+        Err(_) => return stop(2, false, "bad disk number"),
     };
     let confirmation = arg("confirm");
     let expected_bytes = match parse_u64_flag("expected-bytes", optional_arg("expected-bytes")) {
         Ok(Some(value)) => value,
-        Ok(None) => probe_fail(&mut log, 2, false, "probe requires --expected-bytes"),
-        Err(error) => probe_fail(&mut log, 2, false, &error),
+        Ok(None) => return stop(2, false, format!("{label} requires --expected-bytes")),
+        Err(error) => return stop(2, false, error),
     };
     let Some(expected_model) = optional_arg("expected-model") else {
-        probe_fail(&mut log, 2, false, "probe requires --expected-model");
+        return stop(2, false, format!("{label} requires --expected-model"));
     };
     let backup_image = optional_arg("backup-image");
     let backup_sha = optional_arg("backup-sha256");
     let backup_prefix = optional_arg("backup-prefix-sha256");
     let backup_serial = optional_arg("backup-serial");
     let cancel_file = optional_arg("cancel-file");
+    let progress_file = optional_arg("progress-file");
     match (&backup_image, &backup_sha, &backup_prefix, &backup_serial) {
         (Some(_), Some(_), Some(_), Some(_)) | (None, None, None, None) => {}
-        _ => probe_fail(
-            &mut log,
-            2,
-            false,
-            "a probe backup needs the image, checksum, and card identity from this session",
-        ),
+        _ => {
+            return stop(
+                2,
+                false,
+                format!(
+                    "a {label} backup needs the image, checksum, and card identity from this session"
+                ),
+            );
+        }
     }
     if let Some(path) = &backup_image {
         if is_physical_disk_path(Path::new(path)) {
-            probe_fail(
-                &mut log,
+            return stop(
                 3,
                 false,
                 "refusing to read a backup from a physical disk path",
@@ -616,18 +746,26 @@ fn run_probe_mode() -> ! {
     }
     if let Some(path) = &cancel_file {
         if is_physical_disk_path(Path::new(path)) {
-            probe_fail(
-                &mut log,
+            return stop(
                 3,
                 false,
                 "refusing to read a cancel flag from a physical disk path",
             );
         }
     }
+    if let Some(path) = &progress_file {
+        if is_physical_disk_path(Path::new(path)) {
+            return stop(
+                3,
+                false,
+                "refusing to write progress to a physical disk path",
+            );
+        }
+    }
 
     let (disk, model) = match read_disk(disk_number) {
         Ok(disk) => disk,
-        Err(error) => probe_fail(&mut log, 2, false, &error),
+        Err(error) => return stop(2, false, error),
     };
     log.line(&format!(
         "target disk {} {} {} bytes model {model}",
@@ -639,12 +777,12 @@ fn run_probe_mode() -> ! {
         Some(expected_bytes),
         Some(expected_model.as_str()),
     ) {
-        probe_fail(&mut log, 3, false, &error);
+        return stop(3, false, error);
     }
     let live_serial = if backup_image.is_some() {
         match read_serial(disk_number) {
             Ok(serial) => serial,
-            Err(error) => probe_fail(&mut log, 2, false, &error),
+            Err(error) => return stop(2, false, error),
         }
     } else {
         String::new()
@@ -663,23 +801,18 @@ fn run_probe_mode() -> ! {
         displayed_bytes: expected_bytes,
         displayed_model: expected_model,
     };
-    if let Err(block) = probe::authorize_probe(&probe_disk, &plan) {
-        probe_fail(&mut log, 3, false, block.message());
+    if let Err(block) = probe::authorize_card_write(&probe_disk, &plan, word) {
+        return stop(3, false, block.message());
     }
     if let Some(path) = &cancel_file {
         match cancel_file_requests_stop(Path::new(path)) {
             Ok(true) => {
-                let status = ProbeStatus::Cancelled {
-                    overwritten: false,
-                    summary: probe::cancel_summary(false, backup_image.is_some()),
+                return PreparedCard::Cancelled {
+                    backed_up: backup_image.is_some(),
                 };
-                for line in probe::format_probe_log(&status).lines() {
-                    log.line(line);
-                }
-                log.exit(9);
             }
             Ok(false) => {}
-            Err(error) => probe_fail(&mut log, 2, false, &error),
+            Err(error) => return stop(2, false, error),
         }
     }
 
@@ -687,7 +820,7 @@ fn run_probe_mode() -> ! {
         (Some(path), Some(sha), Some(prefix), Some(serial)) => {
             match recorded_backup(&path, &sha, &prefix, &serial) {
                 Ok(backup) => Some(backup),
-                Err(error) => probe_fail(&mut log, 3, false, &error),
+                Err(error) => return stop(3, false, error),
             }
         }
         _ => None,
@@ -695,17 +828,17 @@ fn run_probe_mode() -> ! {
     // Re-read this card and compare it to the backup before locking or writing.
     if let Some(backup) = &backup {
         if let Err(error) = live_card_matches(disk_number, &probe_disk, backup) {
-            probe_fail(&mut log, 3, false, &error);
+            return stop(3, false, error);
         }
     }
     // Backup route only: lock and dismount volumes before any raw write.
-    // Handles stay open until this function exits so Windows does not remount.
-    let _volume_locks = if backup.is_some() {
+    // Handles stay open until the caller drops them so Windows does not remount.
+    let locks = if backup.is_some() {
         match lock_disk_volumes(disk_number) {
             Ok(locks) => Some(locks),
             Err(error) => {
                 let message = probe::backup_write_allowed(Err(error)).unwrap_err();
-                probe_fail(&mut log, 3, false, &message);
+                return stop(3, false, message);
             }
         }
     } else {
@@ -713,18 +846,66 @@ fn run_probe_mode() -> ! {
     };
     let file = match open_drive(disk_number) {
         Ok(file) => file,
-        Err(error) => probe_fail(&mut log, 2, false, &error),
+        Err(error) => return stop(2, false, error),
     };
-    let mut device = DriveDevice {
+    let device = DriveDevice {
         file,
+        raw_read: None,
+        raw_disabled: false,
         len: probe_disk.size_bytes,
     };
+    let cancel_path = cancel_file.map(PathBuf::from);
+    PreparedCard::Ready(Box::new(ArmedCard {
+        disk: probe_disk,
+        plan,
+        backup,
+        locks,
+        device,
+        cancel_path,
+    }))
+}
+
+fn finish_prepare(log: &mut RunLog, prepared: PreparedCard, cancelled_log: String) -> ArmedCard {
+    match prepared {
+        PreparedCard::Ready(armed) => *armed,
+        PreparedCard::Cancelled { .. } => {
+            for line in cancelled_log.lines() {
+                log.line(line);
+            }
+            log.exit(9);
+        }
+        PreparedCard::Failed(stop) => probe_fail(log, stop.code, stop.overwritten, &stop.message),
+    }
+}
+
+/// Quick probe. Rechecks size, model, and card identity after the approval
+/// prompt, then writes patterns. Does not call Clear-Disk. Every exit writes
+/// `OVERWRITTEN=yes` or `OVERWRITTEN=no`.
+fn run_probe_mode() -> ! {
+    let mut log = RunLog::open(optional_arg("log-file").as_deref());
+    let prepared = prepare_destructive(&mut log, "PROBE");
+    let cancelled = probe::format_probe_log(&ProbeStatus::Cancelled {
+        overwritten: false,
+        summary: probe::cancel_summary(
+            false,
+            matches!(prepared, PreparedCard::Cancelled { backed_up: true }),
+        ),
+    });
+    let armed = finish_prepare(&mut log, prepared, cancelled);
+    let ArmedCard {
+        disk,
+        plan,
+        backup,
+        locks,
+        mut device,
+        cancel_path,
+    } = armed;
+    let _locks = locks;
     let request = ProbeRequest {
-        disk: &probe_disk,
+        disk: &disk,
         plan: &plan,
         backup: backup.as_ref(),
     };
-    let cancel_path = cancel_file.as_ref().map(PathBuf::from);
     match probe::run_probe(
         &mut device,
         &request,
@@ -737,6 +918,78 @@ fn run_probe_mode() -> ! {
                 ProbeStatus::Finished(_) => 0,
             };
             for line in probe::format_probe_log(&status).lines() {
+                log.line(line);
+            }
+            log.exit(code);
+        }
+        Err(probe::ProbeError::Blocked(block)) => probe_fail(&mut log, 3, false, block.message()),
+        Err(probe::ProbeError::Failed {
+            message,
+            overwritten,
+        }) => probe_fail(&mut log, 6, overwritten, &message),
+    }
+}
+
+/// Full-card pattern write and read-back. Same gate as the probe. Every exit
+/// writes `OVERWRITTEN=yes` or `OVERWRITTEN=no`.
+fn run_full_check_mode() -> ! {
+    let mut log = RunLog::open(optional_arg("log-file").as_deref());
+    let progress_file = optional_arg("progress-file");
+    let prepared = prepare_destructive(&mut log, fullcheck::FULL_WORD);
+    let backed_up = matches!(prepared, PreparedCard::Cancelled { backed_up: true });
+    let cancelled = fullcheck::format_full_log(&FullStatus::Cancelled {
+        overwritten: false,
+        summary: fullcheck::cancel_summary(false, backed_up),
+    });
+    let armed = finish_prepare(&mut log, prepared, cancelled);
+    let ArmedCard {
+        disk,
+        plan,
+        backup,
+        locks,
+        mut device,
+        cancel_path,
+    } = armed;
+    let _locks = locks;
+    device.raw_read = open_raw_read(disk.number).ok();
+    if device.raw_read.is_none() {
+        device.raw_disabled = true;
+    }
+    log.line(if device.raw_read.is_some() {
+        "READBACK=unbuffered"
+    } else {
+        "READBACK=buffered"
+    });
+    let request = ProbeRequest {
+        disk: &disk,
+        plan: &plan,
+        backup: backup.as_ref(),
+    };
+    let job = FullRun {
+        request: &request,
+        cancel: &AtomicBool::new(false),
+        cancel_file: cancel_path.as_deref(),
+        chunk_bytes: fullcheck::DEFAULT_CHUNK,
+    };
+    let mut last_percent = None;
+    match fullcheck::run_full_check(&mut device, &job, &mut |progress| {
+        let Some(path) = &progress_file else {
+            return;
+        };
+        let done = progress.bytes_done == progress.bytes_total;
+        if last_percent == Some(progress.percent) && !done {
+            return;
+        }
+        last_percent = Some(progress.percent);
+        let line = fullcheck::format_progress(&progress);
+        let _ = restore::write_nofollow(Path::new(path), line.as_bytes());
+    }) {
+        Ok(status) => {
+            let code = match &status {
+                FullStatus::Cancelled { .. } => 9,
+                FullStatus::Finished(_) => 0,
+            };
+            for line in fullcheck::format_full_log(&status).lines() {
                 log.line(line);
             }
             log.exit(code);
@@ -1015,6 +1268,41 @@ mod tests {
         assert!(args_request_probe(&args));
         assert!(!flag_present_in(&args, "restore"));
         assert!(!flag_present_in(&args, "image"));
+        assert!(matches!(
+            card_test_mode(&args),
+            Ok(Some(CardTestMode::Probe))
+        ));
+    }
+
+    #[test]
+    fn full_check_flag_is_its_own_mode() {
+        let args = vec![
+            "cfw-flash".to_string(),
+            "--full-check".to_string(),
+            "--expected-bytes=4096".to_string(),
+            "--expected-model=Samsung EVO".to_string(),
+        ];
+        assert!(args_request_full_check(&args));
+        assert!(!args_request_probe(&args));
+        assert!(matches!(
+            card_test_mode(&args),
+            Ok(Some(CardTestMode::FullCheck))
+        ));
+        let mut both = args.clone();
+        both.push("--probe".to_string());
+        assert!(card_test_mode(&both)
+            .unwrap_err()
+            .contains("cannot run together"));
+        assert!(card_test_mode(&["cfw-flash".into(), "--image=os.img.gz".into()]).is_ok());
+    }
+
+    #[test]
+    fn unbuffered_read_back_needs_4096_alignment() {
+        assert!(read_is_unbuffered(0, 4096, 4096));
+        assert!(read_is_unbuffered(1_048_576, 1_048_576, 8192));
+        assert!(!read_is_unbuffered(512, 4096, 4096));
+        assert!(!read_is_unbuffered(0, 512, 4096));
+        assert!(!read_is_unbuffered(0, 4096, 512));
     }
 
     #[test]
