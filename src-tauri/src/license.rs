@@ -480,6 +480,16 @@ impl<T: LicenseTransport> Session<T> {
         }
     }
 
+    /// Status for a support file. This never contacts Gumroad and never returns
+    /// the saved key, the cache MAC, or a response body.
+    pub fn offline_status(&self) -> LicenseStatus {
+        match self.load() {
+            CacheLoad::Missing => inactive(Reason::NotActivated, MSG_ENTER),
+            CacheLoad::Untrusted => inactive(Reason::UntrustedCache, MSG_UNTRUSTED),
+            CacheLoad::Trusted(cached) => status_from_stored(&cached),
+        }
+    }
+
     pub fn activate(&self, license_key: &str, now: i64) -> ActivateOutcome {
         let key = license_key.trim();
         if let Some(failure) = self.preflight(key) {
@@ -1909,6 +1919,9 @@ mod tests {
             "activate_license",
             "deactivate_license",
             "paid_feature",
+            "save_support_bundle",
+            "support_license_view",
+            "save_support_bundle_does_not_wait_for_the_license_lock",
         ] {
             outside = remove_function(&outside, name);
         }
@@ -1984,6 +1997,27 @@ mod tests {
                 "{name} calls Gumroad on the command task instead of the blocking pool"
             );
         }
+
+        let support = command_body(&src, "save_support_bundle");
+        let support_at = src
+            .find("fn save_support_bundle(")
+            .expect("save_support_bundle");
+        assert!(
+            src[support_at.saturating_sub(6)..support_at].contains("async"),
+            "save_support_bundle must be async"
+        );
+        let pooled = support
+            .find("spawn_blocking")
+            .expect("save_support_bundle must use spawn_blocking");
+        let read = support
+            .find("support_license_view")
+            .expect("save_support_bundle must read license status in the worker");
+        assert!(pooled < read, "license status is read on the command task");
+        let reader = command_body(&src, "support_license_view");
+        assert!(
+            reader.contains("try_lock"),
+            "support license status must not wait on the license lock"
+        );
 
         let caller = std::thread::current().id();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -2432,5 +2466,27 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "safety path waited on licensing"
         );
+    }
+
+    #[test]
+    fn offline_status_for_a_support_file_does_not_call_gumroad() {
+        let lab = lab(vec![]);
+        let status = lab.session.offline_status();
+        assert_eq!(status.reason, Reason::NotActivated);
+        assert!(calls_of(&lab).is_empty());
+        let cache = lab.dir.join("license").join("activation.json");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(
+            &cache,
+            format!(
+                r#"{{"payload":{{"license_key":"{KEY}","email":"{EMAIL}"}},"mac":"abcdef0123456789abcdef0123456789"}}"#
+            ),
+        )
+        .unwrap();
+        let status = lab.session.offline_status();
+        assert_eq!(status.reason, Reason::UntrustedCache);
+        assert!(!status.message.contains(KEY), "{}", status.message);
+        assert!(!status.message.contains(EMAIL), "{}", status.message);
+        assert!(calls_of(&lab).is_empty());
     }
 }

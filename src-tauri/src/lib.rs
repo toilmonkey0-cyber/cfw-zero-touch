@@ -1918,6 +1918,44 @@ fn cancelled_probe_view(claimed_bytes: u64, overwritten: bool, summary: String) 
     })
 }
 
+fn remember_probe_outcome(disk_number: u32, view: &ProbeReportView) {
+    diag::remember_probe(&diag::format_probe(
+        &view.status,
+        disk_number,
+        view.claimed_bytes,
+        view.real_bytes,
+        (view.read_mbps, view.write_mbps),
+        view.overwritten,
+        &view.summary,
+    ));
+    let kind = if !view.kind.is_empty() {
+        view.kind.as_str()
+    } else if view.status == "cancelled" {
+        "not_finished"
+    } else {
+        "unknown"
+    };
+    diag::remember_fake_card(&diag::format_fake_card(
+        kind,
+        view.claimed_bytes,
+        view.real_bytes,
+        &view.summary,
+    ));
+}
+
+fn remember_probe_failure(disk_number: u32, message: &str) {
+    diag::remember_probe(&diag::format_probe(
+        "failed",
+        disk_number,
+        0,
+        0,
+        (0.0, 0.0),
+        false,
+        message,
+    ));
+    diag::remember_fake_card(&diag::format_fake_card("unknown", 0, 0, message));
+}
+
 fn probe_view(parsed: probe::ProbeLog) -> ProbeReportView {
     ProbeReportView {
         status: parsed.status,
@@ -1955,12 +1993,19 @@ fn read_disk_identity(disk_number: u32) -> Result<DiskIdentityView, String> {
     let disk = probe_disk_from_restore(&queried, serial);
     let (serial, size_bytes) = probe::accept_read_only_identity(&disk)?;
     let partition_table_id = query_partition_table_id(disk_number)?;
-    Ok(DiskIdentityView {
+    let view = DiskIdentityView {
         disk_number: disk.number,
         serial,
         size_bytes,
         partition_table_id,
-    })
+    };
+    diag::remember_identity(&diag::format_identity(
+        view.disk_number,
+        &view.serial,
+        view.size_bytes,
+        &view.partition_table_id,
+    ));
+    Ok(view)
 }
 
 /// USB and SD cards only. Disk 0, system disks, and boot disks are left out.
@@ -2149,8 +2194,15 @@ fn probe_card(
             bytes,
             overwritten,
             summary,
-        }) => return Ok(cancelled_probe_view(bytes, overwritten, summary)),
-        Err(ScreenStop::Failed(message)) => return Err(message),
+        }) => {
+            let view = cancelled_probe_view(bytes, overwritten, summary);
+            remember_probe_outcome(disk_number, &view);
+            return Ok(view);
+        }
+        Err(ScreenStop::Failed(message)) => {
+            remember_probe_failure(disk_number, &message);
+            return Err(message);
+        }
     };
 
     let temps = probe_temp_paths();
@@ -2208,7 +2260,9 @@ fn probe_card(
                     parsed.status, parsed.overwritten
                 ),
             );
-            Ok(probe_view(parsed))
+            let view = probe_view(parsed);
+            remember_probe_outcome(disk_number, &view);
+            Ok(view)
         }
         Ok(probe::HelperFollowup::Cancelled {
             overwritten,
@@ -2219,7 +2273,9 @@ fn probe_card(
                 "probe_cancelled",
                 &format!("disk={disk_number} overwritten={overwritten}"),
             );
-            Ok(cancelled_probe_view(displayed_bytes, overwritten, summary))
+            let view = cancelled_probe_view(displayed_bytes, overwritten, summary);
+            remember_probe_outcome(disk_number, &view);
+            Ok(view)
         }
         Err(message) => {
             diag::log(
@@ -2227,6 +2283,7 @@ fn probe_card(
                 "probe_failed",
                 &format!("disk={disk_number}: {message}"),
             );
+            remember_probe_failure(disk_number, &message);
             Err(message)
         }
     }
@@ -2586,6 +2643,91 @@ fn app_version() -> String {
 #[tauri::command]
 fn diagnostics_path() -> String {
     diag::log_path().display().to_string()
+}
+
+/// Save one support zip. Reads notes and license status only. Does not open a card.
+/// The zip is built off the command thread. License status is read only when the
+/// license lock is free; otherwise the file says the status is unknown.
+#[tauri::command]
+async fn save_support_bundle(destination: String, library: Option<String>) -> Result<(), String> {
+    let dest = PathBuf::from(destination.trim());
+    diag::refuse_support_destination(&dest)?;
+    let library = library.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() || diag::is_device_path(&trimmed) {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    });
+    let mut usernames = Vec::new();
+    for key in ["USER", "USERNAME"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim().to_string();
+            if trimmed.len() >= 3 {
+                usernames.push(trimmed);
+            }
+        }
+    }
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    let os_name = std::env::consts::OS.to_string();
+    let arch = std::env::consts::ARCH.to_string();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let view = support_license_view();
+        diag::write_support_bundle(
+            &dest,
+            &diag::SupportFacts {
+                version,
+                os_name,
+                arch,
+                library,
+                license_state: view.state,
+                license_reason: view.reason,
+                license_message: view.message,
+                license_uses: view.uses,
+                over_soft_limit: view.over_soft_limit,
+                stale: view.stale,
+                signed_updates: view.signed_updates,
+                support: view.support,
+                safety_open: view.safety_open,
+                usernames,
+                secrets: Vec::new(),
+            },
+        )?;
+        diag::log("INFO", "support_saved", "file=support-zip");
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("could not save the support file".into()),
+    }
+}
+
+/// License status for the support file. `try_lock` returns immediately when
+/// another command holds the license lock, so saving the file cannot freeze
+/// the window or wait on Gumroad.
+fn support_license_view() -> license::LicenseView {
+    let guard = match license::session_lock().try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return license::LicenseView {
+                state: "unknown".into(),
+                reason: "unknown".into(),
+                message: "License status was not read.".into(),
+                uses: None,
+                over_soft_limit: false,
+                stale: false,
+                signed_updates: false,
+                support: false,
+                safety_open: true,
+            };
+        }
+    };
+    let view = license::production_session().offline_status().to_view(None);
+    drop(guard);
+    view
 }
 
 /// Doctor diagnosis of one selected card: deterministic templates plus an
@@ -3109,6 +3251,7 @@ pub fn run() {
             app_version,
             stage_library,
             diagnostics_path,
+            save_support_bundle,
             needle_status,
             needle_acquire,
             classify_library,
@@ -3131,7 +3274,79 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::read_disk_identity;
+    use super::{read_disk_identity, save_support_bundle};
+
+    #[test]
+    fn save_support_bundle_refuses_a_disk_device() {
+        let error =
+            tauri::async_runtime::block_on(save_support_bundle("/dev/mmcblk0".into(), None))
+                .unwrap_err();
+        assert!(
+            error.to_lowercase().contains("disk") || error.to_lowercase().contains("file"),
+            "{error}"
+        );
+        let drive =
+            tauri::async_runtime::block_on(save_support_bundle(r"\\.\PhysicalDrive1".into(), None))
+                .unwrap_err();
+        assert!(
+            drive.to_lowercase().contains("disk") || drive.to_lowercase().contains("file"),
+            "{drive}"
+        );
+        let com = tauri::async_runtime::block_on(save_support_bundle("//./COM1".into(), None))
+            .unwrap_err();
+        assert!(
+            com.to_lowercase().contains("disk") || com.to_lowercase().contains("file"),
+            "{com}"
+        );
+        let notes = tauri::async_runtime::block_on(save_support_bundle("notes.txt".into(), None))
+            .unwrap_err();
+        assert!(notes.to_lowercase().contains("zip"), "{notes}");
+    }
+
+    #[test]
+    fn save_support_bundle_does_not_wait_for_the_license_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "cfw-support-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var("CFW_STUDIO_DATA").ok();
+        std::env::set_var("CFW_STUDIO_DATA", &dir);
+        let dest = dir.join("cfw-card-studio-support.zip");
+        let guard = super::license::session_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dest_thread = dest.clone();
+        std::thread::spawn(move || {
+            let result = tauri::async_runtime::block_on(save_support_bundle(
+                dest_thread.display().to_string(),
+                None,
+            ));
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(3));
+        drop(guard);
+        let saved = result.expect("support file waited on the license lock");
+        saved.expect("support file saved");
+        let bytes = std::fs::read(&dest).unwrap();
+        let files = super::diag::read_stored_zip(&bytes).unwrap();
+        let license_text = files
+            .iter()
+            .find(|(name, _)| name == "license.txt")
+            .map(|(_, data)| String::from_utf8_lossy(data).into_owned())
+            .unwrap_or_default();
+        assert!(license_text.contains("state=unknown"), "{license_text}");
+        match previous {
+            Some(value) => std::env::set_var("CFW_STUDIO_DATA", value),
+            None => std::env::remove_var("CFW_STUDIO_DATA"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn read_disk_identity_refuses_disk_zero() {
