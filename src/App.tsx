@@ -6,6 +6,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import "./App.css";
 import { stockImagePath } from "./backupPath";
 import { formatBytes } from "./formatBytes";
+import { probeConfirmPrompt } from "./probePath";
 import {
   isFinishedBackupName,
   restoreConfirmPrompt,
@@ -87,7 +88,16 @@ type DoctorReport = {
   suggestedProfileId: string | null;
 };
 
-type Step = "profile" | "card" | "library" | "flash" | "bootOnce" | "done" | "backup" | "restore";
+type Step =
+  | "profile"
+  | "card"
+  | "library"
+  | "flash"
+  | "bootOnce"
+  | "done"
+  | "backup"
+  | "restore"
+  | "probe";
 
 type BackupProgress = { bytesRead: number; bytesTotal: number };
 
@@ -108,6 +118,17 @@ type RestoreReport = {
   cardSha256: string;
   bytes: number;
   detail: string;
+};
+
+type ProbeReport = {
+  status: "finished" | "cancelled";
+  kind: string;
+  claimedBytes: number;
+  realBytes: number;
+  readMbps: number;
+  writeMbps: number;
+  overwritten: boolean;
+  summary: string;
 };
 
 type SortMode = "none" | "smart" | "dat";
@@ -180,6 +201,10 @@ export default function App() {
   const [restoreConfirmation, setRestoreConfirmation] = useState("");
   const [restoreProgress, setRestoreProgress] = useState<RestoreProgress | null>(null);
   const [restoreReport, setRestoreReport] = useState<RestoreReport | null>(null);
+  const [probeDisks, setProbeDisks] = useState<FlashDisk[]>([]);
+  const [probeConfirmation, setProbeConfirmation] = useState("");
+  const [probeProgress, setProbeProgress] = useState("");
+  const [probeReport, setProbeReport] = useState<ProbeReport | null>(null);
   const [keepExistingFolders, setKeepExistingFolders] = useState(false);
   const [feedCheck, setFeedCheck] = useState<FeedCheck | null>(null);
   const [checkingFeed, setCheckingFeed] = useState(false);
@@ -354,6 +379,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const unlisten = listen<string>("probe-progress", (event) => {
+      setProbeProgress(event.payload);
+    });
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
     const unlisten = listen<{ relativeDest: string; index: number; total: number; done: boolean }>(
       "copy-progress",
       (event) => {
@@ -489,6 +523,53 @@ export default function App() {
 
   async function cancelRestore() {
     await invoke("cancel_restore");
+  }
+
+  async function refreshProbeDisks() {
+    setBusy(true);
+    setError("");
+    try {
+      setProbeDisks(await invoke<FlashDisk[]>("list_probe_disks"));
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openProbe() {
+    setError("");
+    setProbeReport(null);
+    setProbeProgress("");
+    setProbeConfirmation("");
+    setStep("probe");
+    await refreshProbeDisks();
+  }
+
+  async function startProbe(disk: FlashDisk) {
+    setBusy(true);
+    setError("");
+    setProbeReport(null);
+    setProbeProgress(
+      "Checking the card. Windows may ask for approval before anything is written.",
+    );
+    try {
+      const report = await invoke<ProbeReport>("probe_card", {
+        diskNumber: disk.number,
+        displayedBytes: disk.sizeBytes,
+        displayedModel: restoreDiskModel(disk.name),
+        confirmation: probeConfirmation,
+      });
+      setProbeReport(report);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelProbe() {
+    await invoke("cancel_probe");
   }
 
   async function refreshFlashDisks() {
@@ -871,6 +952,9 @@ export default function App() {
             <button disabled={busy} onClick={() => void openRestore()}>
               Restore a backup
             </button>
+            <button disabled={busy} onClick={() => void openProbe()}>
+              Test a card
+            </button>
           </div>
           {profiles.length === 0 ? <p>No ROMs-card profiles found.</p> : null}
           <div className="cards">
@@ -943,7 +1027,8 @@ export default function App() {
           {backupReport?.status === "complete" ? (
             <p className="path">
               Saved {backupReport.image} ({formatBytes(backupReport.bytes)}). SHA-256{" "}
-              {backupReport.sha256}. Checksum file {backupReport.sidecar}.
+              {backupReport.sha256}. Checksum file {backupReport.sidecar}. A finished backup of
+              this card can be used to test it for a fake size until you close Card Studio.
             </p>
           ) : null}
           {backupReport?.status === "cancelled" ? (
@@ -1033,6 +1118,77 @@ export default function App() {
           {busy ? <button onClick={() => void cancelRestore()}>Cancel restore</button> : null}
           {restoreReport ? (
             <p className={restoreReport.status === "fail" ? "error" : "path"}>{restoreReport.detail}</p>
+          ) : null}
+        </section>
+      ) : null}
+
+      {step === "probe" ? (
+        <section>
+          <h2>Test a card</h2>
+          <p>
+            This checks whether a removable card really holds the size it claims, and measures how
+            fast it reads and writes. It writes a short test pattern, so it runs only when this
+            session already has a verified backup of this exact card, or the card is blank. Fixed
+            disks, disk 0, and Windows system or boot disks are not listed. Windows asks for
+            approval before anything is written. If you cancel, the result says whether the card
+            was overwritten.
+          </p>
+          <div className="row">
+            <button disabled={busy} onClick={() => void refreshProbeDisks()}>
+              Refresh disks
+            </button>
+            <button disabled={busy} onClick={() => setStep("profile")}>
+              Back
+            </button>
+          </div>
+          {probeDisks.length === 0 ? <p>No USB or SD card detected.</p> : null}
+          <ul className="volumes">
+            {probeDisks.map((disk) => {
+              const model = restoreDiskModel(disk.name);
+              return (
+                <li key={disk.number}>
+                  <div>
+                    <strong>
+                      Disk {disk.number}: {model}
+                    </strong>
+                    <span>{formatBytes(disk.sizeBytes)}</span>
+                  </div>
+                  <label>
+                    {probeConfirmPrompt({
+                      number: disk.number,
+                      name: model,
+                      sizeLabel: formatBytes(disk.sizeBytes),
+                    })}
+                    <input
+                      value={probeConfirmation}
+                      onChange={(event) => setProbeConfirmation(event.target.value)}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <button
+                    disabled={busy || probeConfirmation !== "PROBE"}
+                    onClick={() => void startProbe(disk)}
+                  >
+                    Test disk {disk.number}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          {probeProgress ? <p>{probeProgress}</p> : null}
+          {busy ? <button onClick={() => void cancelProbe()}>Cancel test</button> : null}
+          {probeReport ? (
+            <p
+              className={
+                probeReport.kind === "fake" ||
+                probeReport.kind === "failing" ||
+                (probeReport.status === "cancelled" && probeReport.overwritten)
+                  ? "error"
+                  : "path"
+              }
+            >
+              {probeReport.summary}
+            </p>
           ) : null}
         </section>
       ) : null}

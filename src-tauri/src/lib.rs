@@ -9,6 +9,7 @@ pub mod format_gate;
 pub mod igir;
 pub mod needle;
 pub mod prepare;
+pub mod probe;
 pub mod profiles;
 pub mod restore;
 pub mod romcopy;
@@ -1116,6 +1117,9 @@ impl Drop for StockBackupGuard {
 }
 
 fn begin_stock_backup() -> Result<StockBackupGuard, String> {
+    if PROBE_RUNNING.load(Ordering::SeqCst) {
+        return Err("a card test is already running".into());
+    }
     if RESTORE_RUNNING.load(Ordering::SeqCst) {
         return Err("a backup restore is already running".into());
     }
@@ -1124,35 +1128,6 @@ fn begin_stock_backup() -> Result<StockBackupGuard, String> {
     }
     STOCK_BACKUP_CANCEL.store(false, Ordering::SeqCst);
     Ok(StockBackupGuard)
-}
-
-/// `Get-Disk` only. This does not open `\\.\PhysicalDriveN`.
-fn query_flash_disk(number: u32) -> Result<flash::FlashDisk, String> {
-    if number == 0 {
-        return Err("refusing to open disk 0".into());
-    }
-    let script = format!(
-        "$d = Get-Disk -Number {number}; Write-Output ($d.Number.ToString() + '|' + $d.BusType.ToString() + '|' + $d.Size.ToString() + '|' + $d.IsSystem.ToString() + '|' + $d.IsBoot.ToString())"
-    );
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .output()
-        .map_err(|error| format!("could not inspect the disk: {error}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let line = text
-        .lines()
-        .find(|line| line.contains('|'))
-        .ok_or("no disk info")?;
-    let queried = backup::parse_disk_query(line, number)?;
-    Ok(flash::FlashDisk {
-        number: queried.number,
-        bus: queried.bus,
-        size_bytes: queried.size_bytes,
-        system_disk: queried.system_disk,
-    })
 }
 
 /// Read-only on purpose. Do not add `.write(true)`: a stock-card backup must
@@ -1209,10 +1184,10 @@ fn backup_stock_card(
     }
     let destination = PathBuf::from(&destination);
     backup::check_destination(&destination).map_err(|error| error.to_string())?;
-    let info = query_flash_disk(disk_number)?;
+    let info = query_restore_disk(disk_number)?;
     let disk = backup::BackupDisk {
         number: info.number,
-        bus: info.bus,
+        bus: info.bus.clone(),
         size_bytes: info.size_bytes,
         system_disk: info.system_disk || info.number == 0,
         displayed_bytes,
@@ -1269,6 +1244,12 @@ fn backup_stock_card(
                 "backup_done",
                 &format!("disk={disk_number} bytes={bytes}"),
             );
+            session_backups().remember(probe::SessionBackup {
+                image: image.clone(),
+                size_bytes: bytes,
+                model: info.model.clone(),
+                sha256: sha256.clone(),
+            });
             Ok(BackupReportView {
                 status: "complete".into(),
                 image: image.display().to_string(),
@@ -1321,6 +1302,9 @@ fn restore_cancel_slot() -> std::sync::MutexGuard<'static, Option<PathBuf>> {
 }
 
 fn begin_restore() -> Result<RestoreGuard, String> {
+    if PROBE_RUNNING.load(Ordering::SeqCst) {
+        return Err("a card test is already running".into());
+    }
     if STOCK_BACKUP_RUNNING.load(Ordering::SeqCst) {
         return Err("a stock-card backup is already running".into());
     }
@@ -1691,6 +1675,309 @@ fn restore_backup(
 #[tauri::command]
 fn cancel_restore() {
     signal_restore_cancel();
+}
+
+static PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
+static PROBE_CANCEL: AtomicBool = AtomicBool::new(false);
+static PROBE_CANCEL_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+struct ProbeGuard;
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        PROBE_RUNNING.store(false, Ordering::SeqCst);
+        *probe_cancel_slot() = None;
+    }
+}
+
+fn probe_cancel_slot() -> std::sync::MutexGuard<'static, Option<PathBuf>> {
+    PROBE_CANCEL_FILE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn session_backups() -> std::sync::MutexGuard<'static, probe::BackupSession> {
+    static SESSION: std::sync::OnceLock<Mutex<probe::BackupSession>> = std::sync::OnceLock::new();
+    SESSION
+        .get_or_init(|| Mutex::new(probe::BackupSession::default()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn begin_probe() -> Result<ProbeGuard, String> {
+    if STOCK_BACKUP_RUNNING.load(Ordering::SeqCst) {
+        return Err("a stock-card backup is already running".into());
+    }
+    if RESTORE_RUNNING.load(Ordering::SeqCst) {
+        return Err("a backup restore is already running".into());
+    }
+    if PROBE_RUNNING.swap(true, Ordering::SeqCst) {
+        return Err("a card test is already running".into());
+    }
+    PROBE_CANCEL.store(false, Ordering::SeqCst);
+    Ok(ProbeGuard)
+}
+
+fn signal_probe_cancel() {
+    PROBE_CANCEL.store(true, Ordering::SeqCst);
+    if let Some(path) = probe_cancel_slot().clone() {
+        let _ = restore::signal_cancel_file(&path);
+    }
+}
+
+fn probe_disk_from_restore(disk: &restore::RestoreDisk) -> probe::ProbeDisk {
+    probe::ProbeDisk {
+        number: disk.number,
+        bus: disk.bus.clone(),
+        size_bytes: disk.size_bytes,
+        system_disk: disk.system_disk,
+        model: disk.model.clone(),
+    }
+}
+
+struct ProbeTemps {
+    script: PathBuf,
+    log: PathBuf,
+    cancel: PathBuf,
+}
+
+impl Drop for ProbeTemps {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.script);
+        let _ = std::fs::remove_file(&self.log);
+        let _ = std::fs::remove_file(&self.cancel);
+    }
+}
+
+fn probe_temp_paths() -> ProbeTemps {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    );
+    let dir = std::env::temp_dir();
+    ProbeTemps {
+        script: dir.join(format!("cfw-probe-ui-{unique}.ps1")),
+        log: dir.join(format!("cfw-probe-ui-{unique}.txt")),
+        cancel: dir.join(format!("cfw-probe-cancel-{unique}.txt")),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeReportView {
+    status: String,
+    kind: String,
+    claimed_bytes: u64,
+    real_bytes: u64,
+    read_mbps: f64,
+    write_mbps: f64,
+    overwritten: bool,
+    summary: String,
+}
+
+fn cancelled_probe_view(claimed_bytes: u64, overwritten: bool) -> ProbeReportView {
+    probe_view(probe::ProbeLog {
+        status: "cancelled".into(),
+        kind: String::new(),
+        claimed_bytes,
+        real_bytes: 0,
+        read_mbps: 0.0,
+        write_mbps: 0.0,
+        overwritten,
+        summary: probe::cancel_summary(overwritten),
+    })
+}
+
+fn probe_view(parsed: probe::ProbeLog) -> ProbeReportView {
+    ProbeReportView {
+        status: parsed.status,
+        kind: parsed.kind,
+        claimed_bytes: parsed.claimed_bytes,
+        real_bytes: parsed.real_bytes,
+        read_mbps: parsed.read_mbps,
+        write_mbps: parsed.write_mbps,
+        overwritten: parsed.overwritten,
+        summary: parsed.summary,
+    }
+}
+
+/// USB and SD cards only. Disk 0, system disks, and boot disks are left out.
+#[tauri::command]
+fn list_probe_disks() -> Result<Vec<FlashDiskView>, String> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-Disk | Where-Object { ($_.BusType -eq 'USB' -or $_.BusType -eq 'SD') -and $_.Number -ne 0 -and -not $_.IsSystem -and -not $_.IsBoot } | Select-Object Number, FriendlyName, Size | ConvertTo-Json -Compress",
+        ])
+        .output()
+        .map_err(|error| format!("could not list disks: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| format!("could not read the disk list: {error}"))?;
+    let rows = if value.is_array() {
+        value.as_array().cloned().unwrap_or_default()
+    } else {
+        vec![value]
+    };
+    let mut disks = Vec::new();
+    for row in rows {
+        let number = row.get("Number").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let size_bytes = row.get("Size").and_then(|v| v.as_u64()).unwrap_or(0);
+        if number == 0 || size_bytes == 0 {
+            continue;
+        }
+        disks.push(FlashDiskView {
+            number,
+            name: row
+                .get("FriendlyName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("USB disk")
+                .to_string(),
+            size_bytes,
+        });
+    }
+    Ok(disks)
+}
+
+/// Test a removable card for fake capacity. Writes go through `cfw-flash`.
+///
+/// A verified backup of this size and model from the current process, or a
+/// blank card, is required. The helper rechecks size, model, bus, and
+/// system/boot after the approval prompt.
+#[tauri::command]
+fn probe_card(
+    app: tauri::AppHandle,
+    disk_number: u32,
+    displayed_bytes: u64,
+    displayed_model: String,
+    confirmation: String,
+) -> Result<ProbeReportView, String> {
+    let _guard = begin_probe()?;
+    if disk_number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    if confirmation != "PROBE" {
+        return Err(probe::ProbeBlock::Confirmation.message().into());
+    }
+    let tool = flash_tool()?;
+    let live = query_restore_disk(disk_number)?;
+    let probe_disk = probe_disk_from_restore(&live);
+    let plan = probe::ProbePlan {
+        confirmation: confirmation.clone(),
+        disk_number,
+        displayed_bytes,
+        displayed_model: displayed_model.clone(),
+    };
+    probe::authorize_probe(&probe_disk, &plan).map_err(|block| block.message().to_string())?;
+
+    let remembered = session_backups()
+        .find(live.size_bytes, &live.model)
+        .cloned();
+    if let Some(backup) = &remembered {
+        match restore::inspect_backup(&backup.image, &PROBE_CANCEL, |_| {}) {
+            Ok(_) => {}
+            Err(restore::RestoreError::Cancelled { .. }) => {
+                return Ok(cancelled_probe_view(live.size_bytes, false));
+            }
+            Err(_) if PROBE_CANCEL.load(Ordering::SeqCst) => {
+                return Ok(cancelled_probe_view(live.size_bytes, false));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    } else if let Ok(file) = open_stock_disk_read_only(disk_number) {
+        let mut source = backup::ReadOnlyFile::new(file, live.size_bytes);
+        if !probe::card_is_blank(&mut source).map_err(|error| error.to_string())? {
+            return Err(probe::ProbeBlock::NotBlank.message().into());
+        }
+    }
+
+    let temps = probe_temp_paths();
+    restore::write_new_nofollow(&temps.cancel, b"")
+        .map_err(|error| format!("could not prepare cancel: {error}"))?;
+    restore::write_new_nofollow(&temps.log, b"")
+        .map_err(|error| format!("could not prepare the probe log: {error}"))?;
+    *probe_cancel_slot() = Some(temps.cancel.clone());
+    let request = probe::HelperRequest {
+        disk_number,
+        confirmation,
+        displayed_bytes,
+        displayed_model: displayed_model.clone(),
+        backup_image: remembered.as_ref().map(|backup| backup.image.clone()),
+        backup_sha256: remembered.as_ref().map(|backup| backup.sha256.clone()),
+        cancel_file: temps.cancel.clone(),
+        log_file: temps.log.clone(),
+    };
+    let script = probe::helper_script_line(&tool, &request)?;
+    restore::write_new_nofollow(&temps.script, script.as_bytes())
+        .map_err(|error| format!("could not write the launcher: {error}"))?;
+
+    let model_log = displayed_model.replace(['\n', '\r'], " ");
+    diag::log(
+        "INFO",
+        "probe_start",
+        &format!("disk={disk_number} bytes={displayed_bytes} model={model_log}"),
+    );
+    let _ = app.emit(
+        "probe-progress",
+        "Checking the card. Windows may ask for approval before anything is written.",
+    );
+    let launcher = format!(
+        "$p = Start-Process -FilePath powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'; if ($null -eq $p -or $null -eq $p.ExitCode) {{ exit 1 }}; exit $p.ExitCode",
+        temps.script.display().to_string().replace('\'', "''")
+    );
+    let status = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &launcher])
+        .status();
+    let text = restore::read_nofollow_string(&temps.log).unwrap_or_default();
+    let status = status.map_err(|error| format!("could not start the flash tool: {error}"))?;
+    if let Ok(parsed) = probe::parse_probe_log(&text) {
+        let event = if parsed.status == "cancelled" {
+            "probe_cancelled"
+        } else {
+            "probe_done"
+        };
+        diag::log(
+            "INFO",
+            event,
+            &format!(
+                "disk={disk_number} status={} overwritten={}",
+                parsed.status, parsed.overwritten
+            ),
+        );
+        return Ok(probe_view(parsed));
+    }
+    if PROBE_CANCEL.load(Ordering::SeqCst) && !text.contains("OVERWRITTEN=yes") {
+        diag::log("INFO", "probe_cancelled", &format!("disk={disk_number}"));
+        return Ok(cancelled_probe_view(displayed_bytes, false));
+    }
+    let _ = status;
+    diag::log(
+        "ERROR",
+        "probe_failed",
+        &format!("disk={disk_number}: {text}"),
+    );
+    Err(if text.trim().is_empty() {
+        "the test did not finish. The approval prompt may have been dismissed. The card was not written.".into()
+    } else {
+        text
+    })
+}
+
+#[tauri::command]
+fn cancel_probe() {
+    signal_probe_cancel();
 }
 
 #[derive(Serialize)]
@@ -2172,11 +2459,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_profiles,
             list_flash_disks,
+            list_probe_disks,
             flash_os,
             backup_stock_card,
             cancel_stock_backup,
             restore_backup,
             cancel_restore,
+            probe_card,
+            cancel_probe,
             list_volumes,
             firstboot_state,
             prepare_card,

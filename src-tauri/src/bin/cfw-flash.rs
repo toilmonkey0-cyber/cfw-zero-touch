@@ -1,11 +1,16 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 use cfw_zero_touch_lib::backup::{self, disk_query_script};
+use cfw_zero_touch_lib::block_device::{is_physical_disk_path, FakeBlockDevice};
 use cfw_zero_touch_lib::flash::{
     authorize_flash, sha256_prefix, sha256_reader, write_gzip, FlashDisk, FlashPlan, SectorWriter,
+};
+use cfw_zero_touch_lib::probe::{
+    self, ProbeDisk, ProbePlan, ProbeRequest, ProbeStatus, SessionBackup,
 };
 use cfw_zero_touch_lib::restore::{
     self, cancel_file_requests_stop, hashes_match, image_fits, same_model, BoundedWrite,
@@ -46,6 +51,10 @@ fn flag_present_in(args: &[String], name: &str) -> bool {
 fn restore_requested() -> bool {
     let args: Vec<String> = std::env::args().collect();
     args_request_restore(&args)
+}
+
+fn args_request_probe(args: &[String]) -> bool {
+    flag_present_in(args, "probe")
 }
 
 /// In restore mode both flags are mandatory. `Ok(None)` is an OS flash.
@@ -193,6 +202,16 @@ impl RunLog {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    // Probe is its own mode. `--expected-bytes` also marks a restore, so this
+    // branch has to win before `arg("image")` or the helper would wipe the card.
+    if args_request_probe(&args) {
+        if flag_present_in(&args, "restore") {
+            eprintln!("probe and restore cannot run together");
+            std::process::exit(2);
+        }
+        run_probe_mode();
+    }
     let image = arg("image");
     let expected = arg("sha256");
     let disk_number: u32 = arg("disk").parse().expect("disk number");
@@ -484,6 +503,168 @@ fn open_drive(number: u32) -> Result<File, String> {
     }
 }
 
+/// Seek the logical offset. A counterfeit card aliases in its own controller;
+/// this wrapper does not wrap the address in software.
+struct DriveDevice {
+    file: File,
+    len: u64,
+}
+
+impl FakeBlockDevice for DriveDevice {
+    fn reported_len(&self) -> u64 {
+        self.len
+    }
+
+    fn stored_len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(buf)
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(data)?;
+        self.file.flush()
+    }
+}
+
+/// Quick probe. Rechecks size and model after the approval prompt, then writes
+/// patterns through the same elevated process U4 uses. Does not call Clear-Disk.
+fn run_probe_mode() -> ! {
+    let mut log = RunLog::open(optional_arg("log-file").as_deref());
+    let disk_number: u32 = match arg("disk").parse() {
+        Ok(number) => number,
+        Err(_) => log.fail(2, "bad disk number"),
+    };
+    let confirmation = arg("confirm");
+    let expected_bytes = match parse_u64_flag("expected-bytes", optional_arg("expected-bytes")) {
+        Ok(Some(value)) => value,
+        Ok(None) => log.fail(2, "probe requires --expected-bytes"),
+        Err(error) => log.fail(2, &error),
+    };
+    let Some(expected_model) = optional_arg("expected-model") else {
+        log.fail(2, "probe requires --expected-model");
+    };
+    let backup_image = optional_arg("backup-image");
+    let backup_sha = optional_arg("backup-sha256");
+    let cancel_file = optional_arg("cancel-file");
+    match (&backup_image, &backup_sha) {
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => log.fail(
+            2,
+            "a probe backup needs both the image and the checksum from this session",
+        ),
+    }
+    if let Some(path) = &backup_image {
+        if is_physical_disk_path(Path::new(path)) {
+            log.fail(3, "refusing to read a backup from a physical disk path");
+        }
+    }
+    if let Some(path) = &cancel_file {
+        if is_physical_disk_path(Path::new(path)) {
+            log.fail(
+                3,
+                "refusing to read a cancel flag from a physical disk path",
+            );
+        }
+    }
+
+    let (disk, model) = match read_disk(disk_number) {
+        Ok(disk) => disk,
+        Err(error) => log.fail(2, &error),
+    };
+    log.line(&format!(
+        "target disk {} {} {} bytes model {model}",
+        disk.number, disk.bus, disk.size_bytes
+    ));
+    if let Err(error) = shown_disk_matches(
+        disk.size_bytes,
+        &model,
+        Some(expected_bytes),
+        Some(expected_model.as_str()),
+    ) {
+        log.fail(3, &error);
+    }
+    let probe_disk = ProbeDisk {
+        number: disk.number,
+        bus: disk.bus,
+        size_bytes: disk.size_bytes,
+        system_disk: disk.system_disk,
+        model: model.clone(),
+    };
+    let plan = ProbePlan {
+        confirmation,
+        disk_number,
+        displayed_bytes: expected_bytes,
+        displayed_model: expected_model,
+    };
+    if let Err(block) = probe::authorize_probe(&probe_disk, &plan) {
+        log.fail(3, block.message());
+    }
+    if let Some(path) = &cancel_file {
+        match cancel_file_requests_stop(Path::new(path)) {
+            Ok(true) => {
+                let status = ProbeStatus::Cancelled {
+                    overwritten: false,
+                    summary: probe::cancel_summary(false),
+                };
+                for line in probe::format_probe_log(&status).lines() {
+                    log.line(line);
+                }
+                log.exit(9);
+            }
+            Ok(false) => {}
+            Err(error) => log.fail(2, &error),
+        }
+    }
+
+    let backup = match (backup_image, backup_sha) {
+        (Some(path), Some(sha)) => Some(SessionBackup {
+            image: PathBuf::from(path),
+            size_bytes: probe_disk.size_bytes,
+            model: probe_disk.model.clone(),
+            sha256: sha,
+        }),
+        _ => None,
+    };
+    let file = match open_drive(disk_number) {
+        Ok(file) => file,
+        Err(error) => log.fail(2, &error),
+    };
+    let mut device = DriveDevice {
+        file,
+        len: probe_disk.size_bytes,
+    };
+    let request = ProbeRequest {
+        disk: &probe_disk,
+        plan: &plan,
+        backup: backup.as_ref(),
+    };
+    let cancel_path = cancel_file.as_ref().map(PathBuf::from);
+    match probe::run_probe(
+        &mut device,
+        &request,
+        &AtomicBool::new(false),
+        cancel_path.as_deref(),
+    ) {
+        Ok(status) => {
+            let code = match &status {
+                ProbeStatus::Cancelled { .. } => 9,
+                ProbeStatus::Finished(_) => 0,
+            };
+            for line in probe::format_probe_log(&status).lines() {
+                log.line(line);
+            }
+            log.exit(code);
+        }
+        Err(probe::ProbeError::Blocked(block)) => log.fail(3, block.message()),
+        Err(probe::ProbeError::Failed(message)) => log.fail(6, &message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,6 +730,19 @@ mod tests {
         assert!(size.unwrap_err().contains("size"));
         let model = shown_disk_matches(4096, "Samsung EVO", Some(4096), Some("Other"));
         assert!(model.unwrap_err().contains("model"));
+    }
+
+    #[test]
+    fn probe_flag_is_its_own_mode() {
+        let args = [
+            "cfw-flash".to_string(),
+            "--probe".to_string(),
+            "--expected-bytes=4096".to_string(),
+            "--expected-model=Samsung EVO".to_string(),
+        ];
+        assert!(args_request_probe(&args));
+        assert!(!flag_present_in(&args, "restore"));
+        assert!(!flag_present_in(&args, "image"));
     }
 
     #[test]
