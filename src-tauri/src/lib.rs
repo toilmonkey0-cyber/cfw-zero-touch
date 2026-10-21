@@ -114,6 +114,10 @@ fn lettered_partitions() -> Result<Vec<LetteredPartition>, String> {
         return Err(String::from_utf8_lossy(&output.stderr).to_string());
     }
     let text = String::from_utf8_lossy(&output.stdout);
+    parse_lettered_partitions(&text)
+}
+
+fn parse_lettered_partitions(text: &str) -> Result<Vec<LetteredPartition>, String> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(Vec::new());
@@ -138,9 +142,23 @@ fn lettered_partitions() -> Result<Vec<LetteredPartition>, String> {
             .get("DiskNumber")
             .and_then(|value| value.as_u64())
             .unwrap_or(0) as u32;
+        if disk == 0 {
+            continue;
+        }
         partitions.push(LetteredPartition { letter, disk });
     }
     Ok(partitions)
+}
+
+fn disk_number_of(letter: &str, partitions: &[LetteredPartition]) -> u32 {
+    let Some(want) = letter.chars().next() else {
+        return 0;
+    };
+    partitions
+        .iter()
+        .find(|row| row.letter.eq_ignore_ascii_case(&want))
+        .map(|row| row.disk)
+        .unwrap_or(0)
 }
 
 /// Judge whether ROMs may be copied onto this card for this profile.
@@ -235,9 +253,10 @@ struct VolumeView {
     decision: String,
     relabel: bool,
     reason: String,
+    disk_number: u32,
 }
 
-fn view_volume(volume: VolumeInfo, expected_label: &str) -> VolumeView {
+fn view_volume(volume: VolumeInfo, expected_label: &str, disk_number: u32) -> VolumeView {
     let decision = decide(&volume, expected_label);
     let (decision_name, relabel, reason) = match decision {
         VolumeDecision::Ready { relabel } => ("ready", relabel, String::new()),
@@ -254,6 +273,7 @@ fn view_volume(volume: VolumeInfo, expected_label: &str) -> VolumeView {
         decision: decision_name.into(),
         relabel,
         reason,
+        disk_number,
     }
 }
 
@@ -331,9 +351,13 @@ fn list_volumes(app: tauri::AppHandle, profile_id: String) -> Result<Vec<VolumeV
     let profile = profile_by_id(&app, &profile_id)?;
     let label = profile.rom_schema.volume_label.unwrap_or_default();
     let volumes = volume::list_volumes()?;
+    let partitions = lettered_partitions()?;
     Ok(volumes
         .into_iter()
-        .map(|volume| view_volume(volume, &label))
+        .map(|volume| {
+            let disk_number = disk_number_of(&volume.letter, &partitions);
+            view_volume(volume, &label, disk_number)
+        })
         .collect())
 }
 
@@ -379,7 +403,9 @@ fn prepare_card(
     }
     diag::log("INFO", "prepare_done", &format!("volume={}", volume.letter));
     let refreshed = require_volume(&volume_id).unwrap_or(volume);
-    Ok(view_volume(refreshed, &label))
+    let partitions = lettered_partitions().unwrap_or_default();
+    let disk_number = disk_number_of(&refreshed.letter, &partitions);
+    Ok(view_volume(refreshed, &label, disk_number))
 }
 
 #[tauri::command]
@@ -1814,6 +1840,29 @@ fn query_disk_serial(number: u32) -> Result<String, String> {
     Ok(probe::normalize_serial(line))
 }
 
+fn query_partition_table_id(number: u32) -> Result<String, String> {
+    if number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    let script = probe::partition_table_script(number);
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|error| format!("could not read the partition table id: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read the partition table id: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    probe::normalize_partition_table_id(line)
+}
+
 struct ProbeTemps {
     log: PathBuf,
     cancel: PathBuf,
@@ -1879,6 +1928,38 @@ fn probe_view(parsed: probe::ProbeLog) -> ProbeReportView {
         overwritten: parsed.overwritten,
         summary: parsed.summary,
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskIdentityView {
+    disk_number: u32,
+    serial: String,
+    size_bytes: u64,
+    partition_table_id: String,
+}
+
+/// Disk number, serial, size, and partition-table id from `Get-Disk`.
+/// Does not open `\\.\PhysicalDriveN`.
+///
+/// The serial may be the card reader's serial. `partition_table_id` is the
+/// GPT disk GUID or the MBR disk signature, which stays with the card.
+#[tauri::command]
+fn read_disk_identity(disk_number: u32) -> Result<DiskIdentityView, String> {
+    if disk_number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    let queried = query_restore_disk(disk_number)?;
+    let serial = query_disk_serial(disk_number)?;
+    let disk = probe_disk_from_restore(&queried, serial);
+    let (serial, size_bytes) = probe::accept_read_only_identity(&disk)?;
+    let partition_table_id = query_partition_table_id(disk_number)?;
+    Ok(DiskIdentityView {
+        disk_number: disk.number,
+        serial,
+        size_bytes,
+        partition_table_id,
+    })
 }
 
 /// USB and SD cards only. Disk 0, system disks, and boot disks are left out.
@@ -2890,6 +2971,7 @@ pub fn run() {
             detect_stock_device,
             list_flash_disks,
             list_probe_disks,
+            read_disk_identity,
             flash_os,
             backup_stock_card,
             cancel_stock_backup,
@@ -2924,4 +3006,35 @@ pub fn run() {
                 needle::serve::kill_all();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_disk_identity;
+
+    #[test]
+    fn read_disk_identity_refuses_disk_zero() {
+        let error = read_disk_identity(0).unwrap_err();
+        assert!(
+            error.contains("disk 0"),
+            "disk 0 must be refused before any disk query: {error}"
+        );
+    }
+
+    #[test]
+    fn each_lettered_volume_keeps_its_own_disk_number() {
+        let text = r#"[{"DriveLetter":"E","DiskNumber":2},{"DriveLetter":"F","DiskNumber":4}]"#;
+        let rows = super::parse_lettered_partitions(text).unwrap();
+        assert_eq!(super::disk_number_of("E", &rows), 2);
+        assert_eq!(super::disk_number_of("F:", &rows), 4);
+        let one = r#"{"DriveLetter":"G","DiskNumber":3}"#;
+        let rows = super::parse_lettered_partitions(one).unwrap();
+        assert_eq!(super::disk_number_of("g", &rows), 3);
+        assert_eq!(super::disk_number_of("Z", &rows), 0);
+        let system = r#"[{"DriveLetter":"C","DiskNumber":0},{"DriveLetter":"E","DiskNumber":2}]"#;
+        let rows = super::parse_lettered_partitions(system).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(super::disk_number_of("C", &rows), 0);
+        assert_eq!(super::disk_number_of("E", &rows), 2);
+    }
 }
