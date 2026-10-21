@@ -547,6 +547,8 @@ fn live_card_matches(number: u32, disk: &ProbeDisk, backup: &SessionBackup) -> R
     let mut device = DriveDevice {
         file,
         len: disk.size_bytes,
+        raw_read: None,
+        raw_disabled: true,
     };
     probe::live_identity_matches(&mut device, &backup.identity).map_err(|error| error.to_string())
 }
@@ -573,9 +575,42 @@ fn open_drive(number: u32) -> Result<File, String> {
 
 /// Seek the logical offset. A counterfeit card aliases in its own controller;
 /// this wrapper does not wrap the address in software.
+///
+/// `raw_read` is a `FILE_FLAG_NO_BUFFERING` handle used for the full-card
+/// read-back when the offset, length, and buffer are 4096-byte aligned.
+/// The quick probe leaves it empty. A 512-byte retry stays on `file`, because
+/// unbuffered I/O cannot use a short block.
 struct DriveDevice {
     file: File,
+    raw_read: Option<File>,
+    raw_disabled: bool,
     len: u64,
+}
+
+fn read_is_unbuffered(offset: u64, len: usize, ptr: usize) -> bool {
+    const ALIGN: u64 = 4096;
+    offset.is_multiple_of(ALIGN)
+        && (len as u64).is_multiple_of(ALIGN)
+        && (ptr as u64).is_multiple_of(ALIGN)
+}
+
+fn open_raw_read(number: u32) -> Result<File, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .custom_flags(FILE_FLAG_NO_BUFFERING)
+            .open(format!(r"\\.\PhysicalDrive{number}"))
+            .map_err(|error| format!("could not open drive {number} for unbuffered read: {error}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = number;
+        Err("unbuffered read-back is implemented for Windows".into())
+    }
 }
 
 impl FakeBlockDevice for DriveDevice {
@@ -588,6 +623,28 @@ impl FakeBlockDevice for DriveDevice {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut disable_raw = false;
+        let mut used_raw = false;
+        if !self.raw_disabled {
+            if let Some(raw) = self.raw_read.as_mut() {
+                if read_is_unbuffered(offset, buf.len(), buf.as_ptr() as usize) {
+                    raw.seek(SeekFrom::Start(offset))?;
+                    match raw.read_exact(buf) {
+                        Ok(()) => used_raw = true,
+                        // ERROR_INVALID_PARAMETER: this drive rejected the
+                        // unbuffered size. Later reads use the buffered handle.
+                        Err(error) if error.raw_os_error() == Some(87) => disable_raw = true,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        if disable_raw {
+            self.raw_disabled = true;
+        }
+        if used_raw {
+            return Ok(());
+        }
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(buf)
     }
@@ -793,6 +850,8 @@ fn prepare_destructive(log: &mut RunLog, word: &str) -> PreparedCard {
     };
     let device = DriveDevice {
         file,
+        raw_read: None,
+        raw_disabled: false,
         len: probe_disk.size_bytes,
     };
     let cancel_path = cancel_file.map(PathBuf::from);
@@ -892,6 +951,15 @@ fn run_full_check_mode() -> ! {
         cancel_path,
     } = armed;
     let _locks = locks;
+    device.raw_read = open_raw_read(disk.number).ok();
+    if device.raw_read.is_none() {
+        device.raw_disabled = true;
+    }
+    log.line(if device.raw_read.is_some() {
+        "READBACK=unbuffered"
+    } else {
+        "READBACK=buffered"
+    });
     let request = ProbeRequest {
         disk: &disk,
         plan: &plan,
@@ -1226,6 +1294,15 @@ mod tests {
             .unwrap_err()
             .contains("cannot run together"));
         assert!(card_test_mode(&["cfw-flash".into(), "--image=os.img.gz".into()]).is_ok());
+    }
+
+    #[test]
+    fn unbuffered_read_back_needs_4096_alignment() {
+        assert!(read_is_unbuffered(0, 4096, 4096));
+        assert!(read_is_unbuffered(1_048_576, 1_048_576, 8192));
+        assert!(!read_is_unbuffered(512, 4096, 4096));
+        assert!(!read_is_unbuffered(0, 512, 4096));
+        assert!(!read_is_unbuffered(0, 4096, 512));
     }
 
     #[test]

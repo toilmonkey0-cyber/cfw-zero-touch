@@ -89,6 +89,91 @@ struct CancelOnWrite<D> {
     writes: u32,
 }
 
+/// Accepts writes and reports success, but leaves the previous bytes in place.
+struct IgnoreWrites<D> {
+    inner: D,
+}
+
+impl<D: FakeBlockDevice> FakeBlockDevice for IgnoreWrites<D> {
+    fn reported_len(&self) -> u64 {
+        self.inner.reported_len()
+    }
+
+    fn stored_len(&self) -> u64 {
+        self.inner.stored_len()
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&mut self, _offset: u64, _data: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `read_at` fails when the request covers one of the chosen block offsets.
+///
+/// The blank-card check reads before any write. Failures start after the first
+/// write so they belong to the read-back, not the gate.
+struct FailReads<D> {
+    inner: D,
+    offsets: Vec<u64>,
+    armed: bool,
+}
+
+impl<D: FakeBlockDevice> FakeBlockDevice for FailReads<D> {
+    fn reported_len(&self) -> u64 {
+        self.inner.reported_len()
+    }
+
+    fn stored_len(&self) -> u64 {
+        self.inner.stored_len()
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let end = offset + buf.len() as u64;
+        if self.armed && self.offsets.iter().any(|bad| *bad >= offset && *bad < end) {
+            return Err(std::io::Error::other("injected read failure"));
+        }
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_at(offset, data)?;
+        self.armed = true;
+        Ok(())
+    }
+}
+
+/// `write_at` fails when the request covers one of the chosen block offsets.
+struct FailWrites<D> {
+    inner: D,
+    offsets: Vec<u64>,
+}
+
+impl<D: FakeBlockDevice> FakeBlockDevice for FailWrites<D> {
+    fn reported_len(&self) -> u64 {
+        self.inner.reported_len()
+    }
+
+    fn stored_len(&self) -> u64 {
+        self.inner.stored_len()
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        let end = offset + data.len() as u64;
+        if self.offsets.iter().any(|bad| *bad >= offset && *bad < end) {
+            return Err(std::io::Error::other("injected write failure"));
+        }
+        self.inner.write_at(offset, data)
+    }
+}
+
 impl<D: FakeBlockDevice> FakeBlockDevice for CancelOnWrite<D> {
     fn reported_len(&self) -> u64 {
         self.inner.reported_len()
@@ -230,9 +315,9 @@ fn assert_blocked(error: ProbeError, block: ProbeBlock) {
 
 #[test]
 fn pattern_is_seeded_and_changes_with_position() {
-    let first = pattern_block(0);
-    let next = pattern_block(FULL_BLOCK);
-    let later = pattern_block(FULL_BLOCK * 8);
+    let first = pattern_block(FULL_SEED, 0);
+    let next = pattern_block(FULL_SEED, FULL_BLOCK);
+    let later = pattern_block(FULL_SEED, FULL_BLOCK * 8);
     assert_eq!(&first[..8], b"CFWFULL1");
     assert_eq!(
         u64::from_le_bytes(first[8..16].try_into().unwrap()),
@@ -240,11 +325,16 @@ fn pattern_is_seeded_and_changes_with_position() {
     );
     assert_ne!(first, next);
     assert_ne!(first, later);
-    assert_eq!(fullcheck::decode_pattern_offset(&next), Some(FULL_BLOCK));
-    assert_eq!(fullcheck::decode_pattern_offset(&first), Some(0));
+    assert_ne!(first, pattern_block(FULL_SEED ^ 1, 0));
+    assert_eq!(
+        fullcheck::decode_pattern_offset(FULL_SEED, &next),
+        Some(FULL_BLOCK)
+    );
+    assert_eq!(fullcheck::decode_pattern_offset(FULL_SEED, &first), Some(0));
     let mut flipped = next;
     flipped[0] ^= 0xff;
-    assert_eq!(fullcheck::decode_pattern_offset(&flipped), None);
+    assert_eq!(fullcheck::decode_pattern_offset(FULL_SEED, &flipped), None);
+    assert_ne!(fullcheck::fresh_seed(), fullcheck::fresh_seed());
 }
 
 #[test]
@@ -263,12 +353,12 @@ fn three_spots_near_twelve_gigabytes_are_named_in_plain_language() {
             length: FULL_BLOCK,
         },
     ];
-    let summary = plain_summary(&ranges, false, false);
+    let summary = plain_summary(&ranges, ranges.len() as u64, 0, false, false);
     assert_eq!(
         summary,
         "Found 3 bad spots near 12 GB. Don't use this card. This card was fully erased. Format the card again before you use it."
     );
-    let backed_up = plain_summary(&ranges, true, false);
+    let backed_up = plain_summary(&ranges, ranges.len() as u64, 0, true, false);
     assert!(backed_up.contains("Found 3 bad spots near 12 GB"));
     assert!(backed_up.contains("Don't use this card"));
     assert!(backed_up.contains("fully erased"));
@@ -292,11 +382,11 @@ fn distant_spots_are_listed_and_a_clean_card_says_none() {
             length: FULL_BLOCK * 2,
         },
     ];
-    let summary = plain_summary(&ranges, false, true);
+    let summary = plain_summary(&ranges, ranges.len() as u64, 0, false, true);
     assert!(summary.contains("Found 3 bad spots near 1 MB, 12 GB, and 40 GB"));
     assert!(summary.contains("repeating"));
     assert!(summary.contains("fully erased"));
-    let clean = plain_summary(&[], true, false);
+    let clean = plain_summary(&[], 0, 0, true, false);
     assert!(clean.starts_with("No bad spots."));
     assert!(clean.contains("fully erased"));
     assert!(clean.contains("Restore your backup"));
@@ -443,7 +533,11 @@ fn writes_never_pass_the_claimed_size() {
         writes: Vec::new(),
     };
     let card = disk(2, "USB", size, false, "Generic SD");
-    run(&mut device, &card, None, &AtomicBool::new(false)).unwrap();
+    let status = run(&mut device, &card, None, &AtomicBool::new(false)).unwrap();
+    let seed = match &status {
+        FullStatus::Finished(report) => report.seed,
+        FullStatus::Cancelled { summary, .. } => panic!("bounds run should finish: {summary}"),
+    };
     assert_aligned_cover(&device.writes, size);
     let wide = open_fixture(&scratch, &vec![0u8; size as usize], size);
     let mut wide = Record {
@@ -474,7 +568,7 @@ fn writes_never_pass_the_claimed_size() {
         let mut expect = vec![0u8; data.len()];
         let mut at = 0;
         while at < data.len() {
-            let block = pattern_block(*offset + at as u64);
+            let block = pattern_block(seed, *offset + at as u64);
             expect[at..at + FULL_BLOCK as usize].copy_from_slice(&block);
             at += FULL_BLOCK as usize;
         }
@@ -735,10 +829,13 @@ fn a_cancel_file_before_writing_leaves_the_card_unchanged() {
 fn every_exit_records_whether_the_card_was_overwritten() {
     let finished = format_full_log(&FullStatus::Finished(FullReport {
         claimed_bytes: 8192,
+        seed: 7,
         bad_ranges: vec![BadRange {
             offset: 512,
             length: 512,
         }],
+        range_count: 1,
+        bad_bytes: 512,
         aliased: false,
         write_mbps: 1.5,
         read_mbps: 2.5,
@@ -747,12 +844,17 @@ fn every_exit_records_whether_the_card_was_overwritten() {
                 offset: 512,
                 length: 512,
             }],
+            1,
+            512,
             true,
             false,
         ),
     }));
     assert!(finished.contains("OVERWRITTEN=yes"));
     assert!(finished.contains("RESULT=OK"));
+    assert!(finished.contains("SEED=7"));
+    assert!(finished.contains("BAD_BYTES=512"));
+    assert!(finished.contains("BAD_COUNT=1"));
     assert!(finished.contains("BAD=512:512"));
     assert!(probe::overwritten_flag(&finished).unwrap());
     let parsed = interpret_full_log(Some(0), &finished, false, true).unwrap();
@@ -760,6 +862,9 @@ fn every_exit_records_whether_the_card_was_overwritten() {
     assert!(parsed.overwritten);
     assert_eq!(parsed.bad_ranges.len(), 1);
     assert_eq!(parsed.bad_ranges[0].offset, 512);
+    assert_eq!(parsed.seed, 7);
+    assert_eq!(parsed.bad_bytes, 512);
+    assert_eq!(parsed.range_count, 1);
 
     let cancelled_yes = format_full_log(&FullStatus::Cancelled {
         overwritten: true,
@@ -838,6 +943,213 @@ fn helper_launch_uses_full_check_and_refuses_a_physical_path() {
     )
     .unwrap_err();
     assert!(error.to_lowercase().contains("physical"));
+}
+
+#[test]
+fn a_card_that_ignores_writes_and_keeps_a_previous_pattern_is_bad() {
+    let scratch = Scratch::new("full-ignore-writes");
+    let size = 8192u64;
+    let mut bytes = vec![0u8; size as usize];
+    let mut at = 0;
+    while at < bytes.len() {
+        let block = pattern_block(FULL_SEED, at as u64);
+        bytes[at..at + FULL_BLOCK as usize].copy_from_slice(&block);
+        at += FULL_BLOCK as usize;
+    }
+    let model = "Generic SD";
+    let backup = finished_backup(scratch.path(), &bytes, model);
+    let device = open_fixture(&scratch, &bytes, size);
+    let mut device = IgnoreWrites { inner: device };
+    let card = disk(2, "USB", size, false, model);
+    let status = run(&mut device, &card, Some(&backup), &AtomicBool::new(false))
+        .expect("a stuck previous pattern is a finished bad report");
+    match status {
+        FullStatus::Finished(report) => {
+            assert_eq!(
+                report.bad_ranges,
+                vec![BadRange {
+                    offset: 0,
+                    length: size,
+                }]
+            );
+            assert!(report.summary.contains("Don't use this card"));
+            assert!(!report.summary.contains("No bad spots"));
+            let log = format_full_log(&FullStatus::Finished(report));
+            let seed_line = log
+                .lines()
+                .find(|line| line.starts_with("SEED="))
+                .expect("each run logs its seed");
+            let seed: u64 = seed_line
+                .trim_start_matches("SEED=")
+                .parse()
+                .expect("seed is a number");
+            assert_ne!(seed, FULL_SEED);
+            assert!(log.contains(&format!("SEED={seed}")));
+        }
+        FullStatus::Cancelled { summary, .. } => {
+            panic!("ignored writes must not pass or cancel: {summary}")
+        }
+    }
+}
+
+#[test]
+fn a_read_error_at_chosen_offsets_is_a_bad_range_and_the_scan_continues() {
+    let scratch = Scratch::new("full-read-errors");
+    let size = 8192u64;
+    let device = open_fixture(&scratch, &vec![0u8; size as usize], size);
+    let bad = vec![512u64, 4096];
+    let mut device = FailReads {
+        inner: device,
+        offsets: bad.clone(),
+        armed: false,
+    };
+    let card = disk(2, "SD", size, false, "Generic SD");
+    let plan = plan_for(&card);
+    let request = ProbeRequest {
+        disk: &card,
+        plan: &plan,
+        backup: None,
+    };
+    let status = run_full_check(
+        &mut device,
+        &FullRun {
+            request: &request,
+            cancel: &AtomicBool::new(false),
+            cancel_file: None,
+            chunk_bytes: 2048,
+        },
+        &mut |_| {},
+    )
+    .expect("read errors under the cap are bad ranges, not an abort");
+    match status {
+        FullStatus::Finished(report) => {
+            assert_eq!(
+                report.bad_ranges,
+                vec![
+                    BadRange {
+                        offset: 512,
+                        length: FULL_BLOCK,
+                    },
+                    BadRange {
+                        offset: 4096,
+                        length: FULL_BLOCK,
+                    },
+                ]
+            );
+            assert!(report.summary.contains("Found 2 bad spots"));
+            assert!(report.summary.contains("fully erased"));
+            assert!(!report.summary.contains("Cancelled"));
+        }
+        FullStatus::Cancelled { summary, .. } => panic!("read errors must not cancel: {summary}"),
+    }
+}
+
+#[test]
+fn a_write_error_at_one_block_is_a_bad_range_and_the_scan_continues() {
+    let scratch = Scratch::new("full-write-errors");
+    let size = 8192u64;
+    let device = open_fixture(&scratch, &vec![0u8; size as usize], size);
+    let mut device = FailWrites {
+        inner: device,
+        offsets: vec![1024],
+    };
+    let card = disk(2, "USB", size, false, "Generic SD");
+    let plan = plan_for(&card);
+    let request = ProbeRequest {
+        disk: &card,
+        plan: &plan,
+        backup: None,
+    };
+    let status = run_full_check(
+        &mut device,
+        &FullRun {
+            request: &request,
+            cancel: &AtomicBool::new(false),
+            cancel_file: None,
+            chunk_bytes: 2048,
+        },
+        &mut |_| {},
+    )
+    .expect("one write error is a bad range, not an abort");
+    match status {
+        FullStatus::Finished(report) => {
+            assert_eq!(
+                report.bad_ranges,
+                vec![BadRange {
+                    offset: 1024,
+                    length: FULL_BLOCK,
+                }]
+            );
+            assert!(!report.summary.contains("Cancelled"));
+            assert!(report.summary.contains("fully erased"));
+        }
+        FullStatus::Cancelled { summary, .. } => panic!("write errors must not cancel: {summary}"),
+    }
+}
+
+#[test]
+fn too_many_read_errors_stop_without_saying_cancelled() {
+    let scratch = Scratch::new("full-error-cap");
+    let blocks = 1088u64;
+    let size = blocks * FULL_BLOCK;
+    let device = open_fixture(&scratch, &vec![0u8; size as usize], size);
+    let offsets: Vec<u64> = (0..blocks).map(|index| index * FULL_BLOCK).collect();
+    let mut device = FailReads {
+        inner: device,
+        offsets,
+        armed: false,
+    };
+    let card = disk(2, "USB", size, false, "Generic SD");
+    let error = run(&mut device, &card, None, &AtomicBool::new(false))
+        .expect_err("a card that errors on every block stops");
+    match error {
+        ProbeError::Failed {
+            overwritten,
+            message,
+        } => {
+            assert!(overwritten);
+            assert!(message.contains("stopped because of an error"));
+            assert!(message.contains("Format the card again"));
+            assert!(!message.contains("Cancelled"));
+            assert!(!message.contains("Nothing"));
+        }
+        ProbeError::Blocked(block) => panic!("expected an error stop, got {}", block.message()),
+    }
+}
+
+#[test]
+fn only_the_first_ranges_are_reported_with_the_total_bad_bytes() {
+    let scratch = Scratch::new("full-range-cap");
+    let spots = 40u64;
+    let size = spots * FULL_BLOCK * 2;
+    let device = open_fixture(&scratch, &vec![0u8; size as usize], size);
+    let offsets: Vec<u64> = (0..spots).map(|index| index * FULL_BLOCK * 2).collect();
+    let mut device = CorruptBlocks {
+        inner: device,
+        offsets,
+    };
+    let card = disk(2, "SD", size, false, "Generic SD");
+    let status = run(&mut device, &card, None, &AtomicBool::new(false)).unwrap();
+    match status {
+        FullStatus::Finished(report) => {
+            assert_eq!(report.bad_ranges.len(), 32);
+            assert_eq!(report.bad_ranges[0].offset, 0);
+            assert_eq!(report.bad_ranges[0].length, FULL_BLOCK);
+            assert!(report.summary.contains("Found 40 bad spots"));
+            assert!(report.summary.contains("Showing the first 32"));
+            assert!(report.summary.contains("20.5 KB"));
+            let log = format_full_log(&FullStatus::Finished(report));
+            assert_eq!(
+                log.lines().filter(|line| line.starts_with("BAD=")).count(),
+                32
+            );
+            assert!(log.contains(&format!("BAD_BYTES={}", spots * FULL_BLOCK)));
+            assert!(log.contains("BAD_COUNT=40"));
+        }
+        FullStatus::Cancelled { summary, .. } => {
+            panic!("a capped report still finishes: {summary}")
+        }
+    }
 }
 
 fn assert_aligned_cover(writes: &[(u64, Vec<u8>)], claimed: u64) {

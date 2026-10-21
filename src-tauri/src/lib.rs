@@ -2216,7 +2216,7 @@ fn full_view(parsed: fullcheck::FullLog, claimed_bytes: u64) -> FullReportView {
         status: parsed.status,
         overwritten: parsed.overwritten,
         summary: parsed.summary,
-        bad_count: u32::try_from(parsed.bad_ranges.len()).unwrap_or(u32::MAX),
+        bad_count: u32::try_from(parsed.range_count).unwrap_or(u32::MAX),
         claimed_bytes: if parsed.claimed_bytes == 0 {
             claimed_bytes
         } else {
@@ -2234,6 +2234,9 @@ fn cancelled_full_view(claimed_bytes: u64, overwritten: bool, summary: String) -
             overwritten,
             summary,
             bad_ranges: Vec::new(),
+            range_count: 0,
+            bad_bytes: 0,
+            seed: 0,
             claimed_bytes,
             write_mbps: 0.0,
             read_mbps: 0.0,
@@ -2358,10 +2361,8 @@ fn full_check_card(
                 "INFO",
                 event,
                 &format!(
-                    "disk={disk_number} status={} overwritten={} bad={}",
-                    parsed.status,
-                    parsed.overwritten,
-                    parsed.bad_ranges.len()
+                    "disk={disk_number} status={} overwritten={} bad={} seed={}",
+                    parsed.status, parsed.overwritten, parsed.range_count, parsed.seed
                 ),
             );
             Ok(full_view(parsed, displayed_bytes))
