@@ -28,6 +28,7 @@ import { safetyNote, statusText, type LicenseView } from "./license";
 import { copyPreparedRoms, planRomCopy, prepareAndSeed } from "./romCardPrep";
 import { invokeSafety } from "./safetyPaths";
 import { probeConfirmPrompt } from "./probePath";
+import { saveSupportFile, SupportFileControl } from "./supportFile";
 import {
   isFinishedBackupName,
   restoreConfirmPrompt,
@@ -259,6 +260,7 @@ export default function App() {
   const [applyingFeed, setApplyingFeed] = useState(false);
   const [feedMessage, setFeedMessage] = useState("");
   const [diagPath, setDiagPath] = useState("");
+  const [supportNote, setSupportNote] = useState("");
   const [datFolder, setDatFolder] = useState("");
   const [regions, setRegions] = useState<string[]>(["USA"]);
   const [single, setSingle] = useState(true);
@@ -582,6 +584,30 @@ export default function App() {
     setBackupProgress(null);
     setStep("backup");
     await refreshFlashDisks();
+  }
+
+  async function saveSupport() {
+    setError("");
+    setSupportNote("");
+    try {
+      const outcome = await saveSupportFile(
+        invoke,
+        async () => {
+          const selected = await save({
+            title: "Save support file",
+            defaultPath: "cfw-card-studio-support.zip",
+            filters: [{ name: "Support file", extensions: ["zip"] }],
+          });
+          return typeof selected === "string" ? selected : null;
+        },
+        library,
+      );
+      if (outcome === "saved") {
+        setSupportNote("Support file saved. You can attach that zip when you ask for help.");
+      }
+    } catch (cause) {
+      setError(String(cause));
+    }
   }
 
   async function chooseBackupDestination() {
@@ -1135,6 +1161,7 @@ export default function App() {
             </button>
           </p>
         ) : null}
+        <SupportFileControl disabled={busy} note={supportNote} onSave={() => void saveSupport()} />
       </header>
 
       {error ? <p className="error">{error}</p> : null}

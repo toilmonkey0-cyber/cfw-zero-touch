@@ -10,7 +10,7 @@ Pre-1.0. Only the `main` branch is supported; fixes land there. There are no mai
 
 Report suspected vulnerabilities through GitHub's private vulnerability reporting on this repository (Security → Report a vulnerability). Please do not open a public issue for a security problem.
 
-Useful reports include the affected screen or command, the profile id, the card or disk state, whether a card was modified, and the relevant lines from `%LOCALAPPDATA%\cfw-card-studio\diagnostics.log`. The log deliberately contains no ROM file names, so it is safe to attach.
+Useful reports include the affected screen or command, the profile id, the card or disk state, whether a card was modified, and the relevant lines from `%LOCALAPPDATA%\cfw-card-studio\diagnostics.log`. The log deliberately contains no ROM file names, so it is safe to attach. The in-app **Save support file** button writes a zip of that log plus version, system, the latest card test, and license status. It removes game names, folder paths, account names, the license key, and email addresses before saving. The app does not upload the zip.
 
 Expect an initial response within about a week. This is a part-time project, and there is no bug bounty.
 

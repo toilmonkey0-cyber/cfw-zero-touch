@@ -480,6 +480,16 @@ impl<T: LicenseTransport> Session<T> {
         }
     }
 
+    /// Status for a support file. This never contacts Gumroad and never returns
+    /// the saved key, the cache MAC, or a response body.
+    pub fn offline_status(&self) -> LicenseStatus {
+        match self.load() {
+            CacheLoad::Missing => inactive(Reason::NotActivated, MSG_ENTER),
+            CacheLoad::Untrusted => inactive(Reason::UntrustedCache, MSG_UNTRUSTED),
+            CacheLoad::Trusted(cached) => status_from_stored(&cached),
+        }
+    }
+
     pub fn activate(&self, license_key: &str, now: i64) -> ActivateOutcome {
         let key = license_key.trim();
         if let Some(failure) = self.preflight(key) {
@@ -2432,5 +2442,27 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "safety path waited on licensing"
         );
+    }
+
+    #[test]
+    fn offline_status_for_a_support_file_does_not_call_gumroad() {
+        let lab = lab(vec![]);
+        let status = lab.session.offline_status();
+        assert_eq!(status.reason, Reason::NotActivated);
+        assert!(calls_of(&lab).is_empty());
+        let cache = lab.dir.join("license").join("activation.json");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(
+            &cache,
+            format!(
+                r#"{{"payload":{{"license_key":"{KEY}","email":"{EMAIL}"}},"mac":"abcdef0123456789abcdef0123456789"}}"#
+            ),
+        )
+        .unwrap();
+        let status = lab.session.offline_status();
+        assert_eq!(status.reason, Reason::UntrustedCache);
+        assert!(!status.message.contains(KEY), "{}", status.message);
+        assert!(!status.message.contains(EMAIL), "{}", status.message);
+        assert!(calls_of(&lab).is_empty());
     }
 }

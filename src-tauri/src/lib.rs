@@ -1918,6 +1918,44 @@ fn cancelled_probe_view(claimed_bytes: u64, overwritten: bool, summary: String) 
     })
 }
 
+fn remember_probe_outcome(disk_number: u32, view: &ProbeReportView) {
+    diag::remember_probe(&diag::format_probe(
+        &view.status,
+        disk_number,
+        view.claimed_bytes,
+        view.real_bytes,
+        (view.read_mbps, view.write_mbps),
+        view.overwritten,
+        &view.summary,
+    ));
+    let kind = if !view.kind.is_empty() {
+        view.kind.as_str()
+    } else if view.status == "cancelled" {
+        "not_finished"
+    } else {
+        "unknown"
+    };
+    diag::remember_fake_card(&diag::format_fake_card(
+        kind,
+        view.claimed_bytes,
+        view.real_bytes,
+        &view.summary,
+    ));
+}
+
+fn remember_probe_failure(disk_number: u32, message: &str) {
+    diag::remember_probe(&diag::format_probe(
+        "failed",
+        disk_number,
+        0,
+        0,
+        (0.0, 0.0),
+        false,
+        message,
+    ));
+    diag::remember_fake_card(&diag::format_fake_card("unknown", 0, 0, message));
+}
+
 fn probe_view(parsed: probe::ProbeLog) -> ProbeReportView {
     ProbeReportView {
         status: parsed.status,
@@ -1955,12 +1993,19 @@ fn read_disk_identity(disk_number: u32) -> Result<DiskIdentityView, String> {
     let disk = probe_disk_from_restore(&queried, serial);
     let (serial, size_bytes) = probe::accept_read_only_identity(&disk)?;
     let partition_table_id = query_partition_table_id(disk_number)?;
-    Ok(DiskIdentityView {
+    let view = DiskIdentityView {
         disk_number: disk.number,
         serial,
         size_bytes,
         partition_table_id,
-    })
+    };
+    diag::remember_identity(&diag::format_identity(
+        view.disk_number,
+        &view.serial,
+        view.size_bytes,
+        &view.partition_table_id,
+    ));
+    Ok(view)
 }
 
 /// USB and SD cards only. Disk 0, system disks, and boot disks are left out.
@@ -2149,8 +2194,15 @@ fn probe_card(
             bytes,
             overwritten,
             summary,
-        }) => return Ok(cancelled_probe_view(bytes, overwritten, summary)),
-        Err(ScreenStop::Failed(message)) => return Err(message),
+        }) => {
+            let view = cancelled_probe_view(bytes, overwritten, summary);
+            remember_probe_outcome(disk_number, &view);
+            return Ok(view);
+        }
+        Err(ScreenStop::Failed(message)) => {
+            remember_probe_failure(disk_number, &message);
+            return Err(message);
+        }
     };
 
     let temps = probe_temp_paths();
@@ -2208,7 +2260,9 @@ fn probe_card(
                     parsed.status, parsed.overwritten
                 ),
             );
-            Ok(probe_view(parsed))
+            let view = probe_view(parsed);
+            remember_probe_outcome(disk_number, &view);
+            Ok(view)
         }
         Ok(probe::HelperFollowup::Cancelled {
             overwritten,
@@ -2219,7 +2273,9 @@ fn probe_card(
                 "probe_cancelled",
                 &format!("disk={disk_number} overwritten={overwritten}"),
             );
-            Ok(cancelled_probe_view(displayed_bytes, overwritten, summary))
+            let view = cancelled_probe_view(displayed_bytes, overwritten, summary);
+            remember_probe_outcome(disk_number, &view);
+            Ok(view)
         }
         Err(message) => {
             diag::log(
@@ -2227,6 +2283,7 @@ fn probe_card(
                 "probe_failed",
                 &format!("disk={disk_number}: {message}"),
             );
+            remember_probe_failure(disk_number, &message);
             Err(message)
         }
     }
@@ -2586,6 +2643,53 @@ fn app_version() -> String {
 #[tauri::command]
 fn diagnostics_path() -> String {
     diag::log_path().display().to_string()
+}
+
+/// Save one support zip. Reads notes and license status only. Does not open a card.
+#[tauri::command]
+fn save_support_bundle(destination: String, library: Option<String>) -> Result<(), String> {
+    let dest = PathBuf::from(destination.trim());
+    diag::refuse_support_destination(&dest)?;
+    let library = library.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() || diag::is_device_path(&trimmed) {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    });
+    let view = with_license(|session| session.offline_status().to_view(None));
+    let mut usernames = Vec::new();
+    for key in ["USER", "USERNAME"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim().to_string();
+            if trimmed.len() >= 3 {
+                usernames.push(trimmed);
+            }
+        }
+    }
+    diag::write_support_bundle(
+        &dest,
+        &diag::SupportFacts {
+            version: env!("CARGO_PKG_VERSION").into(),
+            os_name: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            library,
+            license_state: view.state,
+            license_reason: view.reason,
+            license_message: view.message,
+            license_uses: view.uses,
+            over_soft_limit: view.over_soft_limit,
+            stale: view.stale,
+            signed_updates: view.signed_updates,
+            support: view.support,
+            safety_open: view.safety_open,
+            usernames,
+            secrets: Vec::new(),
+        },
+    )?;
+    diag::log("INFO", "support_saved", "file=support-zip");
+    Ok(())
 }
 
 /// Doctor diagnosis of one selected card: deterministic templates plus an
@@ -3109,6 +3213,7 @@ pub fn run() {
             app_version,
             stage_library,
             diagnostics_path,
+            save_support_bundle,
             needle_status,
             needle_acquire,
             classify_library,
@@ -3131,7 +3236,21 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::read_disk_identity;
+    use super::{read_disk_identity, save_support_bundle};
+
+    #[test]
+    fn save_support_bundle_refuses_a_disk_device() {
+        let error = save_support_bundle("/dev/mmcblk0".into(), None).unwrap_err();
+        assert!(
+            error.to_lowercase().contains("disk") || error.to_lowercase().contains("file"),
+            "{error}"
+        );
+        let drive = save_support_bundle(r"\\.\PhysicalDrive1".into(), None).unwrap_err();
+        assert!(
+            drive.to_lowercase().contains("disk") || drive.to_lowercase().contains("file"),
+            "{drive}"
+        );
+    }
 
     #[test]
     fn read_disk_identity_refuses_disk_zero() {

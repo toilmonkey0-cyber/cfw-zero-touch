@@ -54,7 +54,7 @@ It is built for the moment the usual tutorials get wrong. On single-card ArkOS/d
 **Extras**
 - Six card layouts driven by JSON profiles with a published schema, so a new device is a data change.
 - Profile update feed and an in-app update check.
-- Local diagnostics log (`%LOCALAPPDATA%\cfw-card-studio\diagnostics.log`) recording what the app did, viewable from the footer. It never leaves your PC and never records ROM file names.
+- Local diagnostics log (`%LOCALAPPDATA%\cfw-card-studio\diagnostics.log`) recording what the app did, viewable from the footer. It never leaves your PC and never records ROM file names. **Save support file** writes one zip you can send yourself: version, system, recent notes, the latest card test, and license status. Game names, folder paths, the license key, and email addresses are left out.
 
 ## Supported card layouts
 
