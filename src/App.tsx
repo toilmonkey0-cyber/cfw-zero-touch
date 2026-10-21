@@ -11,6 +11,7 @@ import {
   type StockDetection,
 } from "./detectDevice";
 import { formatBytes } from "./formatBytes";
+import { GuidedWizard } from "./GuidedWizard";
 import { fullConfirmPrompt, fullProgressLabel } from "./fullCheckPath";
 import { probeConfirmPrompt } from "./probePath";
 import {
@@ -104,7 +105,8 @@ type Step =
   | "backup"
   | "restore"
   | "probe"
-  | "fullcheck";
+  | "fullcheck"
+  | "guided";
 
 type BackupProgress = { bytesRead: number; bytesTotal: number };
 
@@ -1019,6 +1021,8 @@ export default function App() {
 
       {error ? <p className="error">{error}</p> : null}
 
+      {step === "guided" ? <GuidedWizard onExit={() => setStep("profile")} /> : null}
+
       {step === "profile" ? (
         <section>
           <h2>Choose a card layout</h2>
@@ -1050,6 +1054,9 @@ export default function App() {
             </div>
           ) : null}
           <div className="row">
+            <button disabled={busy} onClick={() => setStep("guided")}>
+              Guided setup
+            </button>
             <button disabled={busy} onClick={() => void openBackup()}>
               Back up a stock card
             </button>
