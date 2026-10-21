@@ -57,7 +57,7 @@ export const BOOT_ONCE_STEPS = [
 
 export const SKIP_WARNINGS: Record<GuidedStep, string> = {
   backup:
-    "Skipping the backup means this card cannot be restored. The backup route stays off. The blank route still applies to a card that is empty.",
+    "Skipping the backup means this setup cannot restore the card. The card test does not take a route from here. It still runs when this app session has a backup of this exact card, or the card is blank.",
   probe:
     "Skipping the quick test means a card that claims the wrong size can still be erased by a later step.",
   fullCheck:
@@ -87,11 +87,19 @@ const WORD: Partial<Record<CommandName, string>> = {
   restore_backup: "FLASH",
 };
 
+export type DiskIdentity = {
+  diskNumber: number;
+  serial: string;
+  sizeBytes: number;
+};
+
 export type FlowCall = {
   command: CommandName;
   confirmation: string;
   route: "" | "backup" | "blank";
   diskNumber: number;
+  serial: string;
+  sizeBytes: number;
   profileId: string;
   volumeId: string;
   destination: string;
@@ -114,6 +122,9 @@ export type GuidedFlow = {
   cardReinserted: boolean;
   identityRechecked: boolean;
   redetectedProfileId: string;
+  pinnedDisk: DiskIdentity | null;
+  flashDisk: DiskIdentity | null;
+  reinsertedDisk: DiskIdentity | null;
   calls: FlowCall[];
 };
 
@@ -166,8 +177,28 @@ export function startGuidedFlow(): GuidedFlow {
     cardReinserted: false,
     identityRechecked: false,
     redetectedProfileId: "",
+    pinnedDisk: null,
+    flashDisk: null,
+    reinsertedDisk: null,
     calls: [],
   };
+}
+
+/** Whitespace-insensitive, like the backup serial check. */
+export function normalizeSerial(serial: string): string {
+  return serial.replace(/\s+/g, "").toLowerCase();
+}
+
+export function sameDisk(left: DiskIdentity, right: DiskIdentity): boolean {
+  const serial = normalizeSerial(left.serial);
+  return (
+    serial.length > 0 &&
+    serial === normalizeSerial(right.serial) &&
+    left.diskNumber === right.diskNumber &&
+    left.diskNumber > 0 &&
+    left.sizeBytes === right.sizeBytes &&
+    left.sizeBytes > 0
+  );
 }
 
 export function skipWarning(flow: GuidedFlow): string {
@@ -176,10 +207,12 @@ export function skipWarning(flow: GuidedFlow): string {
 }
 
 export function probeRouteFlag(flow: GuidedFlow): string {
+  const check =
+    "The card test does not take a route from here. It still runs when this app session has a backup of this exact card, or the card is blank.";
   if (flow.backupDone && !flow.backupRouteDisabled) {
-    return "The backup route is on: this setup has a backup of this card. The blank route still applies if the card is empty.";
+    return `This setup saved a backup of the card. ${check}`;
   }
-  return "The backup route is off: this card cannot be restored. The blank route still applies if the card is empty.";
+  return `This setup has no backup, so it cannot restore the card. ${check}`;
 }
 
 export function skipStep(flow: GuidedFlow): GuidedFlow {
@@ -202,30 +235,33 @@ export function skipStep(flow: GuidedFlow): GuidedFlow {
 
 export function planBackup(
   flow: GuidedFlow,
-  input: { diskNumber: number; destination: string },
+  input: DiskIdentity & { destination: string },
 ): Plan {
-  const blocked = refuseActive(flow, "backup") ?? refuseDisk(input.diskNumber) ?? refuseBackupName(input.destination);
+  const blocked =
+    refuseActive(flow, "backup") ??
+    refuseIdentity(flow, input) ??
+    refuseBackupName(input.destination);
   if (blocked) return { ok: false, reason: blocked };
   return okCall({
     command: "backup_stock_card",
-    diskNumber: input.diskNumber,
+    ...normalizedIdentity(input),
     destination: input.destination.trim(),
   });
 }
 
 export function planProbe(
   flow: GuidedFlow,
-  input: { diskNumber: number; confirmation: string; route: "backup" | "blank" },
+  input: DiskIdentity & { confirmation: string; route: "backup" | "blank" },
 ): Plan {
   const blocked =
     refuseActive(flow, "probe") ??
-    refuseDisk(input.diskNumber) ??
+    refuseIdentity(flow, input) ??
     refuseWord("probe_card", input.confirmation) ??
     refuseRoute(flow, input.route);
   if (blocked) return { ok: false, reason: blocked };
   return okCall({
     command: "probe_card",
-    diskNumber: input.diskNumber,
+    ...normalizedIdentity(input),
     confirmation: input.confirmation,
     route: input.route,
   });
@@ -233,17 +269,17 @@ export function planProbe(
 
 export function planFullCheck(
   flow: GuidedFlow,
-  input: { diskNumber: number; confirmation: string; route: "backup" | "blank" },
+  input: DiskIdentity & { confirmation: string; route: "backup" | "blank" },
 ): Plan {
   const blocked =
     refuseActive(flow, "fullCheck") ??
-    refuseDisk(input.diskNumber) ??
+    refuseIdentity(flow, input) ??
     refuseWord("full_check_card", input.confirmation) ??
     refuseRoute(flow, input.route);
   if (blocked) return { ok: false, reason: blocked };
   return okCall({
     command: "full_check_card",
-    diskNumber: input.diskNumber,
+    ...normalizedIdentity(input),
     confirmation: input.confirmation,
     route: input.route,
   });
@@ -264,11 +300,11 @@ export function planDetect(flow: GuidedFlow): Plan {
 
 export function planFlash(
   flow: GuidedFlow,
-  input: { diskNumber: number; confirmation: string },
+  input: DiskIdentity & { confirmation: string },
 ): Plan {
   const blocked =
     refuseActive(flow, "flash") ??
-    refuseDisk(input.diskNumber) ??
+    refuseIdentity(flow, input) ??
     refuseWord("flash_os", input.confirmation);
   if (blocked) return { ok: false, reason: blocked };
   if (flow.confirmedProfileId.length === 0) {
@@ -279,7 +315,7 @@ export function planFlash(
   }
   return okCall({
     command: "flash_os",
-    diskNumber: input.diskNumber,
+    ...normalizedIdentity(input),
     confirmation: input.confirmation,
     profileId: flow.confirmedProfileId,
   });
@@ -292,6 +328,13 @@ export function planCopy(flow: GuidedFlow, input: { volumeId: string }): Plan {
   }
   if (!flow.identityRechecked) {
     return { ok: false, reason: "Copy stays off until the card is recognized again." };
+  }
+  const expected = recordedCard(flow);
+  if (!flow.reinsertedDisk || !expected || !sameDisk(expected, flow.reinsertedDisk)) {
+    return {
+      ok: false,
+      reason: "Copy stays off until the same card is recognized again.",
+    };
   }
   if (flow.step !== "copy") return { ok: false, reason: "This step is not the current one." };
   if (
@@ -318,7 +361,7 @@ export function planCopy(flow: GuidedFlow, input: { volumeId: string }): Plan {
 
 export function planRestore(
   flow: GuidedFlow,
-  input: { diskNumber: number; confirmation: string; imagePath: string },
+  input: DiskIdentity & { confirmation: string; imagePath: string },
 ): Plan {
   if (!flow.stopped) {
     return {
@@ -326,14 +369,15 @@ export function planRestore(
       reason: "Restore waits until this setup stops. It does not run in the middle of the steps.",
     };
   }
-  const blocked = refuseDisk(input.diskNumber) ?? refuseWord("restore_backup", input.confirmation);
+  const blocked =
+    refuseIdentity(flow, input) ?? refuseWord("restore_backup", input.confirmation);
   if (blocked) return { ok: false, reason: blocked };
   if (!isFinishedBackupName(input.imagePath)) {
     return { ok: false, reason: "Choose a finished .img.gz backup. Partial backups are refused." };
   }
   return okCall({
     command: "restore_backup",
-    diskNumber: input.diskNumber,
+    ...normalizedIdentity(input),
     confirmation: input.confirmation,
     imagePath: input.imagePath.trim(),
   });
@@ -343,8 +387,7 @@ export function finishBackup(flow: GuidedFlow, call: FlowCall, result: BackupOut
   if (!matches(flow, call)) return flow;
   if (result.status === "complete") {
     return {
-      ...flow,
-      calls: [...flow.calls, call],
+      ...recordIssued(flow, call),
       step: "probe",
       backupDone: true,
       backupRouteDisabled: false,
@@ -358,8 +401,7 @@ export function finishProbe(flow: GuidedFlow, call: FlowCall, result: ProbeOutco
   if (!matches(flow, call)) return flow;
   if (result.status === "finished" && result.kind === "genuine") {
     return {
-      ...flow,
-      calls: [...flow.calls, call],
+      ...recordIssued(flow, call),
       step: "fullCheck",
       note: result.summary,
     };
@@ -372,8 +414,7 @@ export function finishFullCheck(flow: GuidedFlow, call: FlowCall, result: FullOu
   if (!matches(flow, call)) return flow;
   if (result.status === "finished" && result.badCount === 0) {
     return {
-      ...flow,
-      calls: [...flow.calls, call],
+      ...recordIssued(flow, call),
       step: "detect",
       note: result.summary,
     };
@@ -386,10 +427,11 @@ export function applyDetection(
   flow: GuidedFlow,
   call: FlowCall,
   detection: StockDetection,
+  presented?: DiskIdentity,
 ): GuidedFlow {
   if (!matches(flow, call)) return flow;
   const recorded: GuidedFlow = { ...flow, calls: [...flow.calls, call] };
-  if (recheckDue(flow)) return applyRecheck(recorded, detection);
+  if (recheckDue(flow)) return applyRecheck(recorded, detection, presented);
   const notice = detectionNotice(detection, false);
   return {
     ...recorded,
@@ -441,7 +483,12 @@ export function chooseDevice(flow: GuidedFlow, profileId: string): GuidedFlow {
 export function finishFlash(flow: GuidedFlow, call: FlowCall, result: WriteOutcome): GuidedFlow {
   if (!matches(flow, call)) return flow;
   if (result.ok) {
-    return { ...flow, calls: [...flow.calls, call], step: "bootOnce", note: result.summary };
+    return {
+      ...recordIssued(flow, call),
+      step: "bootOnce",
+      note: result.summary,
+      flashDisk: identityOf(call),
+    };
   }
   return halt(flow, call, result.outcome, result.overwritten, result.summary);
 }
@@ -456,15 +503,14 @@ export function markCardReturned(flow: GuidedFlow): GuidedFlow {
 /** Clears a finished recheck so the user can insert the card and detect it again. */
 export function repeatIdentityCheck(flow: GuidedFlow): GuidedFlow {
   if (flow.stopped || flow.step !== "copy" || !flow.cardReinserted) return flow;
-  return { ...flow, identityRechecked: false, redetectedProfileId: "" };
+  return { ...flow, identityRechecked: false, redetectedProfileId: "", reinsertedDisk: null };
 }
 
 export function finishCopy(flow: GuidedFlow, call: FlowCall, result: WriteOutcome): GuidedFlow {
   if (!matches(flow, call)) return flow;
   if (result.ok) {
     return {
-      ...flow,
-      calls: [...flow.calls, call],
+      ...recordIssued(flow, call),
       step: "done",
       note: result.summary,
       status: "Guided setup finished.",
@@ -475,7 +521,7 @@ export function finishCopy(flow: GuidedFlow, call: FlowCall, result: WriteOutcom
 
 export function finishRestore(flow: GuidedFlow, call: FlowCall, result: WriteOutcome): GuidedFlow {
   if (!matches(flow, call)) return flow;
-  const recorded: GuidedFlow = { ...flow, calls: [...flow.calls, call], note: result.summary };
+  const recorded: GuidedFlow = { ...recordIssued(flow, call), note: result.summary };
   if (result.ok) {
     return {
       ...recorded,
@@ -491,14 +537,36 @@ export function finishRestore(flow: GuidedFlow, call: FlowCall, result: WriteOut
   };
 }
 
-function applyRecheck(flow: GuidedFlow, detection: StockDetection): GuidedFlow {
-  const profileId = detection.status === "matched" ? detection.profileId : "";
-  if (profileId.length > 0 && profileId !== flow.confirmedProfileId) {
+function applyRecheck(
+  flow: GuidedFlow,
+  detection: StockDetection,
+  presented?: DiskIdentity,
+): GuidedFlow {
+  const expected = recordedCard(flow);
+  const identity = presented ? identityOf(presentedAsCall(presented)) : null;
+  if (!identity || !expected || !sameDisk(expected, identity)) {
     return {
       ...flow,
       stopped: true,
-      identityRechecked: true,
+      identityRechecked: false,
+      reinsertedDisk: null,
+      note: detectionNotice(detection, false).message,
+      status:
+        "Stopped. This card was not recognized. The disk number, serial, or size does not match the card this setup recorded. Copy stays off.",
+    };
+  }
+  const profileId = detection.status === "matched" ? detection.profileId : "";
+  if (
+    profileId.length > 0 &&
+    flow.confirmedProfileId.length > 0 &&
+    profileId !== flow.confirmedProfileId
+  ) {
+    return {
+      ...flow,
+      stopped: true,
+      identityRechecked: false,
       redetectedProfileId: profileId,
+      reinsertedDisk: identity,
       note: detectionNotice(detection, false).message,
       status:
         "Stopped. This card looks like a different handheld than the one you confirmed. Copy stays off.",
@@ -509,10 +577,11 @@ function applyRecheck(flow: GuidedFlow, detection: StockDetection): GuidedFlow {
     step: "copy",
     identityRechecked: true,
     redetectedProfileId: profileId,
+    reinsertedDisk: identity,
     note:
       profileId.length > 0
         ? detectionNotice(detection, false).message
-        : "The card is back. Stock-card detection did not name a different handheld.",
+        : "The card is back. The disk number, serial, and size match the card this setup recorded.",
   };
 }
 
@@ -525,8 +594,7 @@ function halt(
 ): GuidedFlow {
   const step = flow.step === "done" ? "copy" : flow.step;
   return {
-    ...flow,
-    calls: [...flow.calls, call],
+    ...recordIssued(flow, call),
     stopped: true,
     step,
     note: summary,
@@ -565,13 +633,16 @@ function matches(flow: GuidedFlow, call: FlowCall): boolean {
 function replan(flow: GuidedFlow, call: FlowCall): Plan {
   switch (call.command) {
     case "backup_stock_card":
-      return planBackup(flow, { diskNumber: call.diskNumber, destination: call.destination });
+      return planBackup(flow, {
+        ...identityOf(call),
+        destination: call.destination,
+      });
     case "probe_card":
       if (call.route !== "backup" && call.route !== "blank") {
         return { ok: false, reason: "Choose the backup route or the blank route." };
       }
       return planProbe(flow, {
-        diskNumber: call.diskNumber,
+        ...identityOf(call),
         confirmation: call.confirmation,
         route: call.route,
       });
@@ -580,17 +651,17 @@ function replan(flow: GuidedFlow, call: FlowCall): Plan {
         return { ok: false, reason: "Choose the backup route or the blank route." };
       }
       return planFullCheck(flow, {
-        diskNumber: call.diskNumber,
+        ...identityOf(call),
         confirmation: call.confirmation,
         route: call.route,
       });
     case "detect_stock_device":
       return planDetect(flow);
     case "flash_os":
-      return planFlash(flow, { diskNumber: call.diskNumber, confirmation: call.confirmation });
+      return planFlash(flow, { ...identityOf(call), confirmation: call.confirmation });
     case "restore_backup":
       return planRestore(flow, {
-        diskNumber: call.diskNumber,
+        ...identityOf(call),
         confirmation: call.confirmation,
         imagePath: call.imagePath,
       });
@@ -605,6 +676,8 @@ function sameCall(left: FlowCall, right: FlowCall): boolean {
     left.confirmation === right.confirmation &&
     left.route === right.route &&
     left.diskNumber === right.diskNumber &&
+    left.serial === right.serial &&
+    left.sizeBytes === right.sizeBytes &&
     left.profileId === right.profileId &&
     left.volumeId === right.volumeId &&
     left.destination === right.destination &&
@@ -634,6 +707,52 @@ function refuseDisk(diskNumber: number): string | null {
   return null;
 }
 
+function refuseIdentity(flow: GuidedFlow, identity: DiskIdentity): string | null {
+  const disk = refuseDisk(identity.diskNumber);
+  if (disk) return disk;
+  if (!Number.isInteger(identity.sizeBytes) || identity.sizeBytes <= 0) {
+    return "A disk that reports size 0 is never used.";
+  }
+  if (normalizeSerial(identity.serial).length === 0) {
+    return "This card did not report a serial, so it cannot be recognized.";
+  }
+  if (flow.pinnedDisk && !sameDisk(flow.pinnedDisk, identity)) {
+    return "This setup is already using another card. Start over to use a different card.";
+  }
+  return null;
+}
+
+function normalizedIdentity(identity: DiskIdentity): DiskIdentity {
+  return identityOf(presentedAsCall(identity));
+}
+
+function identityOf(call: Pick<FlowCall, "diskNumber" | "serial" | "sizeBytes">): DiskIdentity {
+  return {
+    diskNumber: call.diskNumber,
+    serial: normalizeSerial(call.serial),
+    sizeBytes: call.sizeBytes,
+  };
+}
+
+function presentedAsCall(identity: DiskIdentity): Pick<FlowCall, "diskNumber" | "serial" | "sizeBytes"> {
+  return identity;
+}
+
+function recordedCard(flow: GuidedFlow): DiskIdentity | null {
+  return flow.flashDisk ?? flow.pinnedDisk;
+}
+
+function withPinned(flow: GuidedFlow, call: FlowCall): GuidedFlow {
+  if (flow.pinnedDisk) return flow;
+  const identity = identityOf(call);
+  if (!sameDisk(identity, identity)) return flow;
+  return { ...flow, pinnedDisk: identity };
+}
+
+function recordIssued(flow: GuidedFlow, call: FlowCall): GuidedFlow {
+  return { ...withPinned(flow, call), calls: [...flow.calls, call] };
+}
+
 function refuseWord(command: CommandName, typed: string): string | null {
   const expected = WORD[command];
   if (!expected) return null;
@@ -645,7 +764,7 @@ function refuseWord(command: CommandName, typed: string): string | null {
 
 function refuseRoute(flow: GuidedFlow, route: "backup" | "blank"): string | null {
   if (route === "backup" && (!flow.backupDone || flow.backupRouteDisabled)) {
-    return "The backup route is off because this card cannot be restored. The blank route still applies.";
+    return "This setup has no backup, so it cannot call this the backup route. The card test still runs when this app session has a backup of this exact card, or the card is blank.";
   }
   return null;
 }
@@ -673,6 +792,8 @@ function okCall(partial: Partial<FlowCall> & { command: CommandName }): Plan {
       confirmation: partial.confirmation ?? "",
       route: partial.route ?? "",
       diskNumber: partial.diskNumber ?? 0,
+      serial: partial.serial ?? "",
+      sizeBytes: partial.sizeBytes ?? 0,
       profileId: partial.profileId ?? "",
       volumeId: partial.volumeId ?? "",
       destination: partial.destination ?? "",

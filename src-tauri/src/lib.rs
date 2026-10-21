@@ -1881,6 +1881,31 @@ fn probe_view(parsed: probe::ProbeLog) -> ProbeReportView {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskIdentityView {
+    disk_number: u32,
+    serial: String,
+    size_bytes: u64,
+}
+
+/// Disk number, serial, and size from `Get-Disk`. Does not open `\\.\PhysicalDriveN`.
+#[tauri::command]
+fn read_disk_identity(disk_number: u32) -> Result<DiskIdentityView, String> {
+    if disk_number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    let queried = query_restore_disk(disk_number)?;
+    let serial = query_disk_serial(disk_number)?;
+    let disk = probe_disk_from_restore(&queried, serial);
+    let (serial, size_bytes) = probe::accept_read_only_identity(&disk)?;
+    Ok(DiskIdentityView {
+        disk_number: disk.number,
+        serial,
+        size_bytes,
+    })
+}
+
 /// USB and SD cards only. Disk 0, system disks, and boot disks are left out.
 #[tauri::command]
 fn list_probe_disks() -> Result<Vec<FlashDiskView>, String> {
@@ -2890,6 +2915,7 @@ pub fn run() {
             detect_stock_device,
             list_flash_disks,
             list_probe_disks,
+            read_disk_identity,
             flash_os,
             backup_stock_card,
             cancel_stock_backup,
@@ -2924,4 +2950,18 @@ pub fn run() {
                 needle::serve::kill_all();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_disk_identity;
+
+    #[test]
+    fn read_disk_identity_refuses_disk_zero() {
+        let error = read_disk_identity(0).unwrap_err();
+        assert!(
+            error.contains("disk 0"),
+            "disk 0 must be refused before any disk query: {error}"
+        );
+    }
 }

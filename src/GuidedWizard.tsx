@@ -33,6 +33,7 @@ import {
   skipStep,
   skipWarning,
   startGuidedFlow,
+  type DiskIdentity,
   type GuidedFlow,
 } from "./guidedFlow";
 import { probeConfirmPrompt } from "./probePath";
@@ -101,6 +102,8 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
   const [planView, setPlanView] = useState<PlanView | null>(null);
   const [volume, setVolume] = useState<Volume | null>(null);
   const [progress, setProgress] = useState("");
+  const [identities, setIdentities] = useState<Record<number, DiskIdentity>>({});
+  const [identityChecked, setIdentityChecked] = useState<Record<number, boolean>>({});
   const held = useRef(false);
 
   useEffect(() => {
@@ -133,15 +136,34 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
   }, [flow.confirmedProfileId, profiles]);
 
   useEffect(() => {
-    const wantsFlashList =
-      flow.stopped || flow.step === "backup" || flow.step === "flash";
-    const wantsProbeList = flow.step === "probe" || flow.step === "fullCheck";
+    const wantsReturnList = flow.step === "bootOnce" || flow.step === "copy";
+    const wantsFlashList = flow.stopped || flow.step === "backup" || flow.step === "flash";
+    const wantsProbeList = flow.step === "probe" || flow.step === "fullCheck" || wantsReturnList;
     if (!wantsFlashList && !wantsProbeList) return;
     let live = true;
     const command = wantsProbeList ? "list_probe_disks" : "list_flash_disks";
     invoke<Disk[]>(command)
-      .then((found) => {
-        if (live) setDisks(found);
+      .then(async (found) => {
+        if (!live) return;
+        setDisks(found);
+        const next: Record<number, DiskIdentity> = {};
+        const checked: Record<number, boolean> = {};
+        await Promise.all(
+          found.map(async (disk) => {
+            checked[disk.number] = true;
+            try {
+              next[disk.number] = await invoke<DiskIdentity>("read_disk_identity", {
+                diskNumber: disk.number,
+              });
+            } catch {
+              // A missing serial leaves this disk disabled.
+            }
+          }),
+        );
+        if (live) {
+          setIdentities(next);
+          setIdentityChecked(checked);
+        }
       })
       .catch((cause: unknown) => {
         if (live) setNotice(String(cause));
@@ -204,6 +226,34 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
 
   const profile = profiles.find((item) => item.id === flow.confirmedProfileId) ?? null;
 
+  function knownIdentity(disk: Disk): DiskIdentity {
+    return identities[disk.number] ?? { diskNumber: disk.number, serial: "", sizeBytes: 0 };
+  }
+
+  async function freshIdentity(diskNumber: number): Promise<DiskIdentity | null> {
+    try {
+      const identity = await invoke<DiskIdentity>("read_disk_identity", { diskNumber });
+      setIdentities((current) => ({ ...current, [diskNumber]: identity }));
+      return identity;
+    } catch (cause) {
+      setNotice(String(cause));
+      return null;
+    }
+  }
+
+  function startOver() {
+    setFlow(startGuidedFlow());
+    setConfirmation("");
+    setNotice("");
+    setProgress("");
+    setVolume(null);
+    setPlanView(null);
+    setLibrary("");
+    setRestoreImage("");
+    setBackupDest("");
+    setRoute("blank");
+  }
+
   async function chooseBackupDestination() {
     const selected = await save({
       title: "Save stock-card backup",
@@ -228,7 +278,9 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
 
   async function runBackup(disk: Disk) {
     const snapshot = flow;
-    const planned = planBackup(snapshot, { diskNumber: disk.number, destination: backupDest });
+    const identity = await freshIdentity(disk.number);
+    if (!identity) return;
+    const planned = planBackup(snapshot, { ...identity, destination: backupDest });
     if (!planned.ok) {
       setNotice(planned.reason);
       return;
@@ -240,8 +292,8 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
     setProgress("Reading the card. This does not erase it.");
     try {
       const report = await invoke<BackupReport>("backup_stock_card", {
-        diskNumber: disk.number,
-        displayedBytes: disk.sizeBytes,
+        diskNumber: identity.diskNumber,
+        displayedBytes: identity.sizeBytes,
         destination: planned.call.destination,
       });
       const status = report.status === "complete" || report.status === "cancelled" ? report.status : "failed";
@@ -260,8 +312,10 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
 
   async function runProbe(disk: Disk) {
     const snapshot = flow;
+    const identity = await freshIdentity(disk.number);
+    if (!identity) return;
     const planned = planProbe(snapshot, {
-      diskNumber: disk.number,
+      ...identity,
       confirmation,
       route,
     });
@@ -276,8 +330,8 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
     setProgress("Checking the card. Windows may ask for approval before anything is written.");
     try {
       const report = await invoke<ProbeReport>("probe_card", {
-        diskNumber: disk.number,
-        displayedBytes: disk.sizeBytes,
+        diskNumber: identity.diskNumber,
+        displayedBytes: identity.sizeBytes,
         displayedModel: restoreDiskModel(disk.name),
         confirmation: planned.call.confirmation,
       });
@@ -307,8 +361,10 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
 
   async function runFullCheck(disk: Disk) {
     const snapshot = flow;
+    const identity = await freshIdentity(disk.number);
+    if (!identity) return;
     const planned = planFullCheck(snapshot, {
-      diskNumber: disk.number,
+      ...identity,
       confirmation,
       route,
     });
@@ -325,8 +381,8 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
     );
     try {
       const report = await invoke<FullReport>("full_check_card", {
-        diskNumber: disk.number,
-        displayedBytes: disk.sizeBytes,
+        diskNumber: identity.diskNumber,
+        displayedBytes: identity.sizeBytes,
         displayedModel: restoreDiskModel(disk.name),
         confirmation: planned.call.confirmation,
       });
@@ -386,7 +442,9 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
 
   async function runFlash(disk: Disk) {
     const snapshot = flow;
-    const planned = planFlash(snapshot, { diskNumber: disk.number, confirmation });
+    const identity = await freshIdentity(disk.number);
+    if (!identity) return;
+    const planned = planFlash(snapshot, { ...identity, confirmation });
     if (!planned.ok) {
       setNotice(planned.reason);
       return;
@@ -399,7 +457,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
     try {
       const log = await invoke<string>("flash_os", {
         profileId: planned.call.profileId,
-        diskNumber: disk.number,
+        diskNumber: identity.diskNumber,
         confirmation: planned.call.confirmation,
       });
       setFlow(finishFlash(snapshot, planned.call, { ok: true, summary: log }));
@@ -418,7 +476,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
     }
   }
 
-  async function cardIsBack() {
+  async function cardIsBack(disk: Disk) {
     let snapshot = flow;
     if (snapshot.step === "copy" && snapshot.identityRechecked) {
       snapshot = repeatIdentityCheck(snapshot);
@@ -440,19 +498,38 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
     setFlow(returned);
     setVolume(null);
     setPlanView(null);
+    const unrecognized: StockDetection = {
+      status: "none",
+      profileId: "",
+      device: "",
+      screen: "",
+      profileName: "",
+      message: "",
+    };
     try {
-      const detection = await invoke<StockDetection>("detect_stock_device");
-      const next = applyDetection(returned, planned.call, detection);
+      let identity: DiskIdentity;
+      try {
+        identity = await invoke<DiskIdentity>("read_disk_identity", { diskNumber: disk.number });
+      } catch (cause) {
+        setNotice(String(cause));
+        setFlow(
+          applyDetection(returned, planned.call, unrecognized, {
+            diskNumber: disk.number,
+            serial: "",
+            sizeBytes: 0,
+          }),
+        );
+        return;
+      }
+      let detection = unrecognized;
+      try {
+        detection = await invoke<StockDetection>("detect_stock_device");
+      } catch (cause) {
+        setNotice(String(cause));
+      }
+      const next = applyDetection(returned, planned.call, detection, identity);
       setFlow(next);
       if (next.step === "copy" && !next.stopped) await findReadyVolume(next);
-    } catch (cause) {
-      setFlow(
-        failIssued(returned, planned.call, {
-          outcome: "failed",
-          overwritten: null,
-          summary: String(cause),
-        }),
-      );
     } finally {
       held.current = false;
       setBusy(false);
@@ -583,8 +660,10 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
 
   async function runRestore(disk: Disk) {
     const snapshot = flow;
+    const identity = await freshIdentity(disk.number);
+    if (!identity) return;
     const planned = planRestore(snapshot, {
-      diskNumber: disk.number,
+      ...identity,
       confirmation,
       imagePath: restoreImage,
     });
@@ -598,8 +677,8 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
     setNotice("");
     try {
       const report = await invoke<RestoreReport>("restore_backup", {
-        diskNumber: disk.number,
-        displayedBytes: disk.sizeBytes,
+        diskNumber: identity.diskNumber,
+        displayedBytes: identity.sizeBytes,
         displayedModel: restoreDiskModel(disk.name),
         confirmation: planned.call.confirmation,
         imagePath: planned.call.imagePath,
@@ -685,12 +764,15 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
             disks={disks}
             empty="No USB disk detected."
             action={(disk) => (
-              <button
-                disabled={busy || !planBackup(flow, { diskNumber: disk.number, destination: backupDest }).ok}
-                onClick={() => void runBackup(disk)}
-              >
-                Back up disk {disk.number}
-              </button>
+              <div>
+                <IdentityNote disk={disk} identities={identities} identityChecked={identityChecked} />
+                <button
+                  disabled={busy || !planBackup(flow, { ...knownIdentity(disk), destination: backupDest }).ok}
+                  onClick={() => void runBackup(disk)}
+                >
+                  Back up disk {disk.number}
+                </button>
+              </div>
             )}
           />
         </div>
@@ -716,10 +798,13 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
             })
           }
           allowed={(disk) =>
-            planProbe(flow, { diskNumber: disk.number, confirmation, route }).ok
+            planProbe(flow, { ...knownIdentity(disk), confirmation, route }).ok
           }
           run={runProbe}
           verb="Test"
+          note={(disk) => (
+            <IdentityNote disk={disk} identities={identities} identityChecked={identityChecked} />
+          )}
         />
       ) : null}
 
@@ -743,10 +828,13 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
             })
           }
           allowed={(disk) =>
-            planFullCheck(flow, { diskNumber: disk.number, confirmation, route }).ok
+            planFullCheck(flow, { ...knownIdentity(disk), confirmation, route }).ok
           }
           run={runFullCheck}
           verb="Erase and test"
+          note={(disk) => (
+            <IdentityNote disk={disk} identities={identities} identityChecked={identityChecked} />
+          )}
         />
       ) : null}
 
@@ -803,6 +891,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
               empty="No USB disk detected."
               action={(disk) => (
                 <div>
+                  <IdentityNote disk={disk} identities={identities} identityChecked={identityChecked} />
                   <label>
                     Type FLASH to erase disk {disk.number} ({formatBytes(disk.sizeBytes)})
                     <input
@@ -812,7 +901,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
                     />
                   </label>
                   <button
-                    disabled={busy || !planFlash(flow, { diskNumber: disk.number, confirmation }).ok}
+                    disabled={busy || !planFlash(flow, { ...knownIdentity(disk), confirmation }).ok}
                     onClick={() => void runFlash(disk)}
                   >
                     Flash OS
@@ -843,9 +932,15 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
               />
             </div>
           ) : null}
-          <button disabled={busy} onClick={() => void cardIsBack()}>
-            The card is back
-          </button>
+          <p>Choose the card you took out. Copy stays off until that same card is recognized.</p>
+          <ReturnedDisks
+            disks={disks}
+            identities={identities}
+            identityChecked={identityChecked}
+            busy={busy}
+            label="This card is back"
+            onPick={(disk) => void cardIsBack(disk)}
+          />
         </div>
       ) : null}
 
@@ -853,9 +948,17 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
         <div>
           <h3>Copy your games</h3>
           <p>
-            Copy stays off until the card is back in this computer and the card has been checked
-            again.
+            Copy stays off until the same card is back in this computer and that card has been
+            recognized again.
           </p>
+          <ReturnedDisks
+            disks={disks}
+            identities={identities}
+            identityChecked={identityChecked}
+            busy={busy}
+            label={flow.identityRechecked ? "Check this card again" : "This card is back"}
+            onPick={(disk) => void cardIsBack(disk)}
+          />
           {flow.confirmedProfileId.length === 0 ? (
             <div>
               <p>Choose the handheld before copying.</p>
@@ -870,16 +973,6 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
                 }}
               />
             </div>
-          ) : null}
-          {!flow.identityRechecked ? (
-            <button disabled={busy} onClick={() => void cardIsBack()}>
-              The card is back
-            </button>
-          ) : null}
-          {flow.identityRechecked ? (
-            <button disabled={busy} onClick={() => void cardIsBack()}>
-              Check the card again
-            </button>
           ) : null}
           {volume && profile ? (
             <div>
@@ -970,6 +1063,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
             empty="No USB disk detected."
             action={(disk) => (
               <div>
+                <IdentityNote disk={disk} identities={identities} identityChecked={identityChecked} />
                 <label>
                   {restoreConfirmPrompt({
                     number: disk.number,
@@ -986,7 +1080,7 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
                   disabled={
                     busy ||
                     !planRestore(flow, {
-                      diskNumber: disk.number,
+                      ...knownIdentity(disk),
                       confirmation,
                       imagePath: restoreImage,
                     }).ok
@@ -1021,11 +1115,58 @@ export function GuidedWizard({ onExit }: { onExit: () => void }) {
       ) : null}
 
       <div className="row">
+        <button disabled={busy} onClick={startOver}>
+          Start over
+        </button>
         <button disabled={busy} onClick={onExit}>
           Back to the start screen
         </button>
       </div>
     </section>
+  );
+}
+
+function IdentityNote({
+  disk,
+  identities,
+  identityChecked,
+}: {
+  disk: Disk;
+  identities: Record<number, DiskIdentity>;
+  identityChecked: Record<number, boolean>;
+}) {
+  if (!identityChecked[disk.number] || identities[disk.number]) return null;
+  return <p className="warning">This card did not report a serial, so it cannot be recognized.</p>;
+}
+
+function ReturnedDisks({
+  disks,
+  identities,
+  identityChecked,
+  busy,
+  label,
+  onPick,
+}: {
+  disks: Disk[];
+  identities: Record<number, DiskIdentity>;
+  identityChecked: Record<number, boolean>;
+  busy: boolean;
+  label: string;
+  onPick: (disk: Disk) => void;
+}) {
+  return (
+    <DiskList
+      disks={disks}
+      empty="No USB or SD card detected."
+      action={(disk) => (
+        <div>
+          <IdentityNote disk={disk} identities={identities} identityChecked={identityChecked} />
+          <button disabled={busy || !identities[disk.number]} onClick={() => onPick(disk)}>
+            {label}
+          </button>
+        </div>
+      )}
+    />
   );
 }
 
@@ -1100,6 +1241,7 @@ function TestStep({
   allowed,
   run,
   verb,
+  note,
 }: {
   title: string;
   intro: string;
@@ -1115,6 +1257,7 @@ function TestStep({
   allowed: (disk: Disk) => boolean;
   run: (disk: Disk) => Promise<void>;
   verb: string;
+  note?: (disk: Disk) => ReactNode;
 }) {
   return (
     <div>
@@ -1148,6 +1291,7 @@ function TestStep({
         empty="No USB or SD card detected."
         action={(disk) => (
           <div>
+            {note ? note(disk) : null}
             <label>
               {prompt(disk)}
               <input

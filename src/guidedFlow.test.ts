@@ -34,7 +34,13 @@ import {
 } from "./guidedFlow";
 
 const DISK = 2;
+const SERIAL = "card-a";
+const SIZE = 64_000_000_000;
 const BACKUP = "stock.img.gz";
+
+function onCard<T extends Record<string, unknown>>(input: T) {
+  return { diskNumber: DISK, serial: SERIAL, sizeBytes: SIZE, ...input };
+}
 
 const matched: StockDetection = {
   status: "matched",
@@ -69,13 +75,13 @@ function take(plan: Plan): FlowCall {
 }
 
 function backup(flow: GuidedFlow): GuidedFlow {
-  const call = take(planBackup(flow, { diskNumber: DISK, destination: BACKUP }));
+  const call = take(planBackup(flow, onCard({ destination: BACKUP })));
   return finishBackup(flow, call, { status: "complete", summary: "saved" });
 }
 
 function probe(flow: GuidedFlow, route: "backup" | "blank"): GuidedFlow {
   const call = take(
-    planProbe(flow, { diskNumber: DISK, confirmation: "PROBE", route }),
+    planProbe(flow, onCard({ confirmation: "PROBE", route })),
   );
   return finishProbe(flow, call, {
     status: "finished",
@@ -87,7 +93,7 @@ function probe(flow: GuidedFlow, route: "backup" | "blank"): GuidedFlow {
 
 function fullCheck(flow: GuidedFlow, route: "backup" | "blank"): GuidedFlow {
   const call = take(
-    planFullCheck(flow, { diskNumber: DISK, confirmation: "FULL", route }),
+    planFullCheck(flow, onCard({ confirmation: "FULL", route })),
   );
   return finishFullCheck(flow, call, {
     status: "finished",
@@ -102,23 +108,29 @@ function detectAndConfirm(flow: GuidedFlow): GuidedFlow {
   const detected = applyDetection(flow, call, matched);
   expect(detected.confirmedProfileId).toBe("");
   expect(detected.suggestedProfileId).toBe(matched.profileId);
-  expect(planFlash(detected, { diskNumber: DISK, confirmation: "FLASH" }).ok).toBe(false);
+  expect(planFlash(detected, onCard({ confirmation: "FLASH" })).ok).toBe(false);
   return confirmSuggestedDevice(detected);
 }
 
 function flash(flow: GuidedFlow): GuidedFlow {
-  const call = take(planFlash(flow, { diskNumber: DISK, confirmation: "FLASH" }));
+  const call = take(planFlash(flow, onCard({ confirmation: "FLASH" })));
   expect(call.profileId).toBe(flow.confirmedProfileId);
   expect(call.confirmation).toBe("FLASH");
   expect(call.command).toBe("flash_os");
-  return finishFlash(flow, call, { ok: true, summary: "RESULT=OK" });
+  const flashed = finishFlash(flow, call, { ok: true, summary: "RESULT=OK" });
+  expect(flashed.flashDisk).toEqual(onCard({}));
+  return flashed;
 }
 
-function recheck(flow: GuidedFlow, detection: StockDetection = matched): GuidedFlow {
+function recheck(
+  flow: GuidedFlow,
+  detection: StockDetection = noMatch,
+  presented: { diskNumber: number; serial: string; sizeBytes: number } | null = onCard({}),
+): GuidedFlow {
   const returned = markCardReturned(flow);
   expect(planCopy(returned, { volumeId: "E" }).ok).toBe(false);
   const call = take(planDetect(returned));
-  return applyDetection(returned, call, detection);
+  return applyDetection(returned, call, detection, presented ?? undefined);
 }
 
 function copy(flow: GuidedFlow): GuidedFlow {
@@ -238,28 +250,29 @@ describe("guided flow skip paths", () => {
     },
   );
 
-  it("skipping backup says the card cannot be restored and leaves only the blank route", () => {
+  it("skipping backup says the card cannot be restored and leaves the card test unchanged", () => {
     const flow = skipStep(startGuidedFlow());
     expect(flow.step).toBe("probe");
     expect(flow.backupRouteDisabled).toBe(true);
-    expect(SKIP_WARNINGS.backup).toMatch(/cannot be restored/i);
-    expect(flow.warnings[0]).toMatch(/cannot be restored/i);
-    expect(probeRouteFlag(flow)).toMatch(/backup route is off/i);
-    expect(probeRouteFlag(flow)).toMatch(/blank route/i);
-    const backupRoute = planProbe(flow, {
-      diskNumber: DISK,
+    expect(SKIP_WARNINGS.backup).toMatch(/cannot restore/i);
+    expect(SKIP_WARNINGS.backup).toMatch(/does not take a route/i);
+    expect(SKIP_WARNINGS.backup).toMatch(/blank/i);
+    expect(flow.warnings[0]).toMatch(/cannot restore/i);
+    expect(probeRouteFlag(flow)).toMatch(/cannot restore/i);
+    expect(probeRouteFlag(flow)).toMatch(/blank/i);
+    expect(probeRouteFlag(flow)).toMatch(/does not take a route/i);
+    const backupRoute = planProbe(flow, onCard({
       confirmation: "PROBE",
       route: "backup",
-    });
+    }));
     expect(backupRoute.ok).toBe(false);
     if (!backupRoute.ok) {
-      expect(backupRoute.reason).toMatch(/blank route/i);
+      expect(backupRoute.reason).toMatch(/blank/i);
     }
-    const blankRoute = planProbe(flow, {
-      diskNumber: DISK,
+    const blankRoute = planProbe(flow, onCard({
       confirmation: "PROBE",
       route: "blank",
-    });
+    }));
     expect(blankRoute.ok).toBe(true);
     if (blankRoute.ok) {
       expect(blankRoute.call.route).toBe("blank");
@@ -269,12 +282,35 @@ describe("guided flow skip paths", () => {
     expect(finished.calls.find((call) => call.command === "probe_card")?.route).toBe("blank");
     expect(finished.calls.some((call) => call.route === "backup")).toBe(false);
   });
+
+  it("pins the first card and refuses another disk until the setup starts over", () => {
+    const started = backup(startGuidedFlow());
+    expect(started.pinnedDisk).toEqual(onCard({}));
+    expect(started.flashDisk).toBeNull();
+    const other = onCard({ diskNumber: 3, serial: "other-card" });
+    const refused = planProbe(started, { ...other, confirmation: "PROBE", route: "backup" });
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) {
+      expect(refused.reason).toMatch(/another card/i);
+    }
+    const skipped = skipStep(startGuidedFlow());
+    expect(skipped.pinnedDisk).toBeNull();
+    const probed = probe(skipped, "blank");
+    expect(probed.pinnedDisk).toEqual(onCard({}));
+    expect(
+      planFullCheck(probed, { ...other, confirmation: "FULL", route: "blank" }).ok,
+    ).toBe(false);
+    expect(planBackup(startGuidedFlow(), { ...other, destination: "other.img.gz" }).ok).toBe(true);
+    expect(planBackup(startGuidedFlow(), onCard({ serial: " ", destination: BACKUP })).ok).toBe(
+      false,
+    );
+  });
 });
 
 describe("guided flow stops", () => {
   it("stops on a cancelled probe and shows OVERWRITTEN without continuing", () => {
     const ready = reach("probe");
-    const call = take(planProbe(ready, { diskNumber: DISK, confirmation: "PROBE", route: "backup" }));
+    const call = take(planProbe(ready, onCard({ confirmation: "PROBE", route: "backup" })));
     const stopped = finishProbe(ready, call, {
       status: "cancelled",
       kind: "",
@@ -285,17 +321,17 @@ describe("guided flow stops", () => {
     expect(stopped.step).toBe("probe");
     expect(stopped.status).toContain("OVERWRITTEN");
     expect(stopped.status).toContain("Data on the card was overwritten.");
-    expect(planFullCheck(stopped, { diskNumber: DISK, confirmation: "FULL", route: "backup" }).ok).toBe(
+    expect(planFullCheck(stopped, onCard({ confirmation: "FULL", route: "backup" })).ok).toBe(
       false,
     );
-    expect(planFlash(stopped, { diskNumber: DISK, confirmation: "FLASH" }).ok).toBe(false);
+    expect(planFlash(stopped, onCard({ confirmation: "FLASH" })).ok).toBe(false);
     expect(planCopy(stopped, { volumeId: "E" }).ok).toBe(false);
     expect(commands(stopped)).toEqual(["backup_stock_card", "probe_card"]);
   });
 
   it("does not say OVERWRITTEN when the cancel says nothing was overwritten", () => {
     const ready = reach("probe");
-    const call = take(planProbe(ready, { diskNumber: DISK, confirmation: "PROBE", route: "backup" }));
+    const call = take(planProbe(ready, onCard({ confirmation: "PROBE", route: "backup" })));
     const stopped = finishProbe(ready, call, {
       status: "cancelled",
       kind: "",
@@ -305,14 +341,14 @@ describe("guided flow stops", () => {
     expect(stopped.stopped).toBe(true);
     expect(stopped.status).not.toContain("OVERWRITTEN");
     expect(stopped.status).toMatch(/nothing on the card was overwritten/i);
-    expect(planFullCheck(stopped, { diskNumber: DISK, confirmation: "FULL", route: "blank" }).ok).toBe(
+    expect(planFullCheck(stopped, onCard({ confirmation: "FULL", route: "blank" })).ok).toBe(
       false,
     );
   });
 
   it("does not invent OVERWRITTEN when the result never said", () => {
     const ready = reach("probe");
-    const call = take(planProbe(ready, { diskNumber: DISK, confirmation: "PROBE", route: "backup" }));
+    const call = take(planProbe(ready, onCard({ confirmation: "PROBE", route: "backup" })));
     const stopped = finishProbe(ready, call, {
       status: "cancelled",
       kind: "",
@@ -321,12 +357,12 @@ describe("guided flow stops", () => {
     });
     expect(stopped.status).not.toContain("OVERWRITTEN");
     expect(stopped.status).toMatch(/did not say whether the card was overwritten/i);
-    expect(planFlash(stopped, { diskNumber: DISK, confirmation: "FLASH" }).ok).toBe(false);
+    expect(planFlash(stopped, onCard({ confirmation: "FLASH" })).ok).toBe(false);
   });
 
   it("stops when the quick test finds a fake card", () => {
     const ready = reach("probe");
-    const call = take(planProbe(ready, { diskNumber: DISK, confirmation: "PROBE", route: "backup" }));
+    const call = take(planProbe(ready, onCard({ confirmation: "PROBE", route: "backup" })));
     const stopped = finishProbe(ready, call, {
       status: "finished",
       kind: "fake",
@@ -335,16 +371,16 @@ describe("guided flow stops", () => {
     });
     expect(stopped.stopped).toBe(true);
     expect(stopped.status).toContain("OVERWRITTEN");
-    expect(planFullCheck(stopped, { diskNumber: DISK, confirmation: "FULL", route: "backup" }).ok).toBe(
+    expect(planFullCheck(stopped, onCard({ confirmation: "FULL", route: "backup" })).ok).toBe(
       false,
     );
-    expect(planFlash(stopped, { diskNumber: DISK, confirmation: "FLASH" }).ok).toBe(false);
+    expect(planFlash(stopped, onCard({ confirmation: "FLASH" })).ok).toBe(false);
   });
 
   it("stops when the full check finds bad spots", () => {
     const ready = reach("fullCheck");
     const call = take(
-      planFullCheck(ready, { diskNumber: DISK, confirmation: "FULL", route: "backup" }),
+      planFullCheck(ready, onCard({ confirmation: "FULL", route: "backup" })),
     );
     const stopped = finishFullCheck(ready, call, {
       status: "finished",
@@ -355,7 +391,7 @@ describe("guided flow stops", () => {
     expect(stopped.stopped).toBe(true);
     expect(stopped.status).toContain("OVERWRITTEN");
     expect(planDetect(stopped).ok).toBe(false);
-    expect(planFlash(stopped, { diskNumber: DISK, confirmation: "FLASH" }).ok).toBe(false);
+    expect(planFlash(stopped, onCard({ confirmation: "FLASH" })).ok).toBe(false);
   });
 
   it.each(["backup", "detect", "flash", "copy"] as const)(
@@ -364,7 +400,7 @@ describe("guided flow stops", () => {
       const ready = reach(step);
       let stopped: GuidedFlow;
       if (step === "backup") {
-        const call = take(planBackup(ready, { diskNumber: DISK, destination: BACKUP }));
+        const call = take(planBackup(ready, onCard({ destination: BACKUP })));
         stopped = finishBackup(ready, call, { status: "failed", summary: "the read failed" });
         expect(stopped.status).not.toContain("OVERWRITTEN");
         expect(stopped.status).toMatch(/nothing on the card was overwritten/i);
@@ -387,7 +423,7 @@ describe("guided flow stops", () => {
         expect(stopped.status).not.toContain("OVERWRITTEN");
         expect(stopped.status).toMatch(/nothing on the card was overwritten/i);
       } else if (step === "flash") {
-        const call = take(planFlash(ready, { diskNumber: DISK, confirmation: "FLASH" }));
+        const call = take(planFlash(ready, onCard({ confirmation: "FLASH" })));
         stopped = finishFlash(ready, call, {
           ok: false,
           summary: "the flash did not finish",
@@ -407,15 +443,15 @@ describe("guided flow stops", () => {
         expect(stopped.status).not.toContain("OVERWRITTEN");
       }
       expect(stopped.stopped).toBe(true);
-      expect(planProbe(stopped, { diskNumber: DISK, confirmation: "PROBE", route: "blank" }).ok).toBe(
+      expect(planProbe(stopped, onCard({ confirmation: "PROBE", route: "blank" })).ok).toBe(
         false,
       );
-      expect(planFullCheck(stopped, { diskNumber: DISK, confirmation: "FULL", route: "blank" }).ok).toBe(
+      expect(planFullCheck(stopped, onCard({ confirmation: "FULL", route: "blank" })).ok).toBe(
         false,
       );
-      expect(planFlash(stopped, { diskNumber: DISK, confirmation: "FLASH" }).ok).toBe(false);
+      expect(planFlash(stopped, onCard({ confirmation: "FLASH" })).ok).toBe(false);
       expect(planCopy(stopped, { volumeId: "E" }).ok).toBe(false);
-      expect(planBackup(stopped, { diskNumber: DISK, destination: BACKUP }).ok).toBe(false);
+      expect(planBackup(stopped, onCard({ destination: BACKUP })).ok).toBe(false);
     },
   );
 });
@@ -429,7 +465,7 @@ describe("device confirmation and boot-once", () => {
     expect(detected.suggestedProfileId).toBe("r36s-clone-card");
     expect(detected.confirmedProfileId).toBe("");
     expect(detected.detectionMessage).toContain("R36S clone (board G80CA-MB V1.3)");
-    expect(planFlash(detected, { diskNumber: DISK, confirmation: "FLASH" }).ok).toBe(false);
+    expect(planFlash(detected, onCard({ confirmation: "FLASH" })).ok).toBe(false);
     expect(confirmSuggestedDevice(startGuidedFlow()).confirmedProfileId).toBe("");
     const confirmed = confirmSuggestedDevice(detected);
     expect(confirmed.confirmedProfileId).toBe("r36s-clone-card");
@@ -465,7 +501,7 @@ describe("device confirmation and boot-once", () => {
     expect(chosen.confirmedProfileId).toBe("darkos-rgb10x-os");
     expect(chosen.suggestedProfileId).toBe("r36s-clone-card");
     expect(chosen.step).toBe("flash");
-    const flashing = take(planFlash(chosen, { diskNumber: DISK, confirmation: "FLASH" }));
+    const flashing = take(planFlash(chosen, onCard({ confirmation: "FLASH" })));
     expect(flashing.profileId).toBe("darkos-rgb10x-os");
   });
 
@@ -487,44 +523,65 @@ describe("device confirmation and boot-once", () => {
       expect(refused.reason).toMatch(/recognized/i);
     }
     const call = take(planDetect(returned));
-    const same = applyDetection(returned, call, matched);
+    const same = applyDetection(returned, call, matched, onCard({}));
     expect(same.step).toBe("copy");
     expect(same.identityRechecked).toBe(true);
     expect(planCopy(same, { volumeId: "E" }).ok).toBe(true);
 
-    const unknown = applyDetection(returned, call, noMatch);
-    expect(unknown.stopped).toBe(false);
-    expect(unknown.step).toBe("copy");
-    expect(planCopy(unknown, { volumeId: "E" }).ok).toBe(true);
+    const recognized = applyDetection(returned, call, noMatch, onCard({}));
+    expect(recognized.stopped).toBe(false);
+    expect(recognized.step).toBe("copy");
+    expect(planCopy(recognized, { volumeId: "E" }).ok).toBe(true);
 
-    const mismatch = applyDetection(returned, call, otherMatch);
+    const unknown = applyDetection(returned, call, noMatch);
+    expect(unknown.stopped).toBe(true);
+    expect(unknown.status).toMatch(/not recognized/i);
+    expect(planCopy(unknown, { volumeId: "E" }).ok).toBe(false);
+    expect(planFlash(unknown, onCard({ confirmation: "FLASH" })).ok).toBe(false);
+
+    const mismatch = applyDetection(returned, call, otherMatch, onCard({}));
     expect(mismatch.stopped).toBe(true);
     expect(mismatch.status).toMatch(/different handheld/i);
     expect(planCopy(mismatch, { volumeId: "E" }).ok).toBe(false);
-    expect(planFlash(mismatch, { diskNumber: DISK, confirmation: "FLASH" }).ok).toBe(false);
+    expect(planFlash(mismatch, onCard({ confirmation: "FLASH" })).ok).toBe(false);
+  });
+
+  it("refuses a different physical card after the card comes back", () => {
+    const returned = markCardReturned(reach("bootOnce"));
+    const call = take(planDetect(returned));
+    const swapped = applyDetection(returned, call, noMatch, onCard({ serial: "other-card" }));
+    expect(swapped.stopped).toBe(true);
+    expect(swapped.status).toMatch(/not recognized/i);
+    expect(planCopy(swapped, { volumeId: "E" }).ok).toBe(false);
+    const renumbered = applyDetection(returned, call, matched, onCard({ diskNumber: 4 }));
+    expect(renumbered.stopped).toBe(true);
+    expect(planCopy(renumbered, { volumeId: "E" }).ok).toBe(false);
+    const resized = applyDetection(returned, call, matched, onCard({ sizeBytes: SIZE + 512 }));
+    expect(resized.stopped).toBe(true);
+    expect(planFlash(resized, onCard({ confirmation: "FLASH" })).ok).toBe(false);
   });
 });
 
 describe("confirmations stay separate", () => {
   it("refuses a word from another step, a blank word, and disk 0", () => {
     const probing = reach("probe");
-    expect(planProbe(probing, { diskNumber: DISK, confirmation: "", route: "backup" }).ok).toBe(false);
-    expect(planProbe(probing, { diskNumber: DISK, confirmation: "FLASH", route: "backup" }).ok).toBe(
+    expect(planProbe(probing, onCard({ confirmation: "", route: "backup" })).ok).toBe(false);
+    expect(planProbe(probing, onCard({ confirmation: "FLASH", route: "backup" })).ok).toBe(
       false,
     );
-    expect(planProbe(probing, { diskNumber: 0, confirmation: "PROBE", route: "backup" }).ok).toBe(false);
+    expect(planProbe(probing, onCard({ diskNumber: 0, confirmation: "PROBE", route: "backup" })).ok).toBe(false);
     const checking = reach("fullCheck");
-    expect(planFullCheck(checking, { diskNumber: DISK, confirmation: "PROBE", route: "backup" }).ok).toBe(
+    expect(planFullCheck(checking, onCard({ confirmation: "PROBE", route: "backup" })).ok).toBe(
       false,
     );
-    expect(planFullCheck(checking, { diskNumber: 0, confirmation: "FULL", route: "backup" }).ok).toBe(
+    expect(planFullCheck(checking, onCard({ diskNumber: 0, confirmation: "FULL", route: "backup" })).ok).toBe(
       false,
     );
     const flashing = detectAndConfirm(reach("detect"));
-    expect(planFlash(flashing, { diskNumber: DISK, confirmation: "PROBE" }).ok).toBe(false);
-    expect(planFlash(flashing, { diskNumber: DISK, confirmation: "FULL" }).ok).toBe(false);
-    expect(planFlash(flashing, { diskNumber: 0, confirmation: "FLASH" }).ok).toBe(false);
-    const planned = take(planProbe(probing, { diskNumber: DISK, confirmation: "PROBE", route: "backup" }));
+    expect(planFlash(flashing, onCard({ confirmation: "PROBE" })).ok).toBe(false);
+    expect(planFlash(flashing, onCard({ confirmation: "FULL" })).ok).toBe(false);
+    expect(planFlash(flashing, onCard({ diskNumber: 0, confirmation: "FLASH" })).ok).toBe(false);
+    const planned = take(planProbe(probing, onCard({ confirmation: "PROBE", route: "backup" })));
     const forged = finishProbe(probing, { ...planned, confirmation: "FLASH" }, {
       status: "finished",
       kind: "genuine",
@@ -532,12 +589,12 @@ describe("confirmations stay separate", () => {
       summary: "should not apply",
     });
     expect(forged).toBe(probing);
-    expect(planBackup(startGuidedFlow(), { diskNumber: 0, destination: BACKUP }).ok).toBe(false);
+    expect(planBackup(startGuidedFlow(), onCard({ diskNumber: 0, destination: BACKUP })).ok).toBe(false);
   });
 
   it("restores only as its own confirmed action and does not resume the flow", () => {
     const ready = reach("probe");
-    const call = take(planProbe(ready, { diskNumber: DISK, confirmation: "PROBE", route: "backup" }));
+    const call = take(planProbe(ready, onCard({ confirmation: "PROBE", route: "backup" })));
     const stopped = finishProbe(ready, call, {
       status: "cancelled",
       kind: "",
@@ -545,30 +602,36 @@ describe("confirmations stay separate", () => {
       summary: "Data on the card was overwritten.",
     });
     expect(commands(stopped)).not.toContain("restore_backup");
-    expect(planRestore(startGuidedFlow(), { diskNumber: DISK, confirmation: "FLASH", imagePath: BACKUP }).ok).toBe(
+    expect(planRestore(startGuidedFlow(), onCard({ confirmation: "FLASH", imagePath: BACKUP })).ok).toBe(
       false,
     );
     expect(
-      planRestore(stopped, { diskNumber: DISK, confirmation: "PROBE", imagePath: BACKUP }).ok,
+      planRestore(stopped, onCard({ confirmation: "PROBE", imagePath: BACKUP })).ok,
     ).toBe(false);
     expect(
-      planRestore(stopped, {
-        diskNumber: DISK,
+      planRestore(stopped, onCard({
         confirmation: "FLASH",
         imagePath: "stock.img.gz.partial",
-      }).ok,
+      })).ok,
     ).toBe(false);
+    const otherCard = planRestore(stopped, onCard({
+      diskNumber: 3,
+      serial: "other-card",
+      confirmation: "FLASH",
+      imagePath: BACKUP,
+    }));
+    expect(otherCard.ok).toBe(false);
     const restore = take(
-      planRestore(stopped, { diskNumber: DISK, confirmation: "FLASH", imagePath: BACKUP }),
+      planRestore(stopped, onCard({ confirmation: "FLASH", imagePath: BACKUP })),
     );
     expect(restore.command).toBe("restore_backup");
     expect(restore.confirmation).toBe("FLASH");
     const after = finishRestore(stopped, restore, { ok: true, summary: "restore matched" });
     expect(after.stopped).toBe(true);
     expect(commands(after)).toContain("restore_backup");
-    expect(planFlash(after, { diskNumber: DISK, confirmation: "FLASH" }).ok).toBe(false);
+    expect(planFlash(after, onCard({ confirmation: "FLASH" })).ok).toBe(false);
     expect(planCopy(after, { volumeId: "E" }).ok).toBe(false);
-    expect(planFullCheck(after, { diskNumber: DISK, confirmation: "FULL", route: "blank" }).ok).toBe(
+    expect(planFullCheck(after, onCard({ confirmation: "FULL", route: "blank" })).ok).toBe(
       false,
     );
   });

@@ -6,13 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use cfw_zero_touch_lib::backup::{backup_image, BackupOutcome};
 use cfw_zero_touch_lib::block_device::{is_physical_disk_path, FakeBlockDevice, FileBlockDevice};
 use cfw_zero_touch_lib::probe::{
-    app_precheck, authorize_probe, cancel_summary, card_is_blank, format_failed_log,
-    format_probe_log, helper_launch_command, identity_path, interpret_helper_log,
-    live_identity_matches, load_identity, overwritten_flag, parse_probe_log, plain_summary,
-    prefix_sha256, run_probe, sample_block_hashes, sample_offsets, write_identity, AppPrecheck,
-    BackupSession, CardIdentity, CardKind, HelperFollowup, ProbeBlock, ProbeDisk, ProbeError,
-    ProbePlan, ProbeReport, ProbeRequest, ProbeStatus, SessionBackup, PREFIX_IDENTITY_BYTES,
-    PROBE_BLOCK,
+    accept_read_only_identity, app_precheck, authorize_probe, cancel_summary, card_is_blank,
+    format_failed_log, format_probe_log, helper_launch_command, identity_path,
+    interpret_helper_log, live_identity_matches, load_identity, overwritten_flag, parse_probe_log,
+    plain_summary, prefix_sha256, run_probe, sample_block_hashes, sample_offsets, write_identity,
+    AppPrecheck, BackupSession, CardIdentity, CardKind, HelperFollowup, ProbeBlock, ProbeDisk,
+    ProbeError, ProbePlan, ProbeReport, ProbeRequest, ProbeStatus, SessionBackup,
+    PREFIX_IDENTITY_BYTES, PROBE_BLOCK,
 };
 use cfw_zero_touch_lib::restore::signal_cancel_file;
 
@@ -934,6 +934,46 @@ fn two_cards_with_the_same_first_4_mib_but_different_sample_blocks_are_refused()
     );
     assert_eq!(other.writes, 0);
     assert_eq!(std::fs::read(other.inner.path()).unwrap(), before);
+}
+
+#[test]
+fn a_read_only_identity_accepts_only_a_removable_card_that_reports_a_serial() {
+    let mut card = disk(2, "USB", 64 * 1024 * 1024, false, "Reader");
+    card.serial = "  Reader-1 ".into();
+    assert_eq!(
+        accept_read_only_identity(&card).unwrap(),
+        ("reader-1".into(), 64 * 1024 * 1024)
+    );
+
+    let mut sd = disk(3, "sd", 513, false, "Slot");
+    sd.serial = "Slot-9".into();
+    assert_eq!(
+        accept_read_only_identity(&sd).unwrap(),
+        ("slot-9".into(), 513)
+    );
+
+    let zero = disk(0, "USB", 64 * 1024 * 1024, false, "Reader");
+    let error = accept_read_only_identity(&zero).unwrap_err();
+    assert!(error.contains("disk 0"), "{error}");
+
+    let mut system = disk(2, "USB", 64 * 1024 * 1024, true, "Reader");
+    system.serial = "reader-1".into();
+    let error = accept_read_only_identity(&system).unwrap_err();
+    assert!(error.contains("system or boot"), "{error}");
+
+    let mut fixed = disk(2, "SATA", 64 * 1024 * 1024, false, "Internal");
+    fixed.serial = "internal".into();
+    let error = accept_read_only_identity(&fixed).unwrap_err();
+    assert!(error.contains("USB or SD"), "{error}");
+
+    let mut empty = disk(2, "USB", 0, false, "Reader");
+    empty.serial = "reader-1".into();
+    let error = accept_read_only_identity(&empty).unwrap_err();
+    assert!(error.contains("size is 0"), "{error}");
+
+    let missing = disk(2, "USB", 64 * 1024 * 1024, false, "Reader");
+    let error = accept_read_only_identity(&missing).unwrap_err();
+    assert!(error.contains("serial"), "{error}");
 }
 
 #[test]

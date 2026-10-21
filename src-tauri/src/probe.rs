@@ -242,6 +242,28 @@ fn is_probe_bus(bus: &str) -> bool {
     bus.eq_ignore_ascii_case("USB") || bus.eq_ignore_ascii_case("SD")
 }
 
+/// Disk number, normalized serial, and size for a later identity check.
+///
+/// Uses the same disk 0, system/boot, and USB-or-SD gates as a card write.
+/// A size of 0 or a missing serial is refused. This does not require 512-byte
+/// alignment, a typed confirmation, or an open of `\\.\PhysicalDriveN`.
+pub fn accept_read_only_identity(disk: &ProbeDisk) -> Result<(String, u64), String> {
+    if disk.number == 0 {
+        return Err("refusing to open disk 0".into());
+    }
+    if disk.system_disk || !is_probe_bus(&disk.bus) {
+        return Err(ProbeBlock::NotRemovable.message().into());
+    }
+    if disk.size_bytes == 0 {
+        return Err("refusing a disk whose size is 0".into());
+    }
+    let serial = normalize_serial(&disk.serial);
+    if serial.is_empty() {
+        return Err("This card did not report a serial, so it cannot be recognized.".into());
+    }
+    Ok((serial, disk.size_bytes))
+}
+
 /// Quick probe. The confirmation word is `PROBE`.
 pub fn authorize_probe(disk: &ProbeDisk, plan: &ProbePlan) -> Result<(), ProbeBlock> {
     authorize_card_write(disk, plan, "PROBE")
