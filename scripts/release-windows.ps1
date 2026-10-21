@@ -2,7 +2,7 @@
 # Signing stays off unless SIGNING_ENABLED is exactly true.
 
 param(
-    [ValidateSet('build', 'self-test')]
+    [ValidateSet('build', 'stage', 'sign', 'self-test')]
     [string]$Mode = 'build'
 )
 
@@ -35,82 +35,159 @@ function Get-AuthenticodeResults {
     }
 }
 
-function Invoke-ReleaseBuild {
+function Assert-BuildHasNoSigningSecrets {
+    $names = @(
+        'WINDOWS_CERTIFICATE',
+        'WINDOWS_CERTIFICATE_PASSWORD',
+        'AZURE_TENANT_ID',
+        'AZURE_CLIENT_ID',
+        'AZURE_CLIENT_SECRET',
+        'AZURE_CODE_SIGNING_ACCOUNT_NAME',
+        'AZURE_CERT_PROFILE_NAME',
+        'AZURE_ENDPOINT'
+    )
+    foreach ($name in $names) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            throw "The build step has $name set. Certificate material belongs only on the sign step. Refusing to compile."
+        }
+    }
+}
+
+function Get-ReleaseVersion {
     Set-Location -LiteralPath $Root
     $version = Get-AppVersion -Root $Root
-    Write-Output "Application version $version"
     if ($env:GITHUB_REF_TYPE -eq 'tag') {
         Assert-TagMatchesVersion -Tag $env:GITHUB_REF_NAME -Version $version
     }
+    return $version
+}
 
-    $method = Get-SigningMethod
-    $signed = $method -ne 'off'
-    if (-not $signed) {
-        $outcome = $env:SIGN_STEP_OUTCOME
-        if (-not [string]::IsNullOrWhiteSpace($outcome) -and $outcome -ne 'skipped') {
-            throw "The unsigned job's Sign Windows binaries step was '$outcome', not skipped."
-        }
+function Invoke-TauriBuild {
+    Assert-BuildHasNoSigningSecrets
+    if ($env:SIGNING_ENABLED -eq 'true') {
+        throw 'Refusing to compile while SIGNING_ENABLED is true. Signing is a later step, after the installers exist.'
     }
-
-    if ($signed) {
-        Assert-SigningMaterial -Method $method
-        & (Join-Path $PSScriptRoot 'sign-windows.ps1') -SelfCheck
-        if ($method -eq 'azure') {
-            Install-AzureDlib
-        }
-        & (Join-Path $PSScriptRoot 'sign-windows.ps1') -Prepare
-        $configPath = Join-Path (Get-WorkDirectory) 'tauri-signing.json'
-        $scriptPath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot 'sign-windows.ps1')).Path
-        [void](New-TauriSigningConfigJson -ScriptPath $scriptPath -Destination $configPath)
-        Write-Output "Tauri signCommand is scripts/sign-windows.ps1 ($method)."
-        & npm run tauri build -- --config $configPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "tauri build exited $LASTEXITCODE"
-        }
-    } else {
-        Write-Output 'SIGNING_ENABLED is not true. Building without a signCommand. This build is UNSIGNED.'
-        & npm run tauri build
-        if ($LASTEXITCODE -ne 0) {
-            throw "tauri build exited $LASTEXITCODE"
-        }
+    Write-Output 'Building the installer with no certificate in the environment.'
+    & npm run tauri build
+    if ($LASTEXITCODE -ne 0) {
+        throw "tauri build exited $LASTEXITCODE"
     }
+}
 
-    $bundle = Join-Path $Root 'src-tauri/target/release/bundle'
-    $destination = Join-Path $Root 'release'
-    Copy-ReleaseFiles -BundleRoot $bundle -Destination $destination -Signed $signed
-
+function Publish-ReleaseDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][bool]$Signed,
+        [Parameter(Mandatory = $true)][string]$Version
+    )
     $tool = Find-SignTool
     $onActions = $env:GITHUB_ACTIONS -eq 'true'
     $verifyNote = ''
     if ([string]::IsNullOrWhiteSpace($tool)) {
-        Assert-AuthenticodeResults -Signed $signed -FoundSignTool $false -RunningOnActions $onActions -Results @()
+        Assert-AuthenticodeResults -Signed $Signed -FoundSignTool $false -RunningOnActions $onActions -Results @()
         $verifyNote = 'signtool.exe was not on this machine, so Authenticode was not checked here.'
     } else {
-        $results = @(Get-AuthenticodeResults -Directory $destination -SignTool $tool)
-        Assert-AuthenticodeResults -Signed $signed -FoundSignTool $true -RunningOnActions $onActions -Results $results
-        if ($signed) {
+        $results = @(Get-AuthenticodeResults -Directory $Destination -SignTool $tool)
+        Assert-AuthenticodeResults -Signed $Signed -FoundSignTool $true -RunningOnActions $onActions -Results $results
+        if ($Signed) {
             $verifyNote = 'signtool verify /pa passed for every shipped .exe and .msi.'
         } else {
             $verifyNote = 'signtool verify /pa failed for the shipped installers, which is what an unsigned build should do.'
         }
     }
 
-    $sums = [System.IO.File]::ReadAllText((Join-Path $destination 'SHA256SUMS'))
-    $heading = "CFW Card Studio $version"
+    $sums = [System.IO.File]::ReadAllText((Join-Path $Destination 'SHA256SUMS'))
+    $heading = "CFW Card Studio $Version"
     if ($env:GITHUB_REF_TYPE -eq 'tag' -and -not [string]::IsNullOrWhiteSpace($env:GITHUB_REF_NAME)) {
         $heading = "CFW Card Studio $($env:GITHUB_REF_NAME)"
     }
-    $notes = New-ReleaseNotes -Heading $heading -Signed $signed -SumsText $sums
-    Write-Utf8Text -Path (Join-Path $destination 'RELEASE_NOTES.md') -Text $notes
+    $notes = New-ReleaseNotes -Heading $heading -Signed $Signed -SumsText $sums
+    Write-Utf8Text -Path (Join-Path $Destination 'RELEASE_NOTES.md') -Text $notes
 
     $names = New-Object System.Collections.Generic.List[string]
-    foreach ($file in @(Get-ChildItem -LiteralPath $destination -File | Sort-Object Name)) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $Destination -File | Sort-Object Name)) {
         if ($null -ne $file) { $names.Add($file.Name) }
     }
-    $summary = New-ReleaseSummary -Signed $signed -FileNames $names.ToArray() -VerifyNote $verifyNote -SignStepOutcome $env:SIGN_STEP_OUTCOME
+    $summary = New-ReleaseSummary -Signed $Signed -FileNames $names.ToArray() -VerifyNote $verifyNote -SignStepOutcome $env:SIGN_STEP_OUTCOME
     Write-Output $summary
     if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) {
         Add-Utf8Text -Path $env:GITHUB_STEP_SUMMARY -Text ("`n" + $summary + "`n")
+    }
+}
+
+function Invoke-ReleaseBuild {
+    $version = Get-ReleaseVersion
+    Write-Output "Application version $version"
+    $outcome = $env:SIGN_STEP_OUTCOME
+    if (-not [string]::IsNullOrWhiteSpace($outcome) -and $outcome -ne 'skipped') {
+        throw "The unsigned job's Sign Windows binaries step was '$outcome', not skipped."
+    }
+    Write-Output 'SIGNING_ENABLED is not true for this step. This build is UNSIGNED.'
+    Invoke-TauriBuild
+    $bundle = Join-Path $Root 'src-tauri/target/release/bundle'
+    $destination = Join-Path $Root 'release'
+    Copy-ReleaseFiles -BundleRoot $bundle -Destination $destination -Signed $false
+    Publish-ReleaseDirectory -Destination $destination -Signed $false -Version $version
+}
+
+function Invoke-StageBuild {
+    $version = Get-ReleaseVersion
+    Write-Output "Application version $version"
+    Invoke-TauriBuild
+    $bundle = Join-Path $Root 'src-tauri/target/release/bundle'
+    $destination = Join-Path $Root 'release'
+    Stage-Installers -BundleRoot $bundle -Destination $destination
+    Write-Output 'Staged the installer. No certificate was read. Signing is a separate step.'
+}
+
+function Get-StagedInstallers {
+    param([Parameter(Mandatory = $true)][string]$Directory)
+    if (-not (Test-Path -LiteralPath $Directory)) { return }
+    $found = Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue
+    foreach ($file in @($found)) {
+        if ($null -eq $file) { continue }
+        $ext = $file.Extension.ToLowerInvariant()
+        if ($ext -eq '.exe' -or $ext -eq '.msi') {
+            Write-Output $file
+        }
+    }
+}
+
+function Invoke-SignRelease {
+    $version = Get-ReleaseVersion
+    Write-Output "Application version $version"
+    try {
+        $method = Get-SigningMethod
+        if ($method -eq 'off') {
+            throw 'SIGNING_ENABLED is not true. Refusing to sign.'
+        }
+        Assert-SigningMaterial -Method $method
+        if ($method -eq 'azure') {
+            Install-AzureDlib
+        }
+
+        $destination = Join-Path $Root 'release'
+        $files = @(Get-StagedInstallers -Directory $destination)
+        $msi = @($files | Where-Object { $null -ne $_ -and $_.Extension -eq '.msi' })
+        $exe = @($files | Where-Object { $null -ne $_ -and $_.Extension -eq '.exe' })
+        if ($msi.Count -lt 1 -or $null -eq $msi[0] -or $exe.Count -lt 1 -or $null -eq $exe[0]) {
+            throw 'The sign step needs a finished .msi and .exe from the build step. Refusing to label this build signed.'
+        }
+
+        $signScript = Join-Path $PSScriptRoot 'sign-windows.ps1'
+        foreach ($file in $files) {
+            if ($null -eq $file) { continue }
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $signScript -File $file.FullName
+            if ($LASTEXITCODE -ne 0) {
+                throw "signing failed for $($file.Name)"
+            }
+        }
+
+        Write-ReleaseLabelAndSums -Directory $destination -Signed $true
+        Publish-ReleaseDirectory -Destination $destination -Signed $true -Version $version
+    } finally {
+        Remove-ImportedCodeSigningCertificate
     }
 }
 
@@ -168,9 +245,12 @@ function Assert-ReleaseWorkflowShape {
     $lines = @(Get-Content -LiteralPath $Path)
     $inJobs = $false
     $job = ''
+    $step = ''
     $secretCount = 0
     $writeCount = 0
     $environmentCount = 0
+    $jobIf = @{}
+    $jobBody = @{}
     foreach ($line in $lines) {
         if ($line -eq 'jobs:') {
             $inJobs = $true
@@ -181,10 +261,26 @@ function Assert-ReleaseWorkflowShape {
         }
         if ($inJobs -and $line -match '^  ([a-z0-9-]+):\s*$') {
             $job = $Matches[1]
+            $step = ''
+            if (-not $jobBody.ContainsKey($job)) {
+                $jobBody[$job] = New-Object System.Collections.Generic.List[string]
+            }
+        }
+        if ($job -ne '' -and $jobBody.ContainsKey($job)) {
+            $jobBody[$job].Add($line)
+        }
+        if ($line -match '^    if:\s*(.+)$') {
+            $jobIf[$job] = $Matches[1]
+        }
+        if ($line -match '^\s+- name:\s*(.+)$') {
+            $step = $Matches[1].Trim()
         }
         if ($line -match 'secrets\.') {
             if ($job -ne 'signed') {
                 throw "self-test failed: signing secret referenced outside the signed job: $line"
+            }
+            if ($step -notmatch '^Sign Windows binaries') {
+                throw "self-test failed: signing secret referenced outside the sign step: $line"
             }
             $secretCount++
         }
@@ -204,6 +300,21 @@ function Assert-ReleaseWorkflowShape {
     Assert-That ($secretCount -ge 1) 'the signed job should reference signing secrets'
     Assert-That ($writeCount -eq 1) 'contents: write should appear once'
     Assert-That ($environmentCount -eq 1) 'environment: release should appear once'
+    $signedIf = [string]$jobIf['signed']
+    Assert-That ($signedIf -match "github.event_name == 'push'") 'the signed job must require a push'
+    Assert-That ($signedIf -match "startsWith\(github.ref, 'refs/tags/v'\)") 'the signed job must require a v* tag'
+    Assert-That ($signedIf -match "vars.SIGNING_ENABLED == 'true'") 'the signed job must require the signing switch'
+    $unsignedIf = [string]$jobIf['unsigned']
+    Assert-That ($unsignedIf -match "github.event_name != 'push'") 'a manual run still builds when signing is on'
+    Assert-That ($unsignedIf -match "!startsWith\(github.ref, 'refs/tags/v'\)") 'a non-tag ref still builds unsigned'
+    $releaseBody = [string]($jobBody['release'] -join "`n")
+    Assert-That ($releaseBody -match 'GH_REPO:') 'the release job should set GH_REPO'
+    Assert-That (-not ($releaseBody -match 'actions/checkout')) 'the release job should not check out the repository'
+    $signedBody = [string]($jobBody['signed'] -join "`n")
+    Assert-That ($signedBody -match '-Mode stage') 'the signed job should build before it signs'
+    Assert-That ($signedBody -match '-Mode sign') 'the signed job should sign in its own step'
+    Assert-That ($signedBody -match 'Remove-ImportedCodeSigningCertificate') 'the signed job should remove the imported certificate'
+    Assert-That ($signedBody -match 'if: always\(\)') 'certificate cleanup should run even when signing fails'
     $text = [System.IO.File]::ReadAllText($Path)
     Assert-That (-not ($text -match 'pull_request')) 'the release workflow must not mention a pull request trigger'
     Assert-That ($text -match '--draft') 'the release command must pass --draft'
@@ -293,13 +404,14 @@ function Invoke-ReleaseSelfTest {
         Assert-That ($signedNotes.Contains('This build is SIGNED')) 'signed notes should say SIGNED'
         $checks++
 
-        $configPath = Join-Path $temp 'signing.json'
-        $json = New-TauriSigningConfigJson -ScriptPath 'C:\tools\sign-windows.ps1' -Destination $configPath
-        $parsed = $json | ConvertFrom-Json
-        $signArgs = @($parsed.bundle.windows.signCommand.args)
-        Assert-That ($parsed.bundle.windows.signCommand.cmd -eq 'powershell.exe') 'signCommand cmd should be powershell.exe'
-        Assert-That ($signArgs -contains '%1') 'signCommand should pass %1 for the file Tauri wants signed'
-        Assert-That ($signArgs -contains 'C:\tools\sign-windows.ps1') 'signCommand should point at the script'
+        $thumbFile = Get-CodeSignThumbFile
+        if (Test-Path -LiteralPath $thumbFile) { Remove-Item -LiteralPath $thumbFile -Force }
+        Write-Utf8Text -Path $thumbFile -Text (("AB" * 20) + "`n")
+        Remove-ImportedCodeSigningCertificate
+        Assert-That (-not (Test-Path -LiteralPath $thumbFile)) 'cleanup should delete the thumbprint file'
+        $signSource = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'sign-windows.ps1'))
+        Assert-That ($signSource -match 'finally') 'sign-windows should clean up on every exit'
+        Assert-That ($signSource -match 'Remove-ImportedCodeSigningCertificate') 'sign-windows should remove the imported certificate'
         $checks++
 
         $unsignedSummary = New-ReleaseSummary -Signed $false -FileNames @($exeName) -VerifyNote 'signtool verify /pa failed for the shipped installers, which is what an unsigned build should do.' -SignStepOutcome 'skipped'
@@ -403,6 +515,26 @@ function Invoke-ReleaseSelfTest {
     Assert-That (-not ($ci -match 'WINDOWS_CERTIFICATE')) 'the pull-request CI workflow must not name the signing certificate'
     Assert-That (-not ($ci -match 'AZURE_CLIENT_SECRET')) 'the pull-request CI workflow must not name the Azure client secret'
     Assert-That (-not ($ci -match '\{\{\s*secrets\.')) 'the pull-request CI workflow must not reference Actions secrets'
+    Assert-That ($ci -match 'toolchain: 1.99.1') 'CI should pin the same Rust toolchain as the release workflow'
+    $releaseWorkflow = [System.IO.File]::ReadAllText((Join-Path $Root '.github/workflows/release.yml'))
+    Assert-That ($releaseWorkflow -match 'toolchain: 1.99.1') 'the release workflow should pin Rust 1.99.1'
+    $savedCert = [Environment]::GetEnvironmentVariable('WINDOWS_CERTIFICATE')
+    try {
+        [Environment]::SetEnvironmentVariable('WINDOWS_CERTIFICATE', 'not-a-real-cert')
+        $buildThrew = $false
+        $buildMessage = ''
+        try {
+            Assert-BuildHasNoSigningSecrets
+        } catch {
+            $buildThrew = $true
+            $buildMessage = "$_"
+        }
+        Assert-That $buildThrew 'the build step should refuse a certificate in the environment'
+        Assert-That ($buildMessage -match 'WINDOWS_CERTIFICATE') 'the build refusal should name the variable'
+        Assert-That (-not ($buildMessage.Contains('not-a-real-cert'))) 'the build refusal must not print the certificate'
+    } finally {
+        [Environment]::SetEnvironmentVariable('WINDOWS_CERTIFICATE', $savedCert)
+    }
     $checks++
 
     Write-Output "release scaffold self-test passed ($checks groups)"
@@ -410,6 +542,16 @@ function Invoke-ReleaseSelfTest {
 
 if ($Mode -eq 'self-test') {
     Invoke-ReleaseSelfTest
+    return
+}
+
+if ($Mode -eq 'stage') {
+    Invoke-StageBuild
+    return
+}
+
+if ($Mode -eq 'sign') {
+    Invoke-SignRelease
     return
 }
 

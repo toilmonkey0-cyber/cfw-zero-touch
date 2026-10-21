@@ -35,7 +35,7 @@ The dry run builds the installer and uploads `SHA256SUMS` as an Actions artifact
 
 You need write access to start it. When it finishes, open the run and download the `windows-release` artifact. It contains the `.msi`, the setup `.exe`, `SHA256SUMS`, `SIGNING.txt`, and `RELEASE_NOTES.md`.
 
-With signing left off, the job **Windows installer (unsigned)** runs. Its summary says **This build is UNSIGNED.** The step **Sign Windows binaries** is skipped. The job **Windows installer (signed)** is skipped, so it never asks the `release` environment for a certificate.
+A dispatch always runs **Windows installer (unsigned)**, including when `SIGNING_ENABLED` is already `true`. The signed job also requires a push of a `v*` tag, so **Run workflow** never asks the `release` environment for a certificate. The summary says **This build is UNSIGNED.** The step **Sign Windows binaries** is skipped.
 
 Clearing **dry_run** fails the run on purpose. A dispatch is only a rehearsal. Push a tag when you want a draft.
 
@@ -76,9 +76,9 @@ If a release for that tag already exists, the job stops and leaves it alone. Del
 
 `SIGNING_ENABLED` is a repository variable (**Settings → Secrets and variables → Actions → Variables**). Leave it unset. The only value that turns signing on is the exact lowercase word `true`. `TRUE`, `yes`, and `1` keep the build unsigned.
 
-While it is off:
+While it is off, and also on every **Run workflow** dispatch:
 
-- Tauri is started without `signCommand`.
+- The installer is compiled with no certificate in the environment.
 - The **Sign Windows binaries** step is skipped.
 - No certificate secret is read.
 - `SIGNING.txt` contains `unsigned`.
@@ -104,7 +104,22 @@ These switches live on the GitHub website. A workflow file cannot turn them on.
 
 If a signed job has already run, GitHub may have created `release` with none of these rules. Delete that environment and create it again with the reviewers and the tag rule before you add secrets.
 
-Put signing secrets on this environment. Leave **Repository secrets** empty of certificates, passwords, and Azure client secrets. A repository secret can be read by any workflow job that names it. An environment secret is handed only to a job that names the environment.
+Put signing secrets on this environment. Leave **Repository secrets** empty of certificates, passwords, and Azure client secrets. A repository secret can be read by any workflow job that names it. An environment secret is handed only to a job that names the environment. Keep them at environment level.
+
+### Limit who can push a v* tag
+
+The signed job runs when someone pushes a tag named `v*`. Add a tag ruleset so only admins can create or move those tags. Do this on the GitHub website. This repository change does not edit those settings for you.
+
+1. Open the repository **Settings**.
+2. Open **Rules**, then **Rulesets**.
+3. Click **New ruleset** and choose **Tag**.
+4. Name it `release-tags`.
+5. Under target tags, include the pattern `v*`.
+6. Enable **Restrict creations** and **Restrict updates**. Allow only repository admins, or an admin team you already use. Leave the bypass list empty.
+7. Enable **Restrict deletions** the same way, so a tag cannot be removed or pointed at a different commit quietly.
+8. Save.
+
+A person who can push any tag can otherwise point `v*` at a commit that changes this workflow. The ruleset is what stops that. The environment reviewers are the second check, and they only see a signed build after the tag exists.
 
 ### Azure Artifact Signing, formerly Trusted Signing
 
@@ -139,11 +154,11 @@ Set environment **secrets** on `release`:
 | `AZURE_CERT_PROFILE_NAME` | Certificate profile name |
 | `AZURE_ENDPOINT` | The regional `https://` endpoint from the portal |
 
-The signed job writes a metadata file on the runner from the account name, profile, and endpoint. The client secret stays in the environment for `signtool`. It is not written into the repo and not written into that metadata file.
+The sign step writes a metadata file on the runner from the account name, profile, and endpoint. The client secret stays in that step's environment for `signtool`. It is not written into the repo, not written into that metadata file, and not present while `npm ci` or `tauri build` runs.
 
-Tauri's `signCommand` runs `scripts/sign-windows.ps1`. For Azure, that script calls `signtool sign /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib <dlib> /dmdf <metadata>`.
+After the installer exists, the sign step calls `signtool sign /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib <dlib> /dmdf <metadata>` on the finished setup `.exe` and the `.msi`.
 
-Set `SIGNING_ENABLED` to `true` last. The next `v*` tag waits for the environment reviewer, then signs. If any of those values is missing, the job fails and does not upload an installer labelled signed.
+Set `SIGNING_ENABLED` to `true` last. The next `v*` tag waits for the environment reviewer, builds the installer with no certificate, then signs. If any of those values is missing, the sign step fails and does not upload an installer labelled signed.
 
 ### An OV or EV certificate
 
@@ -172,21 +187,27 @@ Put these secrets on the `release` environment:
 
 GitHub limits how large a secret can be. **VERIFY** the current limit (it has been 48 KB). The base64 has to fit. Azure Artifact Signing avoids putting the certificate in a secret, which is the better fit when the `.pfx` is huge or the CA will not export one.
 
-The workflow imports the `.pfx` into the runner's user certificate store, deletes the `.pfx` file, and signs with the certificate thumbprint. The password is not passed on the `signtool` command line. The runner is destroyed at the end of the job.
+The sign step imports the `.pfx` into the runner's user certificate store, deletes the `.pfx` file, and signs the finished setup `.exe` and `.msi` with the certificate thumbprint. The password is not passed on the `signtool` command line. When that step ends, including when signing fails, the script removes the imported certificate from `Cert:\CurrentUser\My` by thumbprint. The last step of the signed job does that removal again if the thumbprint file is still there, including when an earlier step failed.
+
+Use GitHub-hosted runners only. This workflow already selects `windows-latest` and `ubuntu-latest`. A self-hosted runner keeps the user profile between jobs, so a certificate that survived the cleanup would remain on that machine. Do not point this workflow at a self-hosted runner.
 
 The timestamp server defaults to `http://timestamp.digicert.com`. **VERIFY** the timestamp URL your CA documents, and set the repository variable `WINDOWS_TIMESTAMP_URL` if theirs is different. It has to start with `http://` or `https://`.
 
-`scripts/sign-windows.ps1` is Tauri's `signCommand`. Tauri replaces `%1` with each file it wants signed. The script calls `signtool sign /fd SHA256 /sha1 <thumbprint> /tr <timestamp> /td SHA256`.
+`scripts/sign-windows.ps1` calls `signtool sign /fd SHA256 /sha1 <thumbprint> /tr <timestamp> /td SHA256` on each finished installer. The build does not pass a Tauri `signCommand`, so the compiler never sees the certificate.
 
 Set `SIGNING_ENABLED` to `true` last.
 
 ### What the switch changes
 
-`SIGNING_ENABLED=true` selects the **Windows installer (signed)** job. That job uses the `release` environment, so GitHub waits for the reviewer you configured. The unsigned job is skipped.
+`SIGNING_ENABLED=true` does not by itself select the signed job. The signed job also requires a push of a `v*` tag. A **Run workflow** dispatch stays on the unsigned job and skips signing.
 
-The signed job installs dependencies first, with no certificate in the environment. The sign step is the one that receives the secrets. `npm ci` does not see them.
+On a `v*` tag with the switch on, **Windows installer (signed)** runs. That job uses the `release` environment, so GitHub waits for the reviewer you configured. The unsigned job is skipped.
 
-`SIGNING_METHOD=azure` runs the Azure step. Any other allowed value (`pfx`, or empty) runs the `.pfx` step. A different spelling fails the job before it builds.
+The signed job installs dependencies and builds the installer first. That build sets `SIGNING_ENABLED` to `false` and has no certificate variables. `npm ci` and `npm run tauri build` do not see the certificate or the password.
+
+The next step is the only one that receives the secrets. It signs the finished setup `.exe` and the `.msi`. It does not compile again. It removes the imported certificate by thumbprint when it finishes, and the job removes it again at the end. `SHA256SUMS` is written after signing, so the hashes match the signed files.
+
+`SIGNING_METHOD=azure` runs the Azure sign step. `pfx`, or an empty method, runs the `.pfx` sign step. A different spelling fails the guard on a tag push before the build.
 
 After signing, the job runs `signtool verify /pa` on every shipped `.exe` and `.msi`. A failure there fails the job, so a broken signature is not uploaded as a signed build.
 

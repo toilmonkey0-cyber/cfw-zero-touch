@@ -6,8 +6,10 @@ name: Release
 # in the browser.
 #
 # Signing stays off unless the repository variable SIGNING_ENABLED is
-# exactly true. Certificate material is read only by the signed job, and
-# only from the release environment. This file has no trigger for pull
+# exactly true AND this run is a push of a v* tag. A workflow_dispatch
+# dry run always builds unsigned. Certificate material is read only by
+# the sign step of the signed job, after the installer exists, and only
+# from the release environment. This file has no trigger for pull
 # requests or forks: a pull request would execute the workflow from the
 # untrusted branch.
 
@@ -48,7 +50,7 @@ jobs:
         shell: bash
         run: echo "event=${GITHUB_EVENT_NAME} ref=${GITHUB_REF}"
       - name: Reject an unknown signing method
-        if: vars.SIGNING_ENABLED == 'true' && vars.SIGNING_METHOD != '' && vars.SIGNING_METHOD != 'pfx' && vars.SIGNING_METHOD != 'azure'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.SIGNING_ENABLED == 'true' && vars.SIGNING_METHOD != '' && vars.SIGNING_METHOD != 'pfx' && vars.SIGNING_METHOD != 'azure'
         shell: bash
         run: |
           echo "SIGNING_METHOD must be empty, pfx, or azure. Refusing to sign."
@@ -57,7 +59,7 @@ jobs:
   unsigned:
     name: Windows installer (unsigned)
     needs: guard
-    if: vars.SIGNING_ENABLED != 'true'
+    if: "${{ vars.SIGNING_ENABLED != 'true' || github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v') }}"
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
@@ -65,8 +67,10 @@ jobs:
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      # dtolnay/rust-toolchain (stable branch head at pin time)
+      # dtolnay/rust-toolchain. 1.99.1 is the stable rustc CI resolved on 2026-10-21.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.99.1
       # actions/setup-node v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -75,7 +79,7 @@ jobs:
         run: npm ci
       - name: Sign Windows binaries
         id: sign
-        if: vars.SIGNING_ENABLED == 'true'
+        if: vars.SIGNING_ENABLED == 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
           Write-Error "The unsigned job must not sign. Certificate material is not available here."
@@ -97,7 +101,7 @@ jobs:
   signed:
     name: Windows installer (signed)
     needs: guard
-    if: vars.SIGNING_ENABLED == 'true'
+    if: vars.SIGNING_ENABLED == 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     timeout-minutes: 90
     environment: release
@@ -106,14 +110,21 @@ jobs:
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      # dtolnay/rust-toolchain (stable branch head at pin time)
+      # dtolnay/rust-toolchain. 1.99.1 is the stable rustc CI resolved on 2026-10-21.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.99.1
       # actions/setup-node v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
       - name: Install frontend dependencies
         run: npm ci
+      - name: Build Windows installer
+        shell: pwsh
+        env:
+          SIGNING_ENABLED: 'false'
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode stage
       - name: Sign Windows binaries
         id: pfx
         if: vars.SIGNING_METHOD == '' || vars.SIGNING_METHOD == 'pfx'
@@ -124,7 +135,7 @@ jobs:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
           WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode build
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode sign
       - name: Sign Windows binaries with Azure Artifact Signing
         id: azure
         if: vars.SIGNING_METHOD == 'azure'
@@ -140,7 +151,7 @@ jobs:
           AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
           AZURE_DLIB_URL: ${{ vars.AZURE_DLIB_URL }}
           AZURE_DLIB_SHA256: ${{ vars.AZURE_DLIB_SHA256 }}
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode build
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode sign
       # actions/upload-artifact v4.6.2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -148,6 +159,14 @@ jobs:
           path: release/
           if-no-files-found: error
           retention-days: 14
+      - name: Remove imported code-signing certificate
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath ./scripts/release-lib.ps1)) { exit 0 }
+          . ./scripts/release-lib.ps1
+          Remove-ImportedCodeSigningCertificate
 
   release:
     name: Draft GitHub release
@@ -167,8 +186,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # actions/download-artifact v4.3.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -178,6 +195,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail

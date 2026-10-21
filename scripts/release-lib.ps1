@@ -9,6 +9,63 @@ function Get-WorkDirectory {
     return $dir
 }
 
+function Get-CodeSignThumbFile {
+    return (Join-Path (Get-WorkDirectory) 'cfw-codesign.thumbs')
+}
+
+function Save-ImportedCertificateThumbprints {
+    param([Parameter(Mandatory = $true)]$Imported)
+    $thumbs = New-Object System.Collections.Generic.List[string]
+    foreach ($cert in @($Imported)) {
+        if ($null -eq $cert) { continue }
+        $thumb = ([string]$cert.Thumbprint).Trim().ToUpperInvariant()
+        if ($thumb -match '^[0-9A-F]{40,64}$') {
+            $thumbs.Add($thumb)
+        }
+    }
+    if ($thumbs.Count -lt 1) { return }
+    Write-Utf8Text -Path (Get-CodeSignThumbFile) -Text (($thumbs.ToArray() -join "`n") + "`n")
+}
+
+function Remove-ImportedCodeSigningCertificate {
+    $path = Get-CodeSignThumbFile
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $lines = @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
+    $store = $null
+    $opened = $false
+    try {
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store(
+            [System.Security.Cryptography.X509Certificates.StoreName]::My,
+            [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $opened = $true
+        foreach ($line in $lines) {
+            $thumb = ([string]$line).Trim().ToUpperInvariant()
+            if ($thumb -notmatch '^[0-9A-F]{40,64}$') { continue }
+            $found = $store.Certificates.Find(
+                [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+                $thumb,
+                $false)
+            foreach ($cert in @($found)) {
+                if ($null -eq $cert) { continue }
+                $store.Remove($cert)
+                Write-Host "Removed imported code-signing certificate $thumb"
+            }
+        }
+    } catch {
+        if ($IsWindows) {
+            throw
+        }
+    } finally {
+        if ($null -ne $store) {
+            $store.Close()
+        }
+    }
+    if ($opened -or -not $IsWindows) {
+        Remove-Item -LiteralPath $path -Force
+    }
+}
+
 function Write-Utf8Text {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -290,39 +347,40 @@ function Copy-ReleaseFiles {
         if ($null -eq $file) { continue }
         Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $Destination $file.Name)
     }
-    $label = 'unsigned'
-    if ($Signed) { $label = 'signed' }
-    Write-Utf8Text -Path (Join-Path $Destination 'SIGNING.txt') -Text ($label + "`n")
-    Write-Sha256Sums -Directory $Destination
+    Write-ReleaseLabelAndSums -Directory $Destination -Signed $Signed
 }
 
-function New-TauriSigningConfigJson {
+function Stage-Installers {
     param(
-        [Parameter(Mandatory = $true)][string]$ScriptPath,
+        [Parameter(Mandatory = $true)][string]$BundleRoot,
         [Parameter(Mandatory = $true)][string]$Destination
     )
-    # Tauri replaces the %1 argument with the file it wants signed.
-    # https://v2.tauri.app/reference/config/#signcommand
-    $config = [ordered]@{
-        bundle = [ordered]@{
-            windows = [ordered]@{
-                signCommand = [ordered]@{
-                    cmd  = 'powershell.exe'
-                    args = @(
-                        '-NoProfile',
-                        '-ExecutionPolicy',
-                        'Bypass',
-                        '-File',
-                        $ScriptPath,
-                        '%1'
-                    )
-                }
-            }
-        }
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force
     }
-    $json = $config | ConvertTo-Json -Depth 8
-    Write-Utf8Text -Path $Destination -Text $json
-    return $json
+    New-Item -ItemType Directory -Path $Destination | Out-Null
+    $files = @(Get-InstallerFiles -BundleRoot $BundleRoot)
+    $msi = @($files | Where-Object { $null -ne $_ -and $_.Extension -eq '.msi' })
+    $exe = @($files | Where-Object { $null -ne $_ -and $_.Extension -eq '.exe' })
+    if ($msi.Count -lt 1 -or $null -eq $msi[0] -or $exe.Count -lt 1 -or $null -eq $exe[0]) {
+        $foundNames = @($files | Where-Object { $null -ne $_ } | ForEach-Object { $_.Name })
+        throw ("The bundle needs at least one .msi and one .exe. Found: " + ($foundNames -join ', '))
+    }
+    foreach ($file in $files) {
+        if ($null -eq $file) { continue }
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $Destination $file.Name)
+    }
+}
+
+function Write-ReleaseLabelAndSums {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][bool]$Signed
+    )
+    $label = 'unsigned'
+    if ($Signed) { $label = 'signed' }
+    Write-Utf8Text -Path (Join-Path $Directory 'SIGNING.txt') -Text ($label + "`n")
+    Write-Sha256Sums -Directory $Directory
 }
 
 function Find-SignTool {
@@ -406,18 +464,20 @@ function New-ReleaseSummary {
     $parts = New-Object System.Collections.Generic.List[string]
     if ($Signed) {
         $heading = 'This build is SIGNED.'
-        $parts.Add('SIGNING_ENABLED is true.')
-        $parts.Add('Tauri signCommand ran scripts/sign-windows.ps1.')
-        $parts.Add('Certificate material was read from the release environment.')
+        $parts.Add('SIGNING_ENABLED is true and this run is a v* tag push.')
+        $parts.Add('The installer was built with no certificate in the environment.')
+        $parts.Add('The Sign Windows binaries step then signed the finished .exe and .msi.')
+        $parts.Add('Certificate material was read only in that step, from the release environment.')
+        $parts.Add('The imported certificate was removed from the runner by thumbprint.')
         if (-not [string]::IsNullOrWhiteSpace($VerifyNote)) { $parts.Add($VerifyNote) }
         $parts.Add('A tag push opens a draft GitHub release. You publish that draft from the releases page.')
     } else {
         $heading = 'This build is UNSIGNED.'
-        $parts.Add('SIGNING_ENABLED is not true, so signing stayed off.')
+        $parts.Add('Signing stayed off for this run.')
         if ($SignStepOutcome -eq 'skipped') {
-            $parts.Add('The Sign Windows binaries step was skipped. Tauri ran without a signCommand.')
+            $parts.Add('The Sign Windows binaries step was skipped. Tauri ran with no certificate in the environment.')
         } else {
-            $parts.Add('Tauri ran without a signCommand.')
+            $parts.Add('Tauri ran with no certificate in the environment.')
         }
         $parts.Add('This installer has no Authenticode signature. Windows SmartScreen will warn.')
         $parts.Add('Compare the files with SHA256SUMS before you run them.')
