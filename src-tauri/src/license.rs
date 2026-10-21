@@ -1801,8 +1801,15 @@ mod tests {
             assert_eq!(configured_product_id(), PLACEHOLDER_PRODUCT_ID);
         }
         assert!(!product_id_configured(PLACEHOLDER_PRODUCT_ID));
-        let src = include_str!("license.rs");
-        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+        // Windows CI checks the file out with CRLF. Normalize before splitting
+        // so the scan stays on the production half and does not see this test.
+        let src = include_str!("license.rs").replace("\r\n", "\n");
+        let mut parts = src.split("#[cfg(test)]\nmod tests");
+        let prod = parts.next().unwrap();
+        assert!(
+            parts.next().is_some(),
+            "production scan missed the test module"
+        );
         assert!(!prod.contains("access_token"));
         assert!(!prod.contains("api_key"));
         assert!(!prod.contains("Authorization"));
