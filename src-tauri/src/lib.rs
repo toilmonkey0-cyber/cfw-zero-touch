@@ -1059,14 +1059,17 @@ fn flash_os(
     );
     let log = std::env::temp_dir().join(format!("cfw-flash-ui-{unique}.txt"));
     let script_path = std::env::temp_dir().join(format!("cfw-flash-ui-{unique}.ps1"));
+    restore::write_new_nofollow(&log, b"")
+        .map_err(|error| format!("could not prepare the flash log: {error}"))?;
     let script = format!(
-        "& '{tool}' --image='{image}' --sha256='{sha}' --disk={disk_number} --confirm='{confirmation}' *>&1 | Tee-Object -FilePath '{log}'\r\nexit $LASTEXITCODE\r\n",
+        "& '{tool}' --image='{image}' --sha256='{sha}' --disk={disk_number} --confirm='{confirmation}' --log-file='{log}'\r\nexit $LASTEXITCODE\r\n",
         tool = tool.display().to_string().replace('\'', "''"),
         image = image_path.display().to_string().replace('\'', "''"),
         sha = image.sha256.replace('\'', ""),
         log = log.display().to_string().replace('\'', "''"),
+        confirmation = confirmation.replace('\'', ""),
     );
-    std::fs::write(&script_path, script)
+    restore::write_new_nofollow(&script_path, script.as_bytes())
         .map_err(|error| format!("could not write the launcher: {error}"))?;
     let launcher = format!(
         "Start-Process -FilePath powershell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
@@ -1079,7 +1082,7 @@ fn flash_os(
     // The launcher is "-Wait", so the elevated run has finished; remove the
     // script so no predictable elevated artifact lingers in %TEMP%.
     let _ = std::fs::remove_file(&script_path);
-    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let text = restore::read_nofollow_string(&log).unwrap_or_default();
     if !status.success() || !text.contains("RESULT=OK") {
         let reason = if text.trim().is_empty() {
             "the flash did not finish. The approval prompt may have been dismissed.".to_string()
@@ -1331,7 +1334,7 @@ fn begin_restore() -> Result<RestoreGuard, String> {
 fn signal_restore_cancel() {
     RESTORE_CANCEL.store(true, Ordering::SeqCst);
     if let Some(path) = restore_cancel_slot().clone() {
-        let _ = std::fs::write(path, b"1\n");
+        let _ = restore::signal_cancel_file(&path);
     }
 }
 
@@ -1340,9 +1343,7 @@ fn query_restore_disk(number: u32) -> Result<restore::RestoreDisk, String> {
     if number == 0 {
         return Err("refusing to open disk 0".into());
     }
-    let script = format!(
-        "$d = Get-Disk -Number {number}; $name = [string]$d.FriendlyName; $name = $name -replace '\\|','/'; $name = $name -replace \"[`r`n]\",' '; Write-Output ($d.Number.ToString() + '|' + $d.BusType.ToString() + '|' + $d.Size.ToString() + '|' + $d.IsSystem.ToString() + '|' + $d.IsBoot.ToString() + '|' + $name)"
-    );
+    let script = backup::disk_query_script(number);
     let output = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
         .output()
@@ -1507,25 +1508,27 @@ fn restore_backup(
             detail: restore::cancel_detail(0),
         });
     }
-    if !restore::hashes_match(&inspected.compressed_sha256, &inspected.compressed_sha256) {
-        return Err("checksum is not a SHA-256 hex string".into());
-    }
-    if !restore::hashes_match(&inspected.sha256, &inspected.sha256) {
+    if !restore::is_sha256_hex(&inspected.compressed_sha256)
+        || !restore::is_sha256_hex(&inspected.sha256)
+    {
         return Err("checksum is not a SHA-256 hex string".into());
     }
 
     let temps = restore_temp_paths();
-    std::fs::write(&temps.cancel, b"")
+    restore::write_new_nofollow(&temps.cancel, b"")
         .map_err(|error| format!("could not prepare cancel: {error}"))?;
-    std::fs::write(
+    restore::write_new_nofollow(
         &temps.progress,
-        format!("write 0 {}\n", inspected.image_bytes),
+        format!("write 0 {}\n", inspected.image_bytes).as_bytes(),
     )
     .map_err(|error| format!("could not prepare progress: {error}"))?;
+    restore::write_new_nofollow(&temps.log, b"")
+        .map_err(|error| format!("could not prepare the restore log: {error}"))?;
     *restore_cancel_slot() = Some(temps.cancel.clone());
 
+    let model = powershell_literal(&displayed_model)?;
     let script = format!(
-        "& '{tool}' --image='{image}' --sha256='{sha}' --disk={disk_number} --confirm='FLASH' --sidecar-sha256='{sidecar}' --uncompressed-bytes={image_bytes} --cancel-file='{cancel}' --progress-file='{progress}' *>&1 | Tee-Object -FilePath '{log}'\r\nexit $LASTEXITCODE\r\n",
+        "& '{tool}' --image='{image}' --sha256='{sha}' --disk={disk_number} --confirm='FLASH' --restore --sidecar-sha256='{sidecar}' --uncompressed-bytes={image_bytes} --expected-bytes={displayed_bytes} --expected-model='{model}' --cancel-file='{cancel}' --progress-file='{progress}' --log-file='{log}'\r\nexit $LASTEXITCODE\r\n",
         tool = powershell_literal(&tool.display().to_string())?,
         image = powershell_literal(&image.display().to_string())?,
         sha = inspected.compressed_sha256,
@@ -1535,7 +1538,7 @@ fn restore_backup(
         progress = powershell_literal(&temps.progress.display().to_string())?,
         log = powershell_literal(&temps.log.display().to_string())?,
     );
-    std::fs::write(&temps.script, script)
+    restore::write_new_nofollow(&temps.script, script.as_bytes())
         .map_err(|error| format!("could not write the launcher: {error}"))?;
 
     let _ = app.emit(
@@ -1560,7 +1563,7 @@ fn restore_backup(
     let poller = std::thread::spawn(move || {
         let mut last = String::new();
         loop {
-            if let Ok(text) = std::fs::read_to_string(&progress_path) {
+            if let Ok(text) = restore::read_nofollow_string(&progress_path) {
                 if text != last {
                     if let Some(progress) = restore::parse_progress_line(&text) {
                         let _ = app_progress.emit("restore-progress", &progress);
@@ -1576,7 +1579,7 @@ fn restore_backup(
     });
 
     let launcher = format!(
-        "Start-Process -FilePath powershell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
+        "$p = Start-Process -FilePath powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'; if ($null -eq $p -or $null -eq $p.ExitCode) {{ exit 1 }}; exit $p.ExitCode",
         temps.script.display().to_string().replace('\'', "''")
     );
     let status = std::process::Command::new("powershell.exe")
@@ -1584,24 +1587,58 @@ fn restore_backup(
         .status();
     stop.store(true, Ordering::SeqCst);
     let _ = poller.join();
-    let text = std::fs::read_to_string(&temps.log).unwrap_or_default();
+    let text = restore::read_nofollow_string(&temps.log)
+        .unwrap_or_else(|error| format!("could not read the restore log: {error}"));
     let status = status.map_err(|error| format!("could not start the flash tool: {error}"))?;
-
+    let exit_code = restore::parse_exit_code(&text)
+        .or_else(|| status.code())
+        .unwrap_or(-1);
+    match restore::classify_helper_stop(exit_code, &text) {
+        restore::StopKind::CancelledUntouched => {
+            diag::log("INFO", "restore_cancelled", &format!("disk={disk_number}"));
+            return Ok(RestoreReportView {
+                status: "cancelled".into(),
+                sha256: String::new(),
+                card_sha256: String::new(),
+                bytes: 0,
+                detail: restore::cancel_detail(0),
+            });
+        }
+        restore::StopKind::CancelledErased => {
+            diag::log("INFO", "restore_cancelled", &format!("disk={disk_number}"));
+            return Ok(RestoreReportView {
+                status: "cancelled".into(),
+                sha256: String::new(),
+                card_sha256: String::new(),
+                bytes: 0,
+                detail: restore::cancel_detail(1),
+            });
+        }
+        restore::StopKind::FailedAfterClear { detail } => {
+            diag::log(
+                "ERROR",
+                "restore_failed",
+                &format!("disk={disk_number}: {detail}"),
+            );
+            return Err(detail);
+        }
+        restore::StopKind::Other => {}
+    }
     if RESTORE_CANCEL.load(Ordering::SeqCst)
         && !text.contains("RESULT=OK")
         && !text.contains("verify=fail")
     {
-        let during = text.contains("restore cancelled")
-            && !text.contains("restore cancelled before writing");
-        let detail = restore::cancel_detail(if during { 1 } else { 0 });
         diag::log("INFO", "restore_cancelled", &format!("disk={disk_number}"));
-        return Ok(RestoreReportView {
-            status: "cancelled".into(),
-            sha256: String::new(),
-            card_sha256: String::new(),
-            bytes: 0,
-            detail,
-        });
+        if text.trim().is_empty() {
+            return Ok(RestoreReportView {
+                status: "cancelled".into(),
+                sha256: String::new(),
+                card_sha256: String::new(),
+                bytes: 0,
+                detail: restore::cancel_detail(0),
+            });
+        }
+        return Err(format!("{text}\nThe card was not written."));
     }
 
     let verdict = restore::judge_helper_log(&text, &inspected.sha256);

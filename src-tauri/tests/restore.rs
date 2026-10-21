@@ -6,10 +6,12 @@ use cfw_zero_touch_lib::backup::{backup_image, directory_free_bytes, sidecar_pat
 use cfw_zero_touch_lib::block_device::{FakeBlockDevice, FileBlockDevice};
 use cfw_zero_touch_lib::flash::sha256_bytes;
 use cfw_zero_touch_lib::restore::{
-    cancel_detail, cancel_file_requests_stop, fail_detail, gate_restore, image_fits,
-    inspect_backup, judge_helper_log, parse_helper_log, parse_progress_line, parse_restore_disk,
-    parse_sidecar, pass_detail, restore_to_device, HelperVerdict, InspectedBackup, RestoreBlock,
-    RestoreDisk, RestoreError, RestoreOutcome, RestoreTarget,
+    cancel_detail, cancel_file_requests_stop, classify_helper_stop, fail_detail, gate_restore,
+    image_fits, inspect_backup, judge_helper_log, parse_exit_code, parse_helper_log,
+    parse_progress_line, parse_restore_disk, parse_sidecar, pass_detail, restore_to_device,
+    write_new_nofollow, write_nofollow, BoundedWrite, HelperVerdict, InspectedBackup, RestoreBlock,
+    RestoreDisk, RestoreError, RestoreOutcome, RestoreTarget, StopKind, DISK_CLEARED,
+    DISK_CLEAR_STARTED,
 };
 
 #[allow(dead_code, unused_imports)]
@@ -615,4 +617,90 @@ fn cancel_file_is_exact() {
     assert!(!cancel_file_requests_stop(&path).unwrap());
     std::fs::write(&path, b"1\n").unwrap();
     assert!(cancel_file_requests_stop(&path).unwrap());
+}
+
+#[test]
+fn writes_stop_when_the_image_exceeds_the_disk() {
+    use cfw_zero_touch_lib::flash::SectorWriter;
+    let mut sink = Vec::new();
+    {
+        let mut capped = BoundedWrite::new(&mut sink, 4);
+        let error = capped.write_all(&[1, 2, 3, 4, 5]).unwrap_err();
+        assert!(error.to_string().contains("larger than the target disk"));
+    }
+    assert!(sink.is_empty());
+
+    let mut sink = Vec::new();
+    {
+        let mut capped = BoundedWrite::new(&mut sink, 512);
+        let mut sector = SectorWriter::new(&mut capped);
+        sector.write_all(&[9u8; 600]).unwrap();
+        let error = sector.flush().unwrap_err();
+        assert!(error.to_string().contains("larger than the target disk"));
+    }
+    assert!(sink.len() <= 512);
+    assert!(sink.iter().all(|byte| *byte == 9));
+}
+
+#[test]
+fn cancel_message_follows_the_exit_code_and_whether_clear_ran() {
+    let before = "restore cancelled before writing\nEXIT=9\n";
+    assert_eq!(parse_exit_code(before), Some(9));
+    assert_eq!(
+        classify_helper_stop(9, before),
+        StopKind::CancelledUntouched
+    );
+    assert_eq!(cancel_detail(0), "Cancelled. The card was not written.");
+
+    let during = format!("{DISK_CLEAR_STARTED}\n{DISK_CLEARED}\nrestore cancelled\nEXIT=9\n");
+    assert_eq!(classify_helper_stop(9, &during), StopKind::CancelledErased);
+    assert!(cancel_detail(1).contains("erased"));
+    assert!(!cancel_detail(1).contains("was not written"));
+
+    let too_big = format!(
+        "{DISK_CLEAR_STARTED}\n{DISK_CLEARED}\nimage is larger than the target disk\nEXIT=4\n"
+    );
+    match classify_helper_stop(4, &too_big) {
+        StopKind::FailedAfterClear { detail } => {
+            assert!(detail.contains("erased"));
+            assert!(detail.contains("larger than the target disk"));
+            assert!(!detail.contains("was not written"));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let started = format!("{DISK_CLEAR_STARTED}\nclear failed\nEXIT=5\n");
+    match classify_helper_stop(5, &started) {
+        StopKind::FailedAfterClear { detail } => {
+            assert!(detail.contains("may have been erased"));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let fail = format!("{DISK_CLEARED}\nverify=fail\nEXIT=8\n");
+    assert_eq!(classify_helper_stop(8, &fail), StopKind::Other);
+    assert_eq!(
+        classify_helper_stop(0, "RESULT=OK\nEXIT=0\n"),
+        StopKind::Other
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn progress_and_cancel_files_are_not_followed_when_they_are_links() {
+    let scratch = Scratch::new("restore-nofollow");
+    let target = scratch.path().join("target.txt");
+    std::fs::write(&target, b"keep").unwrap();
+    let link = scratch.path().join("progress.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let error = write_nofollow(&link, b"write 1 2\n").unwrap_err();
+    assert!(error.to_string().contains("follow a link"), "{error}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    let stop = cancel_file_requests_stop(&link).unwrap_err();
+    assert!(stop.contains("follow a link"), "{stop}");
+
+    let regular = scratch.path().join("real.txt");
+    write_new_nofollow(&regular, b"ok").unwrap();
+    write_nofollow(&regular, b"next").unwrap();
+    assert_eq!(std::fs::read(&regular).unwrap(), b"next");
 }

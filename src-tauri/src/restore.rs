@@ -8,7 +8,7 @@
 //! again and is the only writer of `\\.\PhysicalDriveN`.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -191,13 +191,16 @@ pub fn image_fits(image_bytes: u64, disk_bytes: u64) -> bool {
     image_bytes > 0 && image_bytes <= disk_bytes
 }
 
+/// True when `text` is 64 hexadecimal digits, ignoring surrounding whitespace.
+pub fn is_sha256_hex(text: &str) -> bool {
+    let text = text.trim();
+    text.len() == 64 && text.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
 pub fn hashes_match(left: &str, right: &str) -> bool {
     let left = left.trim();
     let right = right.trim();
-    left.len() == 64
-        && right.len() == 64
-        && left.chars().all(|ch| ch.is_ascii_hexdigit())
-        && left.eq_ignore_ascii_case(right)
+    is_sha256_hex(left) && left.eq_ignore_ascii_case(right)
 }
 
 pub fn parse_sidecar(text: &str) -> Result<String, String> {
@@ -242,11 +245,73 @@ fn split_model(line: &str) -> (&str, &str) {
 }
 
 pub fn cancel_file_requests_stop(path: &Path) -> Result<bool, String> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(text.trim() == "1"),
+    match read_nofollow(path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).trim() == "1"),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(format!("could not read {}: {error}", path.display())),
     }
+}
+
+/// Printed on its own line immediately before `Clear-Disk`.
+pub const DISK_CLEAR_STARTED: &str = "disk-clear-started";
+/// Printed on its own line after `Clear-Disk` returns success.
+pub const DISK_CLEARED: &str = "disk-cleared";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopKind {
+    /// Exit 9 and Clear-Disk had not been started.
+    CancelledUntouched,
+    /// Exit 9 after Clear-Disk was started.
+    CancelledErased,
+    /// The helper failed after Clear-Disk was started. The card is not intact.
+    FailedAfterClear { detail: String },
+    /// Pass, verify failure, or a failure that did not reach Clear-Disk.
+    Other,
+}
+
+fn log_has_line(log: &str, marker: &str) -> bool {
+    log.lines().any(|line| line.trim() == marker)
+}
+
+/// Last `EXIT=N` line written by the helper, if any.
+pub fn parse_exit_code(log: &str) -> Option<i32> {
+    log.lines().rev().find_map(|line| {
+        let token = line.trim().strip_prefix("EXIT=")?;
+        token.parse().ok()
+    })
+}
+
+/// Choose the operator message from the helper exit code and the clear markers.
+///
+/// Exit 9 is cancel. `disk-clear-started` means Clear-Disk was invoked, so the
+/// card must not be described as untouched.
+pub fn classify_helper_stop(exit_code: i32, log: &str) -> StopKind {
+    if log_has_line(log, "verify=fail") || log_has_line(log, "RESULT=OK") {
+        return StopKind::Other;
+    }
+    let started = log_has_line(log, DISK_CLEAR_STARTED);
+    let cleared = log_has_line(log, DISK_CLEARED);
+    if exit_code == 9 && !started && !cleared {
+        return StopKind::CancelledUntouched;
+    }
+    if exit_code == 9 {
+        return StopKind::CancelledErased;
+    }
+    if started || cleared {
+        let lead = if cleared {
+            "The card was erased and does not match the backup. Restore again before using the card."
+        } else {
+            "Clear-Disk started and did not finish cleanly. The card may have been erased. Restore again before using the card."
+        };
+        let trimmed = log.trim();
+        let detail = if trimmed.is_empty() {
+            lead.to_string()
+        } else {
+            format!("{lead}\n{trimmed}")
+        };
+        return StopKind::FailedAfterClear { detail };
+    }
+    StopKind::Other
 }
 
 pub fn parse_progress_line(text: &str) -> Option<RestoreProgress> {
@@ -803,17 +868,20 @@ impl<'a, W> WatchedWrite<'a, W> {
         self.written
     }
 
-    fn stop_requested(&self) -> bool {
+    fn stop_requested(&self) -> io::Result<bool> {
         if self
             .cancel_flag
             .is_some_and(|flag| flag.load(Ordering::Acquire))
         {
-            return true;
+            return Ok(true);
         }
         if let Some(path) = self.cancel_file {
-            return cancel_file_requests_stop(path).unwrap_or(false);
+            return match cancel_file_requests_stop(path) {
+                Ok(stop) => Ok(stop),
+                Err(error) => Err(io::Error::other(error)),
+            };
         }
-        false
+        Ok(false)
     }
 
     fn report(&mut self, force: bool) {
@@ -821,7 +889,10 @@ impl<'a, W> WatchedWrite<'a, W> {
         if file_due {
             self.next_report = self.written.saturating_add(CHUNK as u64);
             if let Some(path) = self.progress_file {
-                let _ = fs::write(path, format!("write {} {}\n", self.written, self.total));
+                let _ = write_nofollow(
+                    path,
+                    format!("write {} {}\n", self.written, self.total).as_bytes(),
+                );
             }
         }
         if let Some(callback) = self.on_progress.as_mut() {
@@ -836,7 +907,7 @@ impl<'a, W> WatchedWrite<'a, W> {
 
 impl<W: Write> Write for WatchedWrite<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.stop_requested() {
+        if self.stop_requested()? {
             // `Write::write_all` retries `ErrorKind::Interrupted` forever.
             return Err(io::Error::other("restore cancelled"));
         }
@@ -847,13 +918,190 @@ impl<W: Write> Write for WatchedWrite<'_, W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if self.stop_requested() {
+        if self.stop_requested()? {
             return Err(io::Error::other("restore cancelled"));
         }
         self.inner.flush()?;
         self.report(true);
         Ok(())
     }
+}
+
+/// Stops a flash write once `limit` device bytes have been accepted.
+///
+/// The helper puts this under [`flash::SectorWriter`] so a backup that is
+/// larger than the card cannot keep writing past the queried disk size.
+pub struct BoundedWrite<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+}
+
+impl<W> BoundedWrite<W> {
+    pub fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+        }
+    }
+
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl<W: Write> Write for BoundedWrite<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let room = self.limit.saturating_sub(self.written);
+        if buf.len() as u64 > room {
+            return Err(io::Error::other("image is larger than the target disk"));
+        }
+        let n = self.inner.write(buf)?;
+        if n == 0 {
+            return Err(io::Error::other("short write while flashing"));
+        }
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Create a regular file. An existing symlink is not replaced or followed.
+pub fn write_new_nofollow(path: &Path, data: &[u8]) -> io::Result<()> {
+    let mut file = create_nofollow(path)?;
+    file.write_all(data)?;
+    file.flush()
+}
+
+/// Replace the bytes of an existing regular file. Symlinks are refused.
+pub fn write_nofollow(path: &Path, data: &[u8]) -> io::Result<()> {
+    let mut file = open_nofollow(path, true)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    file.write_all(data)?;
+    file.flush()
+}
+
+/// Open an existing regular file for writing from the start.
+///
+/// The returned handle stays on that file if the directory entry is replaced
+/// later. Callers that write a log from an elevated process use this so a
+/// symlink planted in the user temp directory is not followed.
+pub fn open_nofollow_write(path: &Path) -> io::Result<File> {
+    let mut file = open_nofollow(path, true)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    Ok(file)
+}
+
+pub fn read_nofollow(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = open_nofollow(path, false)?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    Ok(data)
+}
+
+pub fn read_nofollow_string(path: &Path) -> io::Result<String> {
+    let bytes = read_nofollow(path)?;
+    String::from_utf8(bytes).map_err(|error| io::Error::other(format!("log is not utf-8: {error}")))
+}
+
+/// Write `1` into the cancel file without following a symlink.
+pub fn signal_cancel_file(path: &Path) -> io::Result<()> {
+    if symlink_metadata_is_link(path) {
+        fs::remove_file(path)?;
+        return write_new_nofollow(path, b"1\n");
+    }
+    match write_nofollow(path, b"1\n") {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => write_new_nofollow(path, b"1\n"),
+        other => other,
+    }
+}
+
+fn create_nofollow(path: &Path) -> io::Result<File> {
+    if symlink_metadata_is_link(path) {
+        return Err(link_error());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    apply_nofollow(&mut options);
+    match options.open(path) {
+        Ok(file) => reject_reparse(file),
+        Err(error)
+            if error.kind() == io::ErrorKind::AlreadyExists && symlink_metadata_is_link(path) =>
+        {
+            Err(link_error())
+        }
+        Err(error) => Err(map_link_error(error)),
+    }
+}
+
+fn open_nofollow(path: &Path, write: bool) -> io::Result<File> {
+    if symlink_metadata_is_link(path) {
+        return Err(link_error());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    if write {
+        options.write(true);
+    }
+    apply_nofollow(&mut options);
+    match options.open(path) {
+        Ok(file) => reject_reparse(file),
+        Err(error) => Err(map_link_error(error)),
+    }
+}
+
+fn symlink_metadata_is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn link_error() -> io::Error {
+    io::Error::other("refusing to follow a link")
+}
+
+fn map_link_error(error: io::Error) -> io::Error {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return link_error();
+    }
+    error
+}
+
+fn apply_nofollow(options: &mut fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+
+fn reject_reparse(file: File) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let attributes = file.metadata()?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(link_error());
+        }
+    }
+    Ok(file)
 }
 
 struct ProgressRead<'a, R> {
