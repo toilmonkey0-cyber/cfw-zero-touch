@@ -1451,7 +1451,7 @@ fn one_line(text: &str) -> String {
 
 #[cfg(test)]
 mod scrub_tests {
-    use super::{is_device_path, path_end, path_variants, username_in};
+    use super::{is_device_path, path_end, path_variants, scrub, username_in, Privacy};
     use std::path::Path;
 
     #[test]
@@ -1469,6 +1469,27 @@ mod scrub_tests {
         assert_eq!(&text[..path_end(text, 0)], r"D:\Games\Old Lib\Metroid.gba");
         let bare = r"E:\";
         assert_eq!(path_end(bare, 0), bare.len());
+    }
+
+    #[test]
+    fn a_drive_path_leaves_the_username_on_the_next_line() {
+        let privacy = Privacy {
+            paths: vec![r"C:\Users\runner\AppData\Temp\library".into()],
+            rom_names: vec!["Chrono Trigger (USA).sfc".into()],
+            usernames: vec!["romcollector".into()],
+            secrets: Vec::new(),
+        };
+        let notes = scrub(
+            "INFO copy_done library=C:\\Users\\runner\\AppData\\Temp\\library file=Chrono Trigger (USA).sfc\nINFO account=romcollector\n",
+            &privacy,
+        );
+        assert!(notes.contains("[path]"), "{notes}");
+        assert!(notes.contains("[user]"), "{notes}");
+        assert!(
+            !notes.to_ascii_lowercase().contains("romcollector"),
+            "{notes}"
+        );
+        assert!(!notes.contains("Chrono"), "{notes}");
     }
 
     #[test]

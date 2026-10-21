@@ -196,8 +196,11 @@ fn support_zip_hides_fixture_rom_names_and_the_library_path() {
         fs::write(library.join("snes").join(name), b"fixture").unwrap();
     }
     let library_text = library.display().to_string();
+    // The library path is a drive path on Windows, so redaction runs to the
+    // end of that line. The account name has to sit on the next line, or the
+    // path placeholder swallows the username placeholder.
     let mut body = format!(
-        "INFO copy_done library={library_text} file={} account=romcollector user=/home/romcollector/Documents\\Games C:\\Users\\romcollector\\Roms\\{}\n",
+        "INFO copy_done library={library_text} file={} user=/home/romcollector/Documents\\Games C:\\Users\\romcollector\\Roms\\{}\nINFO account=romcollector\n",
         roms[0], roms[1]
     );
     for name in roms {
