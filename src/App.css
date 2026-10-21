@@ -183,6 +183,30 @@ ol {
   font-size: 1.05rem;
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: grid;
+  place-items: center;
+  z-index: 20;
+  padding: 16px;
+}
+
+.modal {
+  background: #24211c;
+  border: 1px solid #4a4338;
+  border-radius: 12px;
+  padding: 16px;
+  width: min(440px, 100%);
+  display: grid;
+  gap: 10px;
+}
+
+.modal h2 {
+  margin: 0;
+}
+
 .doctor {
   border: 1px solid #4a4338;
   border-radius: 10px;

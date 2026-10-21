@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useReducer, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -13,12 +13,20 @@ import {
 import { formatBytes } from "./formatBytes";
 import { GuidedWizard } from "./GuidedWizard";
 import { fullConfirmPrompt, fullProgressLabel } from "./fullCheckPath";
+import { LicenseManager, UnlockDialog } from "./LicenseDialogs";
 import {
-  commercialUnlocked,
-  safetyNote,
-  statusText,
-  type LicenseView,
-} from "./license";
+  deactivateThisComputer,
+  initialLicenseUi,
+  paidFeatureLabel,
+  paidPanelCopy,
+  reduceLicense,
+  requestPaidFeature,
+  submitLicenseKey,
+  type PaidFeature,
+} from "./entitlements";
+import { safetyNote, statusText, type LicenseView } from "./license";
+import { copyPreparedRoms, planRomCopy, prepareAndSeed } from "./romCardPrep";
+import { invokeSafety } from "./safetyPaths";
 import { probeConfirmPrompt } from "./probePath";
 import {
   isFinishedBackupName,
@@ -269,9 +277,7 @@ export default function App() {
   const [doctorEngine, setDoctorEngine] = useState(false);
   const [detection, setDetection] = useState<StockDetection | null>(null);
   const [detectionDismissed, setDetectionDismissed] = useState(false);
-  const [licenseKey, setLicenseKey] = useState("");
-  const [licenseView, setLicenseView] = useState<LicenseView | null>(null);
-  const [licenseBusy, setLicenseBusy] = useState(false);
+  const [licenseUi, dispatchLicense] = useReducer(reduceLicense, initialLicenseUi());
 
   useEffect(() => {
     invoke<Profile[]>("list_profiles")
@@ -300,8 +306,23 @@ export default function App() {
 
   useEffect(() => {
     invoke<LicenseView>("license_status")
-      .then(setLicenseView)
-      .catch(() => setLicenseView(null));
+      .then((view) => dispatchLicense({ type: "status", view }))
+      .catch(() =>
+        dispatchLicense({
+          type: "status",
+          view: {
+            state: "inactive",
+            reason: "unreachable",
+            message: "Couldn't read the license on this computer. Card tools still work.",
+            uses: null,
+            overSoftLimit: false,
+            stale: false,
+            signedUpdates: false,
+            support: false,
+            safetyOpen: true,
+          },
+        }),
+      );
   }, []);
 
   useEffect(() => {
@@ -369,28 +390,54 @@ export default function App() {
     }
   }
 
-  async function activateLicense() {
-    setLicenseBusy(true);
+  async function onPaid(feature: PaidFeature) {
+    const pending = reduceLicense(licenseUi, { type: "busy", busy: true });
+    dispatchLicense({ type: "replace", state: pending });
     try {
-      const view = await invoke<LicenseView>("activate_license", { licenseKey });
-      setLicenseView(view);
-      if (view.state === "active") {
-        setLicenseKey("");
-      }
+      const next = await requestPaidFeature(
+        pending,
+        {
+          paid: (name) => invoke<{ open: boolean; message: string }>("paid_feature", { feature: name }),
+        },
+        feature,
+      );
+      dispatchLicense({ type: "replace", state: next });
     } catch (cause) {
-      setLicenseView({
-        state: "inactive",
-        reason: "unreachable",
-        message: statusText(String(cause), licenseKey),
-        uses: null,
-        overSoftLimit: false,
-        stale: false,
-        signedUpdates: false,
-        support: false,
-        safetyOpen: true,
+      dispatchLicense({
+        type: "paid-result",
+        feature,
+        open: false,
+        message: statusText(cause instanceof Error ? cause.message : String(cause), pending.draftKey),
       });
-    } finally {
-      setLicenseBusy(false);
+    }
+  }
+
+  async function onActivate() {
+    const pending = reduceLicense(licenseUi, { type: "busy", busy: true });
+    dispatchLicense({ type: "replace", state: pending });
+    const next = await submitLicenseKey(pending, {
+      activate: (licenseKey) => invoke<LicenseView>("activate_license", { licenseKey }),
+    });
+    dispatchLicense({ type: "replace", state: next });
+  }
+
+  async function onDeactivate() {
+    const pending = reduceLicense(licenseUi, { type: "busy", busy: true });
+    dispatchLicense({ type: "replace", state: pending });
+    try {
+      const next = await deactivateThisComputer(pending, {
+        deactivate: () => invoke<LicenseView>("deactivate_license"),
+      });
+      dispatchLicense({ type: "replace", state: next });
+    } catch (cause) {
+      dispatchLicense({
+        type: "replace",
+        state: {
+          ...pending,
+          busy: false,
+          notice: statusText(cause instanceof Error ? cause.message : String(cause), pending.draftKey),
+        },
+      });
     }
   }
 
@@ -555,7 +602,7 @@ export default function App() {
     setBackupReport(null);
     setBackupProgress(null);
     try {
-      const report = await invoke<BackupReport>("backup_stock_card", {
+      const report = await invokeSafety<BackupReport>(invoke, "backup_stock_card", {
         diskNumber: disk.number,
         displayedBytes: disk.sizeBytes,
         destination: backupDest,
@@ -569,7 +616,7 @@ export default function App() {
   }
 
   async function cancelBackup() {
-    await invoke("cancel_stock_backup");
+    await invokeSafety(invoke, "cancel_stock_backup");
   }
 
   async function openRestore() {
@@ -600,7 +647,7 @@ export default function App() {
     setRestoreReport(null);
     setRestoreProgress(null);
     try {
-      const report = await invoke<RestoreReport>("restore_backup", {
+      const report = await invokeSafety<RestoreReport>(invoke, "restore_backup", {
         diskNumber: disk.number,
         displayedBytes: disk.sizeBytes,
         displayedModel: restoreDiskModel(disk.name),
@@ -616,14 +663,14 @@ export default function App() {
   }
 
   async function cancelRestore() {
-    await invoke("cancel_restore");
+    await invokeSafety(invoke, "cancel_restore");
   }
 
   async function refreshProbeDisks() {
     setBusy(true);
     setError("");
     try {
-      setProbeDisks(await invoke<FlashDisk[]>("list_probe_disks"));
+      setProbeDisks(await invokeSafety<FlashDisk[]>(invoke, "list_probe_disks"));
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -648,7 +695,7 @@ export default function App() {
       "Checking the card. Windows may ask for approval before anything is written.",
     );
     try {
-      const report = await invoke<ProbeReport>("probe_card", {
+      const report = await invokeSafety<ProbeReport>(invoke, "probe_card", {
         diskNumber: disk.number,
         displayedBytes: disk.sizeBytes,
         displayedModel: restoreDiskModel(disk.name),
@@ -663,14 +710,14 @@ export default function App() {
   }
 
   async function cancelProbe() {
-    await invoke("cancel_probe");
+    await invokeSafety(invoke, "cancel_probe");
   }
 
   async function refreshFullDisks() {
     setBusy(true);
     setError("");
     try {
-      setFullDisks(await invoke<FlashDisk[]>("list_probe_disks"));
+      setFullDisks(await invokeSafety<FlashDisk[]>(invoke, "list_probe_disks"));
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -697,7 +744,7 @@ export default function App() {
       "Checking the card. Windows may ask for approval before anything is written. This test erases the whole card and can take a long time.",
     );
     try {
-      const report = await invoke<FullReport>("full_check_card", {
+      const report = await invokeSafety<FullReport>(invoke, "full_check_card", {
         diskNumber: disk.number,
         displayedBytes: disk.sizeBytes,
         displayedModel: restoreDiskModel(disk.name),
@@ -713,14 +760,14 @@ export default function App() {
   }
 
   async function cancelFullCheck() {
-    await invoke("cancel_full_check");
+    await invokeSafety(invoke, "cancel_full_check");
   }
 
   async function refreshFlashDisks() {
     setBusy(true);
     setError("");
     try {
-      setFlashDisks(await invoke<FlashDisk[]>("list_flash_disks"));
+      setFlashDisks(await invokeSafety<FlashDisk[]>(invoke, "list_flash_disks"));
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -796,18 +843,14 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const updated = await invoke<VolumeView>("prepare_card", {
+      const prepared = await prepareAndSeed(invoke, {
         profileId: profile.id,
-        volumeId: selected.id,
-        confirmation: selected.decision === "needs_format" ? confirmation : "",
+        volume: selected,
+        confirmation,
         displayedBytes: selected.totalBytes,
       });
-      const seeded = await invoke<{ folders: string[] }>("seed_card", {
-        profileId: profile.id,
-        volumeId: selected.id,
-      });
-      setVolume(updated);
-      setFolders(seeded.folders);
+      setVolume(prepared.volume);
+      setFolders(prepared.folders);
       setStep("library");
     } catch (cause) {
       setError(String(cause));
@@ -889,7 +932,7 @@ export default function App() {
         );
         setStaging(false);
       }
-      const next = await invoke<PlanView>("plan_roms", {
+      const next = await planRomCopy<PlanView>(invoke, {
         profileId: profile.id,
         volumeId: volume.id,
         library: source,
@@ -1003,16 +1046,23 @@ export default function App() {
     setError("");
     setProgress("Starting copy…");
     try {
-      const next = await invoke<CopyReport>("copy_roms", {
-        profileId: profile.id,
-        volumeId: volume.id,
-        library: stagedLibrary || library,
-        include: included,
-        dryRun: false,
-        ...(sortMode === "smart"
-          ? { smart: { regions, resolutions }, dedupe: { keep: dedupeKeep } }
-          : {}),
-      });
+      const next =
+        sortMode === "smart"
+          ? await invoke<CopyReport>("copy_roms", {
+              profileId: profile.id,
+              volumeId: volume.id,
+              library: stagedLibrary || library,
+              include: included,
+              dryRun: false,
+              smart: { regions, resolutions },
+              dedupe: { keep: dedupeKeep },
+            })
+          : await copyPreparedRoms(invoke, {
+              profileId: profile.id,
+              volumeId: volume.id,
+              library: stagedLibrary || library,
+              include: included,
+            });
       setReport(next);
       setStep("done");
     } catch (cause) {
@@ -1045,34 +1095,28 @@ export default function App() {
           <p>{safetyNote()}</p>
           <p className="legal">
             A Gumroad license covers signed builds and support for this computer. Three computers
-            are included. More than that still works, and this app shows a warning.
+            are included. More than that still works, and this app shows a warning. Preparing a
+            ROM card does not need a key.
           </p>
-          <label>
-            License key
-            <input
-              type="password"
-              autoComplete="off"
-              spellCheck={false}
-              value={licenseKey}
-              onChange={(event) => setLicenseKey(event.target.value)}
-            />
-          </label>
-          <div className="row">
-            <button
-              disabled={licenseBusy || licenseKey.trim().length === 0}
-              onClick={() => void activateLicense()}
-            >
-              Activate this computer
-            </button>
-          </div>
           <p>
             {statusText(
-              licenseView?.message ?? "Checking this computer's license…",
-              licenseKey,
+              licenseUi.notice || licenseUi.view?.message || "Checking this computer's license…",
+              licenseUi.draftKey,
             )}
           </p>
-          {commercialUnlocked(licenseView).updates ? (
-            <p>Signed builds and support are unlocked on this computer.</p>
+          <div className="row">
+            <button type="button" onClick={() => dispatchLicense({ type: "manage" })}>
+              View license
+            </button>
+            <button type="button" disabled={licenseUi.busy} onClick={() => void onPaid("signed-updates")}>
+              Signed builds
+            </button>
+            <button type="button" disabled={licenseUi.busy} onClick={() => void onPaid("support")}>
+              Support
+            </button>
+          </div>
+          {licenseUi.unlockedPanel ? (
+            <p>{paidPanelCopy(licenseUi.unlockedPanel, licenseUi.view)}</p>
           ) : null}
         </section>
         {appVersion ? <p className="path">Card Studio {appVersion}</p> : null}
@@ -1948,6 +1992,33 @@ export default function App() {
             </li>
           </ol>
         </section>
+      ) : null}
+      {licenseUi.dialog === "unlock" ? (
+        <UnlockDialog
+          featureLabel={
+            licenseUi.pending ? paidFeatureLabel(licenseUi.pending) : "Signed builds and support"
+          }
+          draft={licenseUi.draftKey}
+          busy={licenseUi.busy}
+          message={licenseUi.notice}
+          onDraft={(key) => dispatchLicense({ type: "draft", key })}
+          onActivate={() => void onActivate()}
+          onClose={() => dispatchLicense({ type: "close" })}
+        />
+      ) : null}
+      {licenseUi.dialog === "manage" ? (
+        <LicenseManager
+          message={statusText(
+            licenseUi.notice || licenseUi.view?.message || "Checking this computer's license…",
+            licenseUi.draftKey,
+          )}
+          active={licenseUi.view?.state === "active"}
+          uses={licenseUi.view?.uses ?? null}
+          busy={licenseUi.busy}
+          onEnterKey={() => dispatchLicense({ type: "enter-key" })}
+          onDeactivate={() => void onDeactivate()}
+          onClose={() => dispatchLicense({ type: "close" })}
+        />
       ) : null}
     </main>
   );

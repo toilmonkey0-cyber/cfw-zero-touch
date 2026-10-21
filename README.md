@@ -96,7 +96,7 @@ The design and its accepted limits are written up in [`SECURITY.md`](SECURITY.md
 - DAT files for the optional igir sort are yours to supply (No-Intro's datomatic, for example).
 - The local-AI tier downloads software only — an Apache-2.0 engine and its weights — and only after you accept, verified against SHA-256 pins compiled into the app. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 - The profile feed is fetched from `raw.githubusercontent.com` on launch. Flashing downloads images only when you ask it to. `CFW_FEED_URL` overrides the feed for development.
-- A saved Gumroad license is re-checked over HTTPS when it is older than 7 days. That request sends the product id and the license key, and a network failure does not turn the saved license off. Card backup, restore, tests, and disk safeguards do not need a license. See [`docs/LICENSING.md`](docs/LICENSING.md).
+- A saved Gumroad license is re-checked over HTTPS when it is older than 7 days. That request sends the product id and the license key, and a network failure does not turn the saved license off. Signed builds and support ask for a key. ROM-card prep, backup, restore, card tests, and disk safeguards do not. See [`docs/LICENSING.md`](docs/LICENSING.md).
 - There is no telemetry and no analytics, and filenames never leave your machine. Signed release builds can set `CFW_GUMROAD_PRODUCT_ID` at compile time. The default placeholder does not call Gumroad.
 
 ## Requirements
