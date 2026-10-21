@@ -53,15 +53,38 @@ Above 3, the app still activates and signed-build support stays available. The s
 
 These stay available with no key, an invalid key, a refunded key, or a cached key:
 
+- ROM-card prep (prepare, seed, plan, and copy)
 - Stock-card backup and its cancel
 - Restore and its cancel
-- Quick card test (probe) and its cancel
+- Quick card test (probe), including a fake-card result, and its cancel
 - Full card test and its cancel
+- Disk pinning, identity checks, and OVERWRITTEN reporting
 - Guided setup, which calls those commands
 - Format and flash decisions, including the refusals for a fixed disk, a size of 0, disk 0, and a mismatched checksum
 - The profile feed and the public release link, which carry card-layout fixes
 
 The license screen is the commercial entitlement for signed builds and support. It does not download a private update package and it does not create a Gumroad product.
+
+## Free and paid
+
+Free, with no key, and without waiting on a license check:
+
+- ROM-card prep: list the card, prepare folders, seed the layout, plan, and copy
+- Stock-card backup and restore, including cancel
+- Quick card test (probe), including a fake-card result, and the full card test
+- Disk pinning and identity checks, including the disk 0 refusal
+- OVERWRITTEN reporting
+- Guided setup, format and flash decisions, and the disk refusals
+- The profile feed and the public release link
+
+Paid. Choosing one with no key opens the Enter key dialog:
+
+- Signed builds
+- Support
+
+A valid key unlocks those two on this computer. A refunded, charged-back, or unrecognized key leaves them locked and shows the reason in plain language. More than 3 computers still unlocks, with a warning. After one activation, a failed re-check (offline) stays unlocked. Deactivate this computer from View license; that deletes the saved activation and does not call Gumroad. This doesn't free up one of the 3 computers on Gumroad. Card tools keep working.
+
+`paid_feature` is the command entry for signed builds and support. A safety name returns before any license session is opened, so the check cannot slow those paths. Disk writes are not hooked.
 
 ## Network posture
 

@@ -3015,6 +3015,61 @@ async fn activate_license(license_key: String) -> license::LicenseView {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PaidFeatureView {
+    feature: String,
+    open: bool,
+    message: String,
+}
+
+#[tauri::command]
+async fn deactivate_license() -> license::LicenseView {
+    match tauri::async_runtime::spawn_blocking(|| with_license(|session| session.deactivate()))
+        .await
+    {
+        Ok(status) => {
+            log_license("license_deactivate", &status);
+            status.to_view(None)
+        }
+        Err(_) => {
+            let status = license::worker_stopped_status();
+            log_license("license_deactivate", &status);
+            status.to_view(None)
+        }
+    }
+}
+
+/// Paid features only. Safety names return before a license session is opened,
+/// so a license lookup cannot slow backup, probe, identity, or overwrite reporting.
+#[tauri::command]
+async fn paid_feature(feature: String) -> PaidFeatureView {
+    if !license::command_entry(&feature).consults_license() {
+        let decision = license::decide_paid(&feature, None);
+        return PaidFeatureView {
+            feature,
+            open: decision.open,
+            message: decision.message,
+        };
+    }
+    let feature_name = feature.clone();
+    let status = match tauri::async_runtime::spawn_blocking(|| {
+        with_license(|session| session.status(now_unix()))
+    })
+    .await
+    {
+        Ok(status) => status,
+        Err(_) => license::worker_stopped_status(),
+    };
+    log_license("paid_feature", &status);
+    let decision = license::decide_paid(&feature_name, Some(&status));
+    PaidFeatureView {
+        feature: feature_name,
+        open: decision.open,
+        message: decision.message,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     std::panic::set_hook(Box::new(|info| {
@@ -3059,7 +3114,9 @@ pub fn run() {
             classify_library,
             diagnose_card,
             license_status,
-            activate_license
+            activate_license,
+            deactivate_license,
+            paid_feature
         ])
         .build(tauri::generate_context!())
         .expect("error while building the application")

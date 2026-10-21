@@ -60,6 +60,10 @@ const MSG_UNREADABLE: &str =
 const MSG_STORE: &str =
     "The license checked out, but it could not be saved on this computer. Try again.";
 const MSG_NEEDS_LICENSE: &str = "Signed builds and support need a license. Backup, restore, card tests, and disk safeguards stay available.";
+const MSG_DEACTIVATED: &str = "This computer is no longer activated. This doesn't free up one of the 3 computers on Gumroad. Enter the license key from your Gumroad receipt to use signed builds and support again. Card tools still work.";
+const MSG_UNKNOWN_FEATURE: &str = "That feature is not available.";
+const MSG_SAFETY_OPEN: &str =
+    "This does not need a license. Backup, restore, card tests, and disk safeguards stay available.";
 const MSG_UNCHANGED_SUFFIX: &str = "The license already on this computer is unchanged.";
 
 /// Build-time product id. Unsigned and source builds keep the placeholder.
@@ -217,6 +221,8 @@ pub enum Feature {
     FullCheck,
     DiskRefusal,
     GuidedSetup,
+    Identity,
+    OverwrittenReport,
     SignedUpdates,
     Support,
 }
@@ -236,7 +242,81 @@ pub fn is_safety(feature: Feature) -> bool {
             | Feature::FullCheck
             | Feature::DiskRefusal
             | Feature::GuidedSetup
+            | Feature::Identity
+            | Feature::OverwrittenReport
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandEntry {
+    SafetyOpen,
+    Consult(Feature),
+    Unknown,
+}
+
+impl CommandEntry {
+    pub fn consults_license(self) -> bool {
+        matches!(self, Self::Consult(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaidDecision {
+    pub open: bool,
+    pub message: String,
+}
+
+/// Safety names return before any license session is opened.
+pub fn command_entry(name: &str) -> CommandEntry {
+    match name {
+        "backup" | "backup_stock_card" | "restore" | "restore_backup" | "probe" | "probe_card"
+        | "full-check" | "fullcheck" | "full_check_card" | "disk-refusal" | "guided"
+        | "guided-setup" | "identity" | "read_disk_identity" | "overwritten" => {
+            CommandEntry::SafetyOpen
+        }
+        "signed-updates" => CommandEntry::Consult(Feature::SignedUpdates),
+        "support" => CommandEntry::Consult(Feature::Support),
+        _ => CommandEntry::Unknown,
+    }
+}
+
+/// `status` is ignored for safety names, so a caller can decide them with no session.
+pub fn decide_paid(name: &str, status: Option<&LicenseStatus>) -> PaidDecision {
+    match command_entry(name) {
+        CommandEntry::SafetyOpen => PaidDecision {
+            open: true,
+            message: MSG_SAFETY_OPEN.to_string(),
+        },
+        CommandEntry::Unknown => PaidDecision {
+            open: false,
+            message: MSG_UNKNOWN_FEATURE.to_string(),
+        },
+        CommandEntry::Consult(feature) => {
+            let Some(status) = status else {
+                return PaidDecision {
+                    open: false,
+                    message: MSG_NEEDS_LICENSE.to_string(),
+                };
+            };
+            match gate(feature, status) {
+                Gate::Open => PaidDecision {
+                    open: true,
+                    message: status.message.clone(),
+                },
+                Gate::NeedsLicense { message } => {
+                    let message = if status.state == LicenseState::Inactive {
+                        status.message.clone()
+                    } else {
+                        message
+                    };
+                    PaidDecision {
+                        open: false,
+                        message,
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Safety features are open with or without a license. Above the 3-computer
@@ -409,6 +489,12 @@ impl<T: LicenseTransport> Session<T> {
             CacheLoad::Trusted(cached) if cached.license_key == key => self.reconcile(cached, now),
             _ => self.activate_new(key, now),
         }
+    }
+
+    /// Drops the saved activation. Does not contact Gumroad.
+    pub fn deactivate(&self) -> LicenseStatus {
+        self.discard_cache();
+        inactive(Reason::NotActivated, MSG_DEACTIVATED)
     }
 
     fn preflight(&self, key: &str) -> Option<LicenseStatus> {
@@ -1138,6 +1224,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::block_device::FakeBlockDevice;
 
     const KEY: &str = "ABCD-EFGH-IJKL-MN99";
     const OTHER_KEY: &str = "ZZZZ-YYYY-XXXX-WW99";
@@ -1703,6 +1790,8 @@ mod tests {
             Feature::FullCheck,
             Feature::DiskRefusal,
             Feature::GuidedSetup,
+            Feature::Identity,
+            Feature::OverwrittenReport,
         ] {
             assert_eq!(gate(feature, &inactive), Gate::Open);
             assert_eq!(gate(feature, &active), Gate::Open);
@@ -1802,6 +1891,9 @@ mod tests {
             "list_probe_disks",
             "firstboot_state",
             "read_disk_identity",
+            "seed_card",
+            "plan_roms",
+            "copy_roms",
         ] {
             let body = command_body(&src, name);
             assert!(
@@ -1815,6 +1907,8 @@ mod tests {
             "log_license",
             "license_status",
             "activate_license",
+            "deactivate_license",
+            "paid_feature",
         ] {
             outside = remove_function(&outside, name);
         }
@@ -1859,7 +1953,12 @@ mod tests {
     #[test]
     fn license_commands_run_the_network_off_the_calling_thread() {
         let src = include_str!("lib.rs").replace("\r\n", "\n");
-        for name in ["license_status", "activate_license"] {
+        for name in [
+            "license_status",
+            "activate_license",
+            "deactivate_license",
+            "paid_feature",
+        ] {
             let marker = format!("fn {name}(");
             let start = src
                 .find(&marker)
@@ -1873,10 +1972,11 @@ mod tests {
             let pooled = body
                 .find("spawn_blocking")
                 .unwrap_or_else(|| panic!("{name} must use spawn_blocking"));
-            let call = if name == "license_status" {
-                body.find(".status(")
-            } else {
-                body.find(".activate(")
+            let call = match name {
+                "license_status" | "paid_feature" => body.find(".status("),
+                "activate_license" => body.find(".activate("),
+                "deactivate_license" => body.find(".deactivate("),
+                _ => None,
             }
             .unwrap_or_else(|| panic!("{name} does not call the session"));
             assert!(
@@ -2094,5 +2194,243 @@ mod tests {
         assert_secret_free(&outcome.stored.message);
         assert_eq!(calls.lock().unwrap().len(), 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct BlockingTransport {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl LicenseTransport for BlockingTransport {
+        fn verify(&self, _call: &VerifyCall) -> Result<RawReply, TransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_secs(30));
+            Err(TransportError { kind: "timeout" })
+        }
+    }
+
+    struct DirGuard(PathBuf);
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn deactivate_drops_the_cache_and_does_not_call_gumroad() {
+        let lab = lab(vec![reply_uses(1), reply_uses(1)]);
+        lab.session.activate(KEY, NOW);
+        assert!(cache_file(&lab).exists());
+        let before = calls_of(&lab).len();
+        let status = lab.session.deactivate();
+        assert_eq!(status.state, LicenseState::Inactive);
+        assert!(status.message.contains("no longer activated"));
+        assert!(status
+            .message
+            .contains("doesn't free up one of the 3 computers on Gumroad"));
+        assert_secret_free(&status.message);
+        assert!(!cache_file(&lab).exists());
+        assert_eq!(calls_of(&lab).len(), before);
+        let again = lab.session.status(NOW + 10);
+        assert_eq!(again.reason, Reason::NotActivated);
+        assert!(!again.to_view(None).signed_updates);
+        assert!(!decide_paid("signed-updates", Some(&again)).open);
+        assert!(decide_paid("probe", Some(&again)).open);
+    }
+
+    #[test]
+    fn offline_after_activation_stays_unlocked() {
+        let lab = lab(vec![
+            reply_uses(1),
+            reply_uses(1),
+            Err(TransportError { kind: "timeout" }),
+        ]);
+        lab.session.activate(KEY, NOW);
+        let status = lab.session.status(NOW + REVERIFY_AFTER_SECS);
+        assert!(status.stale);
+        assert_eq!(status.state, LicenseState::Active);
+        assert!(decide_paid("signed-updates", Some(&status)).open);
+        assert!(decide_paid("support", Some(&status)).open);
+        assert!(status.message.contains("stays activated"));
+    }
+
+    #[test]
+    fn a_refunded_key_keeps_paid_features_locked() {
+        let lab = lab(vec![reply_file("refunded.json", 200)]);
+        let outcome = lab.session.activate(KEY, NOW);
+        assert_eq!(outcome.stored.reason, Reason::Refunded);
+        let decision = decide_paid("support", Some(&outcome.stored));
+        assert!(!decision.open);
+        assert!(decision.message.contains("refunded"));
+        assert!(decide_paid("probe_card", Some(&outcome.stored)).open);
+    }
+
+    #[test]
+    fn a_valid_key_unlocks_signed_builds_and_support() {
+        let activated = lab(vec![reply_uses(1), reply_uses(1)]);
+        let outcome = activated.session.activate(KEY, NOW);
+        assert!(decide_paid("signed-updates", Some(&outcome.stored)).open);
+        assert!(decide_paid("support", Some(&outcome.stored)).open);
+        let missing = lab(vec![]);
+        let status = missing.session.status(NOW);
+        let locked = decide_paid("signed-updates", Some(&status));
+        assert!(!locked.open);
+        assert!(locked.message.contains("license key"));
+        assert!(calls_of(&missing).is_empty());
+    }
+
+    #[test]
+    fn the_fourth_computer_stays_unlocked_at_the_paid_gate() {
+        let lab = lab(vec![reply_uses(3), reply_uses(4)]);
+        let outcome = lab.session.activate(KEY, NOW);
+        let decision = decide_paid("signed-updates", Some(&outcome.stored));
+        assert!(decision.open);
+        assert!(outcome.stored.over_soft_limit);
+        assert!(decision.message.contains("more than 3"));
+    }
+
+    #[test]
+    fn paid_feature_answers_safety_names_before_opening_a_license_session() {
+        let src = include_str!("lib.rs").replace("\r\n", "\n");
+        let body = command_body(&src, "paid_feature");
+        let early = body
+            .find("consults_license")
+            .expect("safety names return before the session");
+        let session = body
+            .find("with_license")
+            .expect("paid features still consult the session");
+        assert!(early < session, "{body}");
+    }
+
+    #[test]
+    fn safety_paths_run_with_no_license_and_do_not_wait_on_it() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let dir = scratch();
+        let _guard = DirGuard(dir.clone());
+        let session = Session::new(
+            BlockingTransport {
+                calls: Arc::clone(&calls),
+            },
+            dir.join("license").join("activation.json"),
+            PRODUCT,
+            MACHINE,
+            REQUEST_TIMEOUT,
+        );
+        let started = std::time::Instant::now();
+
+        for name in [
+            "backup",
+            "restore",
+            "probe",
+            "full-check",
+            "identity",
+            "overwritten",
+            "probe_card",
+            "read_disk_identity",
+            "backup_stock_card",
+        ] {
+            let decision = decide_paid(name, None);
+            assert!(decision.open, "{name}");
+            assert!(!command_entry(name).consults_license(), "{name}");
+        }
+
+        let disk0 = crate::read_disk_identity(0).unwrap_err();
+        assert!(disk0.contains("disk 0"), "{disk0}");
+
+        let removable = crate::probe::ProbeDisk {
+            number: 2,
+            bus: "USB".into(),
+            size_bytes: 64 * 1024,
+            system_disk: false,
+            model: "Generic SD".into(),
+            serial: "FixtureCard".into(),
+        };
+        let (serial, size) = crate::probe::accept_read_only_identity(&removable).unwrap();
+        assert_eq!(serial, "fixturecard");
+        assert_eq!(size, 64 * 1024);
+        let pinned = crate::probe::CardIdentity {
+            serial: "FixtureCard".into(),
+            prefix_sha256: "ab".repeat(32),
+            bytes: 8192,
+            model: "Generic SD".into(),
+            samples: Vec::new(),
+        };
+        assert!(crate::probe::same_identity(&pinned, &pinned));
+        let mut moved = pinned.clone();
+        moved.serial = "other-card".into();
+        assert!(!crate::probe::same_identity(&pinned, &moved));
+
+        let backup_disk = crate::backup::BackupDisk {
+            number: 2,
+            bus: "USB".into(),
+            size_bytes: 8192,
+            system_disk: false,
+            displayed_bytes: 8192,
+        };
+        crate::backup::authorize_backup(&backup_disk).unwrap();
+        let system = crate::backup::BackupDisk {
+            number: 0,
+            ..backup_disk.clone()
+        };
+        assert!(crate::backup::authorize_backup(&system).is_err());
+
+        let image = dir.join("card.img");
+        let mut device = crate::block_device::FileBlockDevice::create(&image, 8192, 8192).unwrap();
+        device.write_at(0, &[1, 2, 3, 4]).unwrap();
+        let outcome = crate::backup::backup_image(
+            &mut device,
+            &dir.join("stock.img.gz"),
+            u64::MAX,
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        match outcome {
+            crate::backup::BackupOutcome::Complete { bytes, .. } => assert_eq!(bytes, 8192),
+            crate::backup::BackupOutcome::Cancelled { .. } => panic!("backup cancelled"),
+        }
+
+        let reported = 64 * 1024;
+        let mut fake =
+            crate::block_device::FileBlockDevice::create(&dir.join("fake.img"), 8 * 1024, reported)
+                .unwrap();
+        let probe_disk = crate::probe::ProbeDisk {
+            size_bytes: reported,
+            serial: String::new(),
+            ..removable
+        };
+        let plan = crate::probe::ProbePlan {
+            confirmation: "PROBE".into(),
+            disk_number: 2,
+            displayed_bytes: reported,
+            displayed_model: "Generic SD".into(),
+        };
+        let status = crate::probe::run_probe(
+            &mut fake,
+            &crate::probe::ProbeRequest {
+                disk: &probe_disk,
+                plan: &plan,
+                backup: None,
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        let log = crate::probe::format_probe_log(&status);
+        assert!(crate::probe::overwritten_flag(&log).unwrap());
+        assert!(log.contains("OVERWRITTEN=yes"), "{log}");
+        let crate::probe::ProbeStatus::Finished(report) = status else {
+            panic!("probe did not finish");
+        };
+        assert_eq!(report.kind, crate::probe::CardKind::Fake);
+        assert!(report.summary.contains("overwritten"), "{}", report.summary);
+
+        let status = session.status(NOW);
+        assert_eq!(status.reason, Reason::NotActivated);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "safety path waited on licensing"
+        );
     }
 }
