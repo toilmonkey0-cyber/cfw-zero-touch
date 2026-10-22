@@ -122,7 +122,7 @@ npm run test:unit      # vitest
 cd src-tauri && cargo test
 ```
 
-Build a release bundle with `npm run tauri build`. CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and the frontend checks (including `npm run test:unit`) on every push. Pull requests also build an unsigned Windows installer and upload the `.msi` and `.exe`. `cargo deny` and `npm audit` run as warnings and do not fail the workflow.
+Build a release bundle with `npm run tauri build`. CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and the frontend checks (including `npm run test:unit`) on every push. Pull requests also build an unsigned Windows installer and upload the `.msi` and `.exe`. A `v*` tag runs `.github/workflows/release.yml`, which builds that installer, writes `SHA256SUMS`, and opens a draft GitHub release. You publish the draft. Code signing stays off until `SIGNING_ENABLED` is `true`. See [`docs/RELEASING.md`](docs/RELEASING.md). `cargo deny` and `npm audit` run as warnings and do not fail the workflow.
 
 ## Documentation
 
@@ -134,6 +134,7 @@ Build a release bundle with `npm run tauri build`. CI runs `cargo fmt --check`, 
 | [`docs/FIRSTBOOT.md`](docs/FIRSTBOOT.md) | What ArkOS/dArkOS first boot does to `EASYROMS`, and the disarm logic |
 | [`docs/QA-PHASE1.md`](docs/QA-PHASE1.md) | Hardware QA checklist for a spare card |
 | [`docs/LICENSING.md`](docs/LICENSING.md) | Gumroad license check, offline cache, and what it does not lock |
+| [`docs/RELEASING.md`](docs/RELEASING.md) | How to cut a draft release, turn signing on later, and check `SHA256SUMS` |
 | [`specs/profile.schema.json`](specs/profile.schema.json) | The profile schema every layout validates against |
 
 ## Project status

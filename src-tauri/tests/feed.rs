@@ -107,8 +107,14 @@ use cfw_zero_touch_lib::feed::apply_feed;
 use std::fs;
 
 fn scratch_dir() -> PathBuf {
+    // Unique even when parallel tests scratch a directory within one clock
+    // tick. They share the pid, and Windows often reports the same
+    // subsec_nanos for that whole tick. One test's remove_dir_all then
+    // deletes another test's files.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "cfw-feed-apply-{}-{}",
+        "cfw-feed-apply-{}-{}-{seq}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
