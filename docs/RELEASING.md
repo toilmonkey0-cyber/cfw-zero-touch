@@ -15,7 +15,7 @@ The installer version and the copy shown in the app have to be the same number. 
 - `src-tauri/Cargo.toml` `version` (this is the version the app shows)
 - `src-tauri/tauri.conf.json` `version` (this is the version on the installer)
 
-The tag is `v` plus that number. For `0.2.0` the tag is `v0.2.0`. The workflow stops if the tag and those files disagree.
+The tag is `v` plus that number, and the number is `MAJOR.MINOR.PATCH` with no pre-release suffix. For `0.2.0` the tag is `v0.2.0`. On a tag push, the guard checks that shape with `Assert-TagMatchesVersion` against the four version files. The workflow stops if the tag and those files disagree.
 
 `profiles-feed.json` has its own `app.version`. That is the number the in-app "new build available" banner compares against. Bump it in the same commit when you want the banner to mention this release. The release workflow leaves the feed alone.
 
@@ -37,7 +37,7 @@ You need write access to start it. When it finishes, open the run and download t
 
 A dispatch always runs **Windows installer (unsigned)**, including when `SIGNING_ENABLED` is already `true`. The compile job also requires a push of a `v*` tag, so **Run workflow** never asks the `release` environment for a certificate. The summary says **This build is UNSIGNED.** The step **Sign Windows binaries** is skipped.
 
-Clearing **dry_run** fails the run on purpose. A dispatch is only a rehearsal. Push a tag when you want a draft.
+Clearing **dry_run** fails the run on purpose. A dispatch only builds an unsigned installer. Push a tag when you want a draft.
 
 ### Why a pull request cannot run this dry run
 
@@ -83,7 +83,7 @@ While it is off, and also on every **Run workflow** dispatch:
 - No certificate secret is read.
 - `SIGNING.txt` contains `unsigned`.
 - `signtool verify /pa` fails on the setup `.exe` and the `.msi`, and the job summary says so.
-- The job extracts the MSI with `msiexec /a` and runs `signtool verify /pa` on every `.exe` inside. Those fail too, which is what an unsigned build should do. The extract has to contain `cfw-zero-touch.exe` and `cfw-flash.exe`.
+- The job extracts the MSI with `msiexec /a`. `signtool verify /pa` has to fail for `cfw-zero-touch.exe` and `cfw-flash.exe`. That failure is what an unsigned build should do. Other executables in the extract do not decide the unsigned label.
 
 ## Turn signing on later
 
@@ -207,15 +207,39 @@ Set `SIGNING_ENABLED` to `true` last.
 On a `v*` tag with the switch on, the unsigned job is skipped. Four jobs run instead:
 
 1. **Compile Windows binaries** has no `release` environment and no certificate. It runs `npm run tauri build -- --no-bundle`, copies `cfw-zero-touch.exe` and `cfw-flash.exe` (and any other executable beside them in `src-tauri/target/release`), and publishes the SHA-256 of those files as a job output.
-2. **Sign Windows binaries** uses the `release` environment, so GitHub waits for the reviewer. It checks out `scripts/` only, with credentials persistence off. It does not run `npm` or `cargo`. It downloads the unsigned executables, refuses to continue if their hashes differ from the compile job's output, and only then signs them. It publishes the hashes of the signed executables.
-3. **Bundle Windows installers** has no `release` environment and no certificate. It puts the signed executables back into `src-tauri/target/release`, checks those hashes, and runs `npm run tauri bundle -- --no-binary-patching --no-sign`. `--no-binary-patching` needs the Tauri CLI at 2.12.2. Tauri otherwise rewrites `cfw-zero-touch.exe` once per installer type (MSI, then NSIS), which strips an Authenticode signature. This app does not use the updater, so that per-installer patch is not required. The bundle job hashes the executables again afterwards and stops if the bytes changed. It publishes the hashes of the unsigned setup `.exe` and `.msi`.
-4. **Sign Windows installers** uses the `release` environment again, so GitHub asks for approval a second time. It checks out `scripts/` only, downloads the installers, checks their hashes, and signs the setup `.exe` and the `.msi`. `SHA256SUMS` is written after that, so the hashes match the signed installers.
+2. **Sign Windows binaries** uses the `release` environment, so GitHub waits for the reviewer. It checks out `scripts/` only, with credentials persistence off. It does not run `npm` or `cargo`. It downloads the unsigned executables, refuses to continue if their hashes differ from the compile job's output, and only then signs them. It publishes the hashes of the signed executables and the signer thumbprint of the certificate it used.
+3. **Bundle Windows installers** has no `release` environment and no certificate. It puts the signed executables back into `src-tauri/target/release`, checks those hashes, and runs `npm run tauri bundle -- --no-binary-patching --no-sign`. `--no-binary-patching` needs the Tauri CLI at 2.12.2. Tauri otherwise rewrites `cfw-zero-touch.exe` once per installer type (MSI, then NSIS), which strips an Authenticode signature. This app does not use the updater, so that per-installer patch is not required. The bundle job hashes the executables again afterwards and stops if the bytes changed. It publishes the hashes of the unsigned setup `.exe` and `.msi`. This job still installs the Rust toolchain. `tauri bundle` runs `cargo metadata` to locate the app. It does not compile the app again.
+4. **Sign Windows installers** uses the `release` environment again, so GitHub asks for approval a second time. It checks out `scripts/` only. It does not trust the bundle job to describe what is inside the installers. It reads `SIGNED_BINARY_HASHES` and `SIGNER_THUMBPRINT` from the binary sign job. Before it imports a certificate, it checks the installer file hashes, then extracts both installers. The MSI is extracted with `System32\msiexec.exe /a`. The setup `.exe` is extracted with 7-Zip 26.05. The script downloads `7z2605-x64.msi` from `https://github.com/ip7z/7zip/releases/download/26.05/7z2605-x64.msi`, which is the file [7-zip.org](https://www.7-zip.org/download.html) links, and refuses it unless the SHA-256 is `3fe4ab99fa15629c652944309a2b2bc6e41fc933fc6b63f5df1ebcf3aea68263`. That pin is a constant in `scripts/release-lib.ps1`. The download has to stay on HTTPS and under 5 MB. `msiexec /a` installs that MSI into a private directory, and the job runs the single `7z.exe` there, with `7z.dll` beside it. It does not use a 7-Zip already on `PATH`. Certificate secrets are removed from the process environment for the extract, so an installer custom action cannot read them. The certificate is imported only after the inspection succeeds.
 
-Approve both waits. The bundle job between them never receives the certificate.
+`cfw-zero-touch.exe` and `cfw-flash.exe` inside both extracts have to match the binary sign job's hashes byte for byte. `Get-AuthenticodeSignature` has to report the same signer thumbprint that job published. `signtool verify /pa` has to pass for those two as well. `/pa` alone is not enough: a different trusted certificate would pass it. Any other `.exe` or `.dll` fails the job unless it is one of the five NSIS plugins pinned by name and SHA-256 (`System.dll`, `nsDialogs.dll`, `nsis_tauri_utils.dll`, `StartMenu.dll`, `NSISdl.dll` from NSIS 3.11 and Tauri's `nsis_tauri_utils`), or the single NSIS `uninstall.exe`. That uninstaller is generated with the product name and version inside it, so a full-file hash cannot be pinned before the bundle exists. The job allows exactly one file of that name, between 60 KB and 200 KB, containing both `Nullsoft Install System v3.11` and `Nullsoft.NSIS.exehead`. That check is not a signature.
+
+After that inspection the job signs the setup `.exe` and the `.msi`. Their signer thumbprint has to match the same certificate, and `signtool verify /pa` has to pass. `SHA256SUMS` is written after that, so the hashes match the signed installers.
+
+### Two reviewer approvals
+
+The two sign jobs are separate on purpose. Each one sets `environment: release`. GitHub stops and waits for a required reviewer before **Sign Windows binaries** runs, and it stops and waits again before **Sign Windows installers** runs. Approving the first wait does not approve the second. Do not merge the two jobs into one, and do not turn the environment name into a variable. A variable would let a workflow edit point signing at an environment with weaker rules.
+
+The bundle job between the two waits has no `release` environment and never receives the certificate.
 
 `SIGNING_METHOD=azure` runs the Azure sign step in each sign job. `pfx`, or an empty method, runs the `.pfx` sign step. A different spelling fails the guard on a tag push before the compile.
 
-After the installers are signed, the job runs `signtool verify /pa` on the setup `.exe` and the `.msi`. It then extracts the MSI with `msiexec /a` (the copy in `System32`, so `PATH` cannot substitute another `msiexec`) and runs `signtool verify /pa` on every `.exe` inside. `cfw-zero-touch.exe` and `cfw-flash.exe` have to be in that extract. A failure there fails the job, so a broken signature is not uploaded as a signed build. The unsigned path runs the same extract and requires those checks to fail.
+After the installers are signed, the job runs `signtool verify /pa` on the setup `.exe` and the `.msi`. It then extracts the MSI again with `msiexec /a` and checks the executables inside. `cfw-zero-touch.exe` and `cfw-flash.exe` have to be in that extract. A failure there fails the job, so a broken signature is not uploaded as a signed build. The unsigned path runs the same MSI extract and requires `signtool verify /pa` to fail for those two product executables.
+
+### One-time rehearsal before you pay for a certificate
+
+Do this once, on a throwaway tag, before you buy a certificate and before you leave `SIGNING_ENABLED` set. This repository change does not run that rehearsal, does not create the environment, and does not push a tag.
+
+`v0.2.0` is already a tag here. Do not reuse it. On a branch you will not merge, bump `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` to a `MAJOR.MINOR.PATCH` version that has never been tagged. The tag has to be `v` plus that number. The guard uses `Assert-TagMatchesVersion`.
+
+1. Create a GitHub environment named `release-rehearsal`. You are the only required reviewer. Do not put a production certificate on it. Limit deployment to tags the same way as `release`.
+2. On that unmerged branch, change both sign jobs from `environment: release` to `environment: release-rehearsal`. Leave that edit off `main`.
+3. Create a self-signed code-signing `.pfx` on your own machine. Store it only as `WINDOWS_CERTIFICATE` and `WINDOWS_CERTIFICATE_PASSWORD` on `release-rehearsal`.
+4. Set the repository variable `SIGNING_ENABLED` to `true` for this run only.
+5. Push the throwaway tag. Approve `release-rehearsal` when the binary sign job waits, and approve it again when the installer sign job waits.
+6. In the installer sign job log, the inner `cfw-zero-touch.exe` and `cfw-flash.exe` should match the binary sign job's hashes, and the signer thumbprint should match. `signtool verify /pa` then fails, because a self-signed certificate is not a trusted Authenticode chain. The job goes red and no draft is published. That red result is what you want. Do not weaken `/pa`, and do not install the test certificate as a trusted root to make the job green.
+7. Delete the throwaway tag. Delete a draft if one was opened. Unset `SIGNING_ENABLED`. Do not merge the environment-name edit.
+
+Paid signing stays on the `release` environment, with a real certificate, after this rehearsal. Unset `SIGNING_ENABLED` again before any later tag that should stay unsigned.
 
 ## Check a file you downloaded
 
@@ -264,12 +288,20 @@ signtool verify /pa "C:\cfw-msi-extract\path\to\cfw-zero-touch.exe"
 signtool verify /pa "C:\cfw-msi-extract\path\to\cfw-flash.exe"
 ```
 
-Search the extract and run `signtool verify /pa` on every `.exe`. An unsigned build fails each of them. A signed build passes each of them. Signing only the outer setup file leaves these two unsigned, which is why the tag pipeline signs them before it bundles.
+Search the extract and run `signtool verify /pa` on `cfw-zero-touch.exe` and `cfw-flash.exe`. An unsigned build fails those two. A signed build passes them. Also compare the signer thumbprint with the certificate you expect:
+
+```powershell
+(Get-AuthenticodeSignature -LiteralPath '.\cfw-zero-touch.exe').SignerCertificate.Thumbprint
+(Get-AuthenticodeSignature -LiteralPath '.\cfw-flash.exe').SignerCertificate.Thumbprint
+```
+
+The two thumbprints should match each other and the certificate that signed the installers. `signtool verify /pa` only tells you the chain is trusted. The tag pipeline checks the thumbprint as well, before it signs the outer installer, because a different trusted certificate would still pass `/pa`. Signing only the outer setup file leaves these two unsigned, which is why the tag pipeline signs them before it bundles.
 
 ## What you do yourself
 
 - Publish the draft, from the releases page, after the checks above.
 - Choose a signing vendor and pay them, later, after you **VERIFY** the price.
-- Approve the `release` environment twice when a signed tag build is waiting: once for the executables, and once for the installers.
+- Approve the `release` environment twice when a signed tag build is waiting: once before the executables are signed, and once before the installers are signed. One approval does not cover both. See [Two reviewer approvals](#two-reviewer-approvals).
+- Run the [one-time self-signed rehearsal](#one-time-rehearsal-before-you-pay-for-a-certificate) before you pay for a certificate. That rehearsal is a separate environment and a throwaway tag. It is not the dry run.
 
 The workflow builds, checksums, and opens the draft. With the switch off, it labels the build unsigned and skips signing.

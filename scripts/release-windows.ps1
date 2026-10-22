@@ -108,7 +108,11 @@ function Publish-ReleaseDirectory {
     }
     $inner = Assert-MsiInnerSignatures -Directory $Destination -Signed $Signed -SignTool $tool -OnActions $onActions
     if ($inner -eq 'checked') {
-        $innerNote = 'msiexec /a extracted the MSI. signtool verify /pa was run on every .exe inside, including cfw-zero-touch.exe and cfw-flash.exe.'
+        if ($Signed) {
+            $innerNote = 'msiexec /a extracted the MSI. signtool verify /pa passed for the executables inside, including cfw-zero-touch.exe and cfw-flash.exe.'
+        } else {
+            $innerNote = 'msiexec /a extracted the MSI. signtool verify /pa failed for cfw-zero-touch.exe and cfw-flash.exe, which is what an unsigned build should do.'
+        }
         if ([string]::IsNullOrWhiteSpace($verifyNote)) {
             $verifyNote = $innerNote
         } else {
@@ -288,7 +292,11 @@ function Assert-MsiInnerSignatures {
                     ExitCode = [int]$LASTEXITCODE
                 })
             }
-            Assert-AuthenticodeResults -Signed $Signed -FoundSignTool $true -RunningOnActions $OnActions -Results @($results.ToArray())
+            $toCheck = @(Select-AuthenticodeResultsForLabel -Signed $Signed -Results @($results.ToArray()))
+            if (-not $Signed) {
+                Assert-ProductExecutableNames -Names @($toCheck | ForEach-Object { [string]$_.Name })
+            }
+            Assert-AuthenticodeResults -Signed $Signed -FoundSignTool $true -RunningOnActions $OnActions -Results $toCheck
         } finally {
             if (Test-Path -LiteralPath $extract) {
                 Remove-Item -LiteralPath $extract -Recurse -Force
@@ -329,19 +337,309 @@ function Invoke-SignBinaries {
         }
         Invoke-SignChildFiles -Files $exes
         $signed = @(Get-TopLevelExecutables -Directory $destination)
+        Assert-ProductExecutableNames -Names @($signed | ForEach-Object { $_.Name })
         $manifest = Format-HashManifest -Files $signed
+        $thumb = Get-CommonSignerThumbprint -Files $signed
         Write-GitHubOutputValue -Name 'hashes' -Value (ConvertTo-HashManifestBase64 -Manifest $manifest)
-        Write-Output 'Signed cfw-zero-touch.exe and cfw-flash.exe. The installers are bundled by a later job.'
+        Write-GitHubOutputValue -Name 'thumbprint' -Value $thumb
+        Write-Output "Signed cfw-zero-touch.exe and cfw-flash.exe. Signer thumbprint $thumb. The installers are bundled by a later job."
     } finally {
         Remove-ImportedCodeSigningCertificate
     }
 }
 
 function Get-SignReleaseVersion {
-    if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v(\d+\.\d+\.\d+)$') {
-        return $Matches[1]
+    if ($env:GITHUB_REF_TYPE -ne 'tag') {
+        throw 'The installer sign job only runs for a v* tag.'
     }
-    throw 'The installer sign job only runs for a v* tag.'
+    $tag = [string]$env:GITHUB_REF_NAME
+    Assert-ReleaseTagShape -Tag $tag
+    return $tag.Substring(1)
+}
+
+function Get-CommonSignerThumbprint {
+    param([Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Files)
+    $values = New-Object System.Collections.Generic.List[string]
+    foreach ($file in @($Files)) {
+        if ($null -eq $file) { continue }
+        $values.Add((Get-AuthenticodeSignerThumbprint -Path $file.FullName))
+    }
+    if ($values.Count -lt 1) {
+        throw 'There was no signed file to read a thumbprint from.'
+    }
+    $first = $values[0]
+    foreach ($value in $values) {
+        if (-not [string]::Equals($value, $first, [StringComparison]::Ordinal)) {
+            throw 'The signed executables do not share one signer thumbprint. Refusing to publish it.'
+        }
+    }
+    Assert-SignerThumbprint -Actual $first -Expected $first
+    return $first
+}
+
+function Save-HttpsFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][long]$MaxBytes
+    )
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'https') {
+        throw 'Refusing a download that is not https.'
+    }
+    $handler = New-Object System.Net.Http.HttpClientHandler
+    $handler.AllowAutoRedirect = $true
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromMinutes(2)
+    $response = $null
+    $stream = $null
+    $out = $null
+    try {
+        $response = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        $code = [int]$response.StatusCode
+        if ($code -lt 200 -or $code -ge 300) {
+            throw "Download of the pinned 7-Zip installer failed with HTTP $code."
+        }
+        $final = $response.RequestMessage.RequestUri
+        if ($null -eq $final -or $final.Scheme -ne 'https') {
+            throw 'The 7-Zip download redirected off https. Refusing it.'
+        }
+        $length = $response.Content.Headers.ContentLength
+        if ($null -ne $length -and [int64]$length -gt $MaxBytes) {
+            throw "The 7-Zip download claims $length bytes. Refusing a file larger than $MaxBytes."
+        }
+        $stream = $response.Content.ReadAsStream()
+        $out = [System.IO.File]::Create($Destination)
+        $buffer = New-Object byte[] 81920
+        $total = [int64]0
+        while ($true) {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+            $total += [int64]$read
+            if ($total -gt $MaxBytes) {
+                throw "The 7-Zip download exceeded $MaxBytes bytes. Refusing to continue."
+            }
+            $out.Write($buffer, 0, $read)
+        }
+    } finally {
+        if ($null -ne $out) { $out.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Assert-TrustedSevenZipPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$SevenZip,
+        [Parameter(Mandatory = $true)][string]$ExtractRoot
+    )
+    $leaf = Split-Path -Leaf $SevenZip
+    if (-not [string]::Equals($leaf, '7z.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Refusing to extract the setup executable with anything other than 7z.exe.'
+    }
+    $full = [System.IO.Path]::GetFullPath($SevenZip)
+    $root = [System.IO.Path]::GetFullPath($ExtractRoot)
+    $separator = [System.IO.Path]::DirectorySeparatorChar
+    if (-not $root.EndsWith($separator)) {
+        $root = $root + $separator
+    }
+    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+        throw '7z.exe is outside the private 7-Zip extract. Refusing to run it.'
+    }
+    $exeItem = Get-Item -LiteralPath $full
+    if (-not [string]::IsNullOrWhiteSpace([string]$exeItem.LinkType)) {
+        throw 'Refusing a 7z.exe that is a link.'
+    }
+    $dll = Join-Path (Split-Path -Parent $full) '7z.dll'
+    if (-not (Test-Path -LiteralPath $dll)) {
+        throw '7z.dll was not beside the extracted 7z.exe. Refusing to run it.'
+    }
+    $dllItem = Get-Item -LiteralPath $dll
+    if (-not [string]::IsNullOrWhiteSpace([string]$dllItem.LinkType)) {
+        throw 'Refusing a 7z.dll that is a link.'
+    }
+}
+
+function Install-PinnedSevenZip {
+    param([Parameter(Mandatory = $true)][string]$ExtractDirectory)
+    Assert-SevenZipDownloadPin
+    $msi = Join-Path (Get-WorkDirectory) 'cfw-7z2605-x64.msi'
+    if (Test-Path -LiteralPath $msi) {
+        Remove-Item -LiteralPath $msi -Force
+    }
+    try {
+        Save-HttpsFile -Url (Get-SevenZipMsiUrl) -Destination $msi -MaxBytes ([int64](Get-SevenZipMsiMaxBytes))
+        Assert-PinnedSevenZipMsi -Path $msi
+        Invoke-MsiAdminExtract -MsiPath $msi -Destination $ExtractDirectory
+    } finally {
+        if (Test-Path -LiteralPath $msi) {
+            Remove-Item -LiteralPath $msi -Force
+        }
+    }
+    $root = (Resolve-Path -LiteralPath $ExtractDirectory).Path
+    $exes = @(Get-ChildItem -LiteralPath $root -Filter '7z.exe' -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+    if ($exes.Count -ne 1 -or $null -eq $exes[0]) {
+        throw "Expected exactly one 7z.exe in the pinned 7-Zip extract. Found $($exes.Count)."
+    }
+    $full = $exes[0].FullName
+    Assert-TrustedSevenZipPath -SevenZip $full -ExtractRoot $root
+    return $full
+}
+
+function Invoke-NsisExtract {
+    param(
+        [Parameter(Mandatory = $true)][string]$SevenZip,
+        [Parameter(Mandatory = $true)][string]$SetupExe,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    if (-not (Test-Path -LiteralPath $SevenZip)) {
+        throw 'The pinned 7z.exe was not found.'
+    }
+    $resolvedSevenZip = (Resolve-Path -LiteralPath $SevenZip).Path
+    $leaf = Split-Path -Leaf $resolvedSevenZip
+    if (-not [string]::Equals($leaf, '7z.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Refusing to extract the setup executable with anything other than 7z.exe.'
+    }
+    $dll = Join-Path (Split-Path -Parent $resolvedSevenZip) '7z.dll'
+    if (-not (Test-Path -LiteralPath $dll)) {
+        throw '7z.dll was not beside 7z.exe. Refusing to extract the setup executable.'
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $Destination | Out-Null
+    $dest = (Resolve-Path -LiteralPath $Destination).Path
+    $setup = (Resolve-Path -LiteralPath $SetupExe).Path
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $resolvedSevenZip
+    $psi.WorkingDirectory = Split-Path -Parent $psi.FileName
+    $psi.UseShellExecute = $false
+    [void]$psi.ArgumentList.Add('x')
+    [void]$psi.ArgumentList.Add('-y')
+    [void]$psi.ArgumentList.Add('-bso0')
+    [void]$psi.ArgumentList.Add('-bsp0')
+    [void]$psi.ArgumentList.Add("-o$dest")
+    [void]$psi.ArgumentList.Add($setup)
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if ($null -eq $proc) {
+        throw '7z.exe did not start.'
+    }
+    [void]$proc.WaitForExit()
+    if ($proc.ExitCode -ne 0) {
+        throw "7z.exe failed to extract $(Split-Path -Leaf $setup) with exit $($proc.ExitCode)."
+    }
+}
+
+function Assert-ProductExecutablesTrust {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExtractDirectory,
+        [Parameter(Mandatory = $true)][string]$SignTool
+    )
+    $required = @(Get-RequiredExecutableNames)
+    $found = @(Get-ChildItem -LiteralPath $ExtractDirectory -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+    $checked = 0
+    foreach ($file in $found) {
+        $isProduct = $false
+        foreach ($name in $required) {
+            if ([string]::Equals($file.Name, $name, [StringComparison]::Ordinal)) {
+                $isProduct = $true
+            }
+        }
+        if (-not $isProduct) { continue }
+        & $SignTool verify /pa $file.FullName
+        if ($LASTEXITCODE -ne 0) {
+            throw "signtool verify /pa failed for $($file.Name). The thumbprint matched the binary sign job, and this signature is still not trusted. A self-signed rehearsal certificate fails here on purpose."
+        }
+        Write-Output "signtool verify /pa passed for $($file.Name)."
+        $checked++
+    }
+    if ($checked -lt $required.Count) {
+        throw 'signtool verify /pa did not run on both product executables.'
+    }
+}
+
+function Invoke-InspectInstallersBeforeSigning {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Installers,
+        [Parameter(Mandatory = $true)][string]$SignedManifest,
+        [Parameter(Mandatory = $true)][string]$SignerThumbprint
+    )
+    if (-not $IsWindows) {
+        throw 'Installer inspection uses msiexec and 7-Zip on Windows only.'
+    }
+    $tool = Find-SignTool
+    if ([string]::IsNullOrWhiteSpace($tool)) {
+        throw 'signtool.exe was not found under the Windows SDK. Refusing to sign installers we cannot verify.'
+    }
+    $root = Join-Path $env:SystemDrive 'cfw-installer-inspect'
+    if (-not (Test-Path -LiteralPath $root)) {
+        New-Item -ItemType Directory -Path $root | Out-Null
+    }
+    $sevenRoot = Join-Path $root ('7zip-' + [guid]::NewGuid().ToString('n'))
+    $extracts = New-Object System.Collections.Generic.List[string]
+    try {
+        $sevenZip = Install-PinnedSevenZip -ExtractDirectory $sevenRoot
+        Write-Output "Using pinned 7-Zip at $sevenZip"
+        $reader = { param($Path) Get-AuthenticodeSignerThumbprint -Path $Path }
+        foreach ($msi in @($Installers | Where-Object { $null -ne $_ -and $_.Extension.ToLowerInvariant() -eq '.msi' })) {
+            $dir = Join-Path $root ('msi-' + [guid]::NewGuid().ToString('n'))
+            $extracts.Add($dir)
+            Invoke-MsiAdminExtract -MsiPath $msi.FullName -Destination $dir
+            Assert-InstallerPayload -ExtractDirectory $dir -Kind 'msi' -SignedManifest $SignedManifest -SignerThumbprint $SignerThumbprint -ReadThumbprint $reader
+            Write-Output "MSI payload matched the binary sign job for $($msi.Name)."
+            Assert-ProductExecutablesTrust -ExtractDirectory $dir -SignTool $tool
+        }
+        foreach ($exe in @($Installers | Where-Object { $null -ne $_ -and $_.Extension.ToLowerInvariant() -eq '.exe' })) {
+            $dir = Join-Path $root ('nsis-' + [guid]::NewGuid().ToString('n'))
+            $extracts.Add($dir)
+            Invoke-NsisExtract -SevenZip $sevenZip -SetupExe $exe.FullName -Destination $dir
+            Assert-InstallerPayload -ExtractDirectory $dir -Kind 'nsis' -SignedManifest $SignedManifest -SignerThumbprint $SignerThumbprint -ReadThumbprint $reader
+            Write-Output "NSIS payload matched the binary sign job for $($exe.Name)."
+            Assert-ProductExecutablesTrust -ExtractDirectory $dir -SignTool $tool
+        }
+    } finally {
+        if (Test-Path -LiteralPath $sevenRoot) {
+            Remove-Item -LiteralPath $sevenRoot -Recurse -Force
+        }
+        foreach ($dir in $extracts) {
+            if (Test-Path -LiteralPath $dir) {
+                Remove-Item -LiteralPath $dir -Recurse -Force
+            }
+        }
+    }
+}
+
+function Assert-SignedInstallerThumbprints {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Files,
+        [Parameter(Mandatory = $true)][string]$Expected,
+        [Parameter(Mandatory = $true)][string]$SignTool
+    )
+    foreach ($file in @($Files)) {
+        if ($null -eq $file) { continue }
+        $actual = Get-AuthenticodeSignerThumbprint -Path $file.FullName
+        Assert-SignerThumbprint -Actual $actual -Expected $Expected
+        & $SignTool verify /pa $file.FullName
+        if ($LASTEXITCODE -ne 0) {
+            throw "signtool verify /pa failed for $($file.Name) after signing."
+        }
+        Write-Output "$($file.Name) signer thumbprint matches the binary sign job."
+    }
+}
+
+function Get-SignedBinaryManifestText {
+    if ([string]::IsNullOrWhiteSpace($env:SIGNED_BINARY_HASHES)) {
+        throw 'SIGNED_BINARY_HASHES is empty. The binary sign job must pass file hashes. Refusing to sign the installers.'
+    }
+    return ConvertFrom-HashManifestBase64 -Encoded $env:SIGNED_BINARY_HASHES
+}
+
+function Get-SignerThumbprintText {
+    $value = [string]$env:SIGNER_THUMBPRINT
+    Assert-SignerThumbprint -Actual $value -Expected $value
+    return $value.Trim().ToUpperInvariant()
 }
 
 function Invoke-SignInstallers {
@@ -360,11 +658,22 @@ function Invoke-SignInstallers {
             throw 'The installer sign job needs a finished .msi and .exe. Refusing to label this build signed.'
         }
         Assert-FilesMatchManifest -Manifest (Get-ExpectedManifestText) -Files $files
+        $signedManifest = Get-SignedBinaryManifestText
+        $signer = Get-SignerThumbprintText
+        Write-Output 'Installer hashes match the bundle job. Inspecting the inner files before any certificate is imported.'
+        Invoke-WithSigningSecretsHidden -Action {
+            Invoke-InspectInstallersBeforeSigning -Installers $files -SignedManifest $signedManifest -SignerThumbprint $signer
+        }.GetNewClosure()
         Assert-SigningMaterial -Method $method
         if ($method -eq 'azure') {
             Install-AzureDlib
         }
         Invoke-SignChildFiles -Files $files
+        $tool = Find-SignTool
+        if ([string]::IsNullOrWhiteSpace($tool)) {
+            throw 'signtool.exe was not found after signing. Refusing to call this build signed.'
+        }
+        Assert-SignedInstallerThumbprints -Files $files -Expected $signer -SignTool $tool
         Write-ReleaseLabelAndSums -Directory $destination -Signed $true
         Publish-ReleaseDirectory -Destination $destination -Signed $true -Version $version
     } finally {
@@ -531,7 +840,21 @@ function Assert-ReleaseWorkflowShape {
     Assert-That ($signBinaries -match 'needs.compile.outputs.hashes') 'the binary sign job should verify the compile hashes'
     $signInstallers = [string]($jobBody['sign-installers'] -join "`n")
     Assert-That ($signInstallers -match '-Mode sign-installers') 'the installer sign job should sign the finished installers'
+    Assert-That ($signInstallers -match 'needs:\s*\[bundle,\s*sign-binaries\]') 'the installer sign job should read the binary sign job directly'
     Assert-That ($signInstallers -match 'needs.bundle.outputs.hashes') 'the installer sign job should verify the bundle hashes'
+    Assert-That ($signInstallers -match 'SIGNED_BINARY_HASHES:') 'the installer sign job should receive the signed binary hashes'
+    Assert-That ($signInstallers -match 'needs\.sign-binaries\.outputs\.hashes') 'the signed binary hashes should come from the binary sign job'
+    Assert-That ($signInstallers -match 'SIGNER_THUMBPRINT:') 'the installer sign job should receive the signer thumbprint'
+    Assert-That ($signInstallers -match 'needs\.sign-binaries\.outputs\.thumbprint') 'the signer thumbprint should come from the binary sign job'
+    $signBinariesOut = [string]($jobBody['sign-binaries'] -join "`n")
+    Assert-That ($signBinariesOut -match 'outputs\.thumbprint') 'the binary sign job should publish the signer thumbprint'
+    $guardBody = [string]($jobBody['guard'] -join "`n")
+    Assert-That ($guardBody -match 'Assert-TagMatchesVersion') 'the guard should use the same tag rule as the release script'
+    Assert-That ($guardBody -match 'contents:\s*read') 'the guard checks out the repo to compare the tag with the version files'
+    Assert-That ($guardBody -match 'persist-credentials:\s*false') 'the guard checkout should not persist credentials'
+    Assert-That (-not ($guardBody -match 'environment:\s*release')) 'the guard must not use the release environment'
+    Assert-That ($bundleBody -match 'rust-toolchain') 'the bundle job keeps a Rust toolchain'
+    Assert-That ($bundleBody -match 'cargo metadata') 'the bundle job should say why the Rust toolchain stays'
     $unsignedBody = [string]($jobBody['unsigned'] -join "`n")
     Assert-That ($unsignedBody -match '-Mode build') 'the unsigned job should still build a labelled installer'
     Assert-That ($unsignedBody -notmatch 'environment:\s*release') 'the unsigned job must not use the release environment'
@@ -551,9 +874,30 @@ function Invoke-ReleaseSelfTest {
     $version = Get-AppVersion -Root $Root
     Assert-That (-not [string]::IsNullOrWhiteSpace($version)) 'version should be readable'
     Assert-TagMatchesVersion -Tag "v$version" -Version $version
+    Assert-TagMatchesVersion -Tag 'v1.2.3' -Version '1.2.3'
     $tagThrew = $false
     try { Assert-TagMatchesVersion -Tag 'v0.0.0-nope' -Version $version } catch { $tagThrew = $true }
     Assert-That $tagThrew 'a mismatched tag should be refused'
+    $shortTag = $false
+    try { Assert-TagMatchesVersion -Tag 'v1.2' -Version '1.2' } catch { $shortTag = $true }
+    Assert-That $shortTag 'a tag without a patch number should be refused'
+    $preTag = $false
+    try { Assert-TagMatchesVersion -Tag 'v1.2.3-rc.1' -Version '1.2.3-rc.1' } catch { $preTag = $true }
+    Assert-That $preTag 'a pre-release tag should be refused even when it matches the version text'
+    $savedRefType = [Environment]::GetEnvironmentVariable('GITHUB_REF_TYPE')
+    $savedRefName = [Environment]::GetEnvironmentVariable('GITHUB_REF_NAME')
+    try {
+        [Environment]::SetEnvironmentVariable('GITHUB_REF_TYPE', 'tag')
+        [Environment]::SetEnvironmentVariable('GITHUB_REF_NAME', 'v1.2.3')
+        Assert-That ((Get-SignReleaseVersion) -eq '1.2.3') 'a vMAJOR.MINOR.PATCH tag should parse'
+        [Environment]::SetEnvironmentVariable('GITHUB_REF_NAME', 'v1.2.3-rc.1')
+        $shapeThrew = $false
+        try { Get-SignReleaseVersion } catch { $shapeThrew = $true }
+        Assert-That $shapeThrew 'the sign job should use the same tag shape as Assert-TagMatchesVersion'
+    } finally {
+        [Environment]::SetEnvironmentVariable('GITHUB_REF_TYPE', $savedRefType)
+        [Environment]::SetEnvironmentVariable('GITHUB_REF_NAME', $savedRefName)
+    }
     $checks++
 
     $temp = Join-Path ([System.IO.Path]::GetTempPath()) ("cfw-release-selftest-" + [guid]::NewGuid().ToString('n'))
@@ -675,6 +1019,27 @@ function Invoke-ReleaseSelfTest {
         Assert-That $missingActions 'Actions should fail when signtool is missing'
         $localSkip = Assert-AuthenticodeResults -Signed $false -FoundSignTool $false -RunningOnActions $false -Results @()
         Assert-That ($localSkip -eq 'skipped') 'a local machine without signtool can skip the check'
+        $mixed = @(
+            [pscustomobject]@{ Name = 'helper.exe'; ExitCode = 0 }
+            [pscustomobject]@{ Name = 'cfw-zero-touch.exe'; ExitCode = 1 }
+            [pscustomobject]@{ Name = 'cfw-flash.exe'; ExitCode = 1 }
+        )
+        $picked = @(Select-AuthenticodeResultsForLabel -Signed $false -Results $mixed)
+        Assert-That ($picked.Count -eq 2) 'unsigned verification should look at the two product executables'
+        $unsignedProducts = Assert-AuthenticodeResults -Signed $false -FoundSignTool $true -RunningOnActions $true -Results $picked
+        Assert-That ($unsignedProducts -eq 'checked') 'an extra executable that verifies should not reject the unsigned label'
+        $productSigned = @(
+            [pscustomobject]@{ Name = 'cfw-zero-touch.exe'; ExitCode = 0 }
+            [pscustomobject]@{ Name = 'cfw-flash.exe'; ExitCode = 1 }
+        )
+        $productPicked = @(Select-AuthenticodeResultsForLabel -Signed $false -Results $productSigned)
+        $productThrew = $false
+        try {
+            Assert-AuthenticodeResults -Signed $false -FoundSignTool $true -RunningOnActions $true -Results $productPicked
+        } catch { $productThrew = $true }
+        Assert-That $productThrew 'a product executable that verifies should reject the unsigned label'
+        $allResults = @(Select-AuthenticodeResultsForLabel -Signed $true -Results $mixed)
+        Assert-That ($allResults.Count -eq 3) 'a signed build still checks every extracted executable'
         $checks++
 
         $httpThrew = $false
@@ -801,6 +1166,188 @@ function Invoke-ReleaseSelfTest {
     Assert-That ($releaseSource -match "'/a'") 'the MSI extract should be an administrative install'
     Assert-That ($releaseSource -match 'cfw-zero-touch\.exe') 'verification should require the app executable'
     Assert-That ($releaseSource -match 'cfw-flash\.exe') 'verification should require the admin helper'
+    $checks++
+
+    Assert-SevenZipDownloadPin
+    Assert-That ((Get-SevenZipMsiUrl) -eq 'https://github.com/ip7z/7zip/releases/download/26.05/7z2605-x64.msi') 'the 7-Zip pin should be the official 26.05 MSI'
+    Assert-That ((Get-SevenZipMsiSha256) -eq '3fe4ab99fa15629c652944309a2b2bc6e41fc933fc6b63f5df1ebcf3aea68263') 'the 7-Zip pin should be the hashed asset'
+    $sevenTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("cfw-7zpin-" + [guid]::NewGuid().ToString('n'))
+    New-Item -ItemType Directory -Path $sevenTemp | Out-Null
+    try {
+        $bogus = Join-Path $sevenTemp 'not-7z.msi'
+        [System.IO.File]::WriteAllBytes($bogus, [byte[]](1, 2, 3, 4))
+        $badPin = $false
+        try { Assert-PinnedSevenZipMsi -Path $bogus } catch { $badPin = $true }
+        Assert-That $badPin 'a 7-Zip installer with the wrong hash should be refused'
+        $httpDownload = $false
+        try { Save-HttpsFile -Url 'http://example.com/7z.msi' -Destination (Join-Path $sevenTemp 'http.msi') -MaxBytes 10 } catch { $httpDownload = $true }
+        Assert-That $httpDownload 'a 7-Zip download that is not https should be refused'
+        $toolRoot = Join-Path $sevenTemp 'extract'
+        $toolDir = Join-Path (Join-Path $toolRoot 'Files') '7-Zip'
+        New-Item -ItemType Directory -Path $toolDir | Out-Null
+        $sevenExe = Join-Path $toolDir '7z.exe'
+        $sevenDll = Join-Path $toolDir '7z.dll'
+        [System.IO.File]::WriteAllBytes($sevenExe, [byte[]](1))
+        [System.IO.File]::WriteAllBytes($sevenDll, [byte[]](2))
+        Assert-TrustedSevenZipPath -SevenZip $sevenExe -ExtractRoot $toolRoot
+        $outside = Join-Path $sevenTemp '7z.exe'
+        [System.IO.File]::WriteAllBytes($outside, [byte[]](1))
+        $outsideThrew = $false
+        try { Assert-TrustedSevenZipPath -SevenZip $outside -ExtractRoot $toolRoot } catch { $outsideThrew = $true }
+        Assert-That $outsideThrew '7z.exe outside the private extract should be refused'
+        $wrongLeaf = Join-Path $toolDir '7za.exe'
+        [System.IO.File]::WriteAllBytes($wrongLeaf, [byte[]](1))
+        $leafThrew = $false
+        try { Assert-TrustedSevenZipPath -SevenZip $wrongLeaf -ExtractRoot $toolRoot } catch { $leafThrew = $true }
+        Assert-That $leafThrew 'only 7z.exe should be accepted'
+        try {
+            $realSeven = Join-Path $sevenTemp 'real-7z.exe'
+            [System.IO.File]::WriteAllBytes($realSeven, [byte[]](1))
+            Remove-Item -LiteralPath $sevenExe -Force
+            New-Item -ItemType SymbolicLink -Path $sevenExe -Target $realSeven | Out-Null
+            $linkThrew = $false
+            try { Assert-TrustedSevenZipPath -SevenZip $sevenExe -ExtractRoot $toolRoot } catch { $linkThrew = $true }
+            Assert-That $linkThrew 'a 7z.exe link should be refused'
+        } catch {
+            Write-Output 'skipped 7z.exe link check; this machine refused to create a symlink'
+        }
+    } finally {
+        if (Test-Path -LiteralPath $sevenTemp) { Remove-Item -LiteralPath $sevenTemp -Recurse -Force }
+    }
+    $plugins = Get-NsisPluginAllowList
+    Assert-That ($plugins['System.dll'] -eq '8b4c47c4cf5e76ec57dd5a050d5acd832a0d532ee875d7b44f6cdaf68f90d37c') 'System.dll should stay pinned to the NSIS 3.11 plugin'
+    Assert-That ($plugins['nsis_tauri_utils.dll'] -eq '5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709') 'nsis_tauri_utils.dll should stay pinned'
+    $thumb = 'AB' * 20
+    $payload = Join-Path ([System.IO.Path]::GetTempPath()) ("cfw-payload-" + [guid]::NewGuid().ToString('n'))
+    New-Item -ItemType Directory -Path $payload | Out-Null
+    try {
+        $app = Join-Path $payload 'cfw-zero-touch.exe'
+        $flash = Join-Path $payload 'cfw-flash.exe'
+        [System.IO.File]::WriteAllBytes($app, [Text.Encoding]::ASCII.GetBytes('app-bytes'))
+        [System.IO.File]::WriteAllBytes($flash, [Text.Encoding]::ASCII.GetBytes('flash-bytes'))
+        $manifest = Format-HashManifest -Files @(Get-ChildItem -LiteralPath $payload -Filter *.exe -File)
+        $signedMap = Get-HashManifestMap -Manifest $manifest
+        $pluginOk = Assert-PayloadEntry -Name 'System.dll' -Sha256 $plugins['System.dll'] -ByteLength 12288 -Kind 'nsis' -SignedHashes $signedMap -SignerThumbprint $thumb -ActualThumbprint '' -BannerPresent $false
+        Assert-That ($pluginOk -eq 'plugin') 'a pinned NSIS plugin should be allowed without our thumbprint'
+        $badPlugin = $false
+        try {
+            Assert-PayloadEntry -Name 'System.dll' -Sha256 ('ab' * 32) -ByteLength 12288 -Kind 'nsis' -SignedHashes $signedMap -SignerThumbprint $thumb -ActualThumbprint '' -BannerPresent $false
+        } catch { $badPlugin = $true }
+        Assert-That $badPlugin 'a plugin with the wrong hash should be refused'
+        $emptyThumb = $false
+        try { Assert-SignerThumbprint -Actual '' -Expected '' } catch { $emptyThumb = $true }
+        Assert-That $emptyThumb 'an empty signer thumbprint should be refused'
+        $wrongThumb = $false
+        try { Assert-SignerThumbprint -Actual ('CD' * 20) -Expected $thumb } catch { $wrongThumb = $true }
+        Assert-That $wrongThumb 'a different signer thumbprint should be refused'
+        Assert-SignerThumbprint -Actual $thumb.ToLowerInvariant() -Expected $thumb
+        $reader = { param($Path) return ('AB' * 20) }
+        $msiDir = Join-Path $payload 'msi'
+        New-Item -ItemType Directory -Path $msiDir | Out-Null
+        Copy-Item -LiteralPath $app -Destination (Join-Path $msiDir 'cfw-zero-touch.exe')
+        Copy-Item -LiteralPath $flash -Destination (Join-Path $msiDir 'cfw-flash.exe')
+        [System.IO.File]::WriteAllBytes((Join-Path $msiDir 'profile.json'), [byte[]](1))
+        Assert-InstallerPayload -ExtractDirectory $msiDir -Kind 'msi' -SignedManifest $manifest -SignerThumbprint $thumb -ReadThumbprint $reader
+        $evil = Join-Path $msiDir 'evil.exe'
+        [System.IO.File]::WriteAllBytes($evil, [Text.Encoding]::ASCII.GetBytes('evil'))
+        $evilThrew = $false
+        try {
+            Assert-InstallerPayload -ExtractDirectory $msiDir -Kind 'msi' -SignedManifest $manifest -SignerThumbprint $thumb -ReadThumbprint $reader
+        } catch { $evilThrew = $true }
+        Assert-That $evilThrew 'an unexpected executable should be refused'
+        Remove-Item -LiteralPath $evil -Force
+        $evilDll = Join-Path $msiDir 'evil.dll'
+        [System.IO.File]::WriteAllBytes($evilDll, [Text.Encoding]::ASCII.GetBytes('dll'))
+        $dllThrew = $false
+        try {
+            Assert-InstallerPayload -ExtractDirectory $msiDir -Kind 'msi' -SignedManifest $manifest -SignerThumbprint $thumb -ReadThumbprint $reader
+        } catch { $dllThrew = $true }
+        Assert-That $dllThrew 'an unexpected library should be refused'
+        Remove-Item -LiteralPath $evilDll -Force
+        $nsisDir = Join-Path $payload 'nsis'
+        New-Item -ItemType Directory -Path (Join-Path $nsisDir '$PLUGINSDIR') | Out-Null
+        Copy-Item -LiteralPath $app -Destination (Join-Path $nsisDir 'cfw-zero-touch.exe')
+        Copy-Item -LiteralPath $flash -Destination (Join-Path $nsisDir 'cfw-flash.exe')
+        $uninstall = Join-Path $nsisDir 'uninstall.exe'
+        $stub = New-Object byte[] 70000
+        $bannerBytes = [Text.Encoding]::ASCII.GetBytes((Get-NsisUninstallBanner))
+        $headBytes = [Text.Encoding]::ASCII.GetBytes('Nullsoft.NSIS.exehead')
+        [System.Array]::Copy($bannerBytes, 0, $stub, 100, $bannerBytes.Length)
+        [System.Array]::Copy($headBytes, 0, $stub, 200, $headBytes.Length)
+        [System.IO.File]::WriteAllBytes($uninstall, $stub)
+        Assert-InstallerPayload -ExtractDirectory $nsisDir -Kind 'nsis' -SignedManifest $manifest -SignerThumbprint $thumb -ReadThumbprint $reader
+        $small = New-Object byte[] 1000
+        [System.Array]::Copy($bannerBytes, 0, $small, 0, $bannerBytes.Length)
+        [System.IO.File]::WriteAllBytes($uninstall, $small)
+        $smallThrew = $false
+        try {
+            Assert-InstallerPayload -ExtractDirectory $nsisDir -Kind 'nsis' -SignedManifest $manifest -SignerThumbprint $thumb -ReadThumbprint $reader
+        } catch { $smallThrew = $true }
+        Assert-That $smallThrew 'a tiny uninstall.exe should be refused'
+        $huge = New-Object byte[] 300000
+        [System.Array]::Copy($bannerBytes, 0, $huge, 0, $bannerBytes.Length)
+        [System.IO.File]::WriteAllBytes($uninstall, $huge)
+        $hugeThrew = $false
+        try {
+            Assert-InstallerPayload -ExtractDirectory $nsisDir -Kind 'nsis' -SignedManifest $manifest -SignerThumbprint $thumb -ReadThumbprint $reader
+        } catch { $hugeThrew = $true }
+        Assert-That $hugeThrew 'a huge uninstall.exe should be refused'
+        $plain = New-Object byte[] 70000
+        [System.IO.File]::WriteAllBytes($uninstall, $plain)
+        $bannerThrew = $false
+        try {
+            Assert-InstallerPayload -ExtractDirectory $nsisDir -Kind 'nsis' -SignedManifest $manifest -SignerThumbprint $thumb -ReadThumbprint $reader
+        } catch { $bannerThrew = $true }
+        Assert-That $bannerThrew 'uninstall.exe without the NSIS banner should be refused'
+        [System.IO.File]::WriteAllBytes($uninstall, $stub)
+        Copy-Item -LiteralPath $uninstall -Destination (Join-Path $msiDir 'uninstall.exe')
+        $msiUninstall = $false
+        try {
+            Assert-InstallerPayload -ExtractDirectory $msiDir -Kind 'msi' -SignedManifest $manifest -SignerThumbprint $thumb -ReadThumbprint $reader
+        } catch { $msiUninstall = $true }
+        Assert-That $msiUninstall 'the MSI extract must not contain uninstall.exe'
+        Remove-Item -LiteralPath (Join-Path $msiDir 'uninstall.exe') -Force
+        $badReader = { param($Path) return ('CD' * 20) }
+        $thumbThrew = $false
+        try {
+            Assert-InstallerPayload -ExtractDirectory $nsisDir -Kind 'nsis' -SignedManifest $manifest -SignerThumbprint $thumb -ReadThumbprint $badReader
+        } catch { $thumbThrew = $true }
+        Assert-That $thumbThrew 'an inner executable signed by another certificate should be refused'
+        [System.IO.File]::WriteAllBytes((Join-Path $nsisDir 'cfw-zero-touch.exe'), [Text.Encoding]::ASCII.GetBytes('tampered-app'))
+        $hashThrew = $false
+        try {
+            Assert-InstallerPayload -ExtractDirectory $nsisDir -Kind 'nsis' -SignedManifest $manifest -SignerThumbprint $thumb -ReadThumbprint $reader
+        } catch { $hashThrew = $true }
+        Assert-That $hashThrew 'an inner executable whose bytes changed should be refused'
+    } finally {
+        if (Test-Path -LiteralPath $payload) { Remove-Item -LiteralPath $payload -Recurse -Force }
+    }
+    $savedSecret = [Environment]::GetEnvironmentVariable('WINDOWS_CERTIFICATE')
+    try {
+        [Environment]::SetEnvironmentVariable('WINDOWS_CERTIFICATE', 'hidden-marker')
+        $inside = Invoke-WithSigningSecretsHidden -Action { return [Environment]::GetEnvironmentVariable('WINDOWS_CERTIFICATE') }
+        Assert-That ([string]::IsNullOrWhiteSpace([string]$inside)) 'extraction must not see the certificate'
+        $child = Invoke-WithSigningSecretsHidden -Action {
+            return (& pwsh -NoProfile -Command '[Environment]::GetEnvironmentVariable("WINDOWS_CERTIFICATE")')
+        }
+        Assert-That ([string]::IsNullOrWhiteSpace([string]$child)) 'a child process during extraction must not see the certificate'
+        $restored = [Environment]::GetEnvironmentVariable('WINDOWS_CERTIFICATE')
+        Assert-That ($restored -eq 'hidden-marker') 'the certificate should be restored after extraction'
+        $boom = $false
+        try { Invoke-WithSigningSecretsHidden -Action { throw 'boom' } } catch { $boom = $true }
+        Assert-That $boom 'a failed extraction should surface the error'
+        Assert-That (([Environment]::GetEnvironmentVariable('WINDOWS_CERTIFICATE')) -eq 'hidden-marker') 'a failed extraction should still restore the certificate'
+    } finally {
+        [Environment]::SetEnvironmentVariable('WINDOWS_CERTIFICATE', $savedSecret)
+    }
+    $releaseSource = [System.IO.File]::ReadAllText($PSCommandPath)
+    $installChunk = [regex]::Match($releaseSource, '(?sm)function Invoke-SignInstallers \{.*?^function Get-StagedInstallers').Value
+    Assert-That ($installChunk.Contains('Invoke-InspectInstallersBeforeSigning')) 'the installer sign job should inspect before it signs'
+    Assert-That ($installChunk.IndexOf('Invoke-InspectInstallersBeforeSigning') -lt $installChunk.IndexOf('Assert-SigningMaterial')) 'inspection should happen before the certificate is imported'
+    Assert-That ($installChunk.IndexOf('Assert-SigningMaterial') -lt $installChunk.IndexOf('Invoke-SignChildFiles')) 'the certificate should be imported only after inspection'
+    $binaryChunk = [regex]::Match($releaseSource, '(?sm)function Invoke-SignBinaries \{.*?^function Get-SignReleaseVersion').Value
+    Assert-That ($binaryChunk.Contains("Name 'thumbprint'")) 'the binary sign job should publish the signer thumbprint'
+    Assert-That ($binaryChunk.IndexOf('Invoke-SignChildFiles') -lt $binaryChunk.IndexOf("Name 'thumbprint'")) 'the thumbprint should be read after signing'
     $checks++
 
     Assert-ReleaseWorkflowShape -Path (Join-Path $Root '.github/workflows/release.yml')

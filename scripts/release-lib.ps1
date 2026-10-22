@@ -206,14 +206,67 @@ function Get-AppVersion {
     return [string]$distinct[0]
 }
 
+function Test-ReleaseTagShape {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Tag)
+    return [regex]::IsMatch($Tag, '^v\d+\.\d+\.\d+$')
+}
+
+function Assert-ReleaseTagShape {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Tag)
+    if (-not (Test-ReleaseTagShape -Tag $Tag)) {
+        throw "Tag '$Tag' has to look like v1.2.3. A pre-release suffix is not a release tag."
+    }
+}
+
 function Assert-TagMatchesVersion {
     param(
         [Parameter(Mandatory = $true)][string]$Tag,
         [Parameter(Mandatory = $true)][string]$Version
     )
+    Assert-ReleaseTagShape -Tag $Tag
+    if (-not [regex]::IsMatch($Version, '^\d+\.\d+\.\d+$')) {
+        throw "Version '$Version' has to look like 1.2.3 so the tag can be v plus that number."
+    }
     $expected = "v$Version"
-    if ($Tag -ne $expected) {
+    if (-not [string]::Equals($Tag, $expected, [StringComparison]::Ordinal)) {
         throw "Tag '$Tag' has to be $expected so it matches package.json, package-lock.json, src-tauri/Cargo.toml, and src-tauri/tauri.conf.json."
+    }
+}
+
+function Get-SevenZipMsiUrl {
+    # 7-Zip 26.05 x64 MSI. https://www.7-zip.org/download.html links the
+    # official ip7z/7zip GitHub release. The pin is a constant so a
+    # repository variable cannot retarget it.
+    return 'https://github.com/ip7z/7zip/releases/download/26.05/7z2605-x64.msi'
+}
+
+function Get-SevenZipMsiSha256 {
+    # SHA-256 of that asset (2008576 bytes).
+    return '3fe4ab99fa15629c652944309a2b2bc6e41fc933fc6b63f5df1ebcf3aea68263'
+}
+
+function Get-SevenZipMsiMaxBytes {
+    return 5242880
+}
+
+function Assert-SevenZipDownloadPin {
+    $url = Get-SevenZipMsiUrl
+    $uri = $null
+    if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri)) {
+        throw 'The 7-Zip download pin is not an absolute URL.'
+    }
+    if (-not [string]::Equals($uri.Scheme, 'https', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The 7-Zip download pin must use https.'
+    }
+    if (-not [string]::Equals($uri.Host, 'github.com', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The 7-Zip download pin must be hosted on github.com.'
+    }
+    if (-not [string]::Equals($uri.AbsolutePath, '/ip7z/7zip/releases/download/26.05/7z2605-x64.msi', [StringComparison]::Ordinal)) {
+        throw 'The 7-Zip download pin must be the 26.05 x64 MSI from ip7z/7zip.'
+    }
+    $hash = Get-SevenZipMsiSha256
+    if ($hash -notmatch '^[0-9a-f]{64}$') {
+        throw 'The 7-Zip hash pin must be 64 lowercase hex characters.'
     }
 }
 
@@ -520,9 +573,29 @@ function ConvertFrom-HashManifestBase64 {
     try {
         $bytes = [Convert]::FromBase64String($compact)
     } catch {
-        throw 'EXPECTED_HASHES is not valid base64. Refusing to sign.'
+        throw 'The hash list is not valid base64. Refusing to sign.'
     }
     return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Get-HashManifestMap {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Manifest)
+    $expected = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::Ordinal)
+    foreach ($line in ($Manifest -split "`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -notmatch '^([0-9a-f]{64})  (.+)$') {
+            throw 'The hash list from the previous job is malformed. Refusing to continue.'
+        }
+        $name = $Matches[2]
+        if ($expected.ContainsKey($name)) {
+            throw "The hash list repeats $name. Refusing to continue."
+        }
+        [void]$expected.Add($name, $Matches[1])
+    }
+    if ($expected.Count -lt 1) {
+        throw 'The previous job sent no file hashes. Refusing to continue.'
+    }
+    return ,$expected
 }
 
 function Assert-FilesMatchManifest {
@@ -530,17 +603,7 @@ function Assert-FilesMatchManifest {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Manifest,
         [Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Files
     )
-    $expected = @{}
-    foreach ($line in ($Manifest -split "`n")) {
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        if ($line -notmatch '^([0-9a-f]{64})  (.+)$') {
-            throw 'The hash list from the previous job is malformed. Refusing to continue.'
-        }
-        $expected[$Matches[2]] = $Matches[1]
-    }
-    if ($expected.Count -lt 1) {
-        throw 'The previous job sent no file hashes. Refusing to continue.'
-    }
+    $expected = Get-HashManifestMap -Manifest $Manifest
     $actual = @($Files | Where-Object { $null -ne $_ })
     if ($actual.Count -ne $expected.Count) {
         throw "Refusing to continue. The previous job hashed $($expected.Count) files and this job has $($actual.Count)."
@@ -550,8 +613,221 @@ function Assert-FilesMatchManifest {
             throw "Refusing to continue. $($file.Name) was not in the previous job's hash list."
         }
         $hash = Get-FileSha256Hex -Path $file.FullName
-        if ($hash -ne $expected[$file.Name]) {
+        if (-not [string]::Equals($hash, $expected[$file.Name], [StringComparison]::Ordinal)) {
             throw "Refusing to continue. $($file.Name) does not match the hash from the previous job."
+        }
+    }
+}
+
+function Assert-PinnedSevenZipMsi {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    Assert-SevenZipDownloadPin
+    $item = Get-Item -LiteralPath $Path
+    $max = Get-SevenZipMsiMaxBytes
+    if ($item.Length -lt 1 -or $item.Length -gt $max) {
+        throw "The 7-Zip installer is $($item.Length) bytes. Refusing a file larger than $max bytes."
+    }
+    $hash = Get-FileSha256Hex -Path $Path
+    if (-not [string]::Equals($hash, (Get-SevenZipMsiSha256), [StringComparison]::Ordinal)) {
+        throw 'The 7-Zip installer hash does not match the pin. Refusing to extract it.'
+    }
+}
+
+function Get-SigningSecretNames {
+    return @(
+        'WINDOWS_CERTIFICATE',
+        'WINDOWS_CERTIFICATE_PASSWORD',
+        'AZURE_TENANT_ID',
+        'AZURE_CLIENT_ID',
+        'AZURE_CLIENT_SECRET',
+        'AZURE_CODE_SIGNING_ACCOUNT_NAME',
+        'AZURE_CERT_PROFILE_NAME',
+        'AZURE_ENDPOINT',
+        'AZURE_DLIB_URL',
+        'AZURE_DLIB_SHA256',
+        'AZURE_DLIB_PATH'
+    )
+}
+
+function Invoke-WithSigningSecretsHidden {
+    param([Parameter(Mandatory = $true)][scriptblock]$Action)
+    $saved = @{}
+    foreach ($name in (Get-SigningSecretNames)) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name)
+        [Environment]::SetEnvironmentVariable($name, $null)
+    }
+    try {
+        & $Action
+    } finally {
+        foreach ($name in (Get-SigningSecretNames)) {
+            [Environment]::SetEnvironmentVariable($name, $saved[$name])
+        }
+    }
+}
+
+function Get-NsisPluginAllowList {
+    # Names and SHA-256 of the DLLs inside a Tauri NSIS setup: NSIS 3.11
+    # Plugins/x86-unicode (System, nsDialogs, NSISdl, StartMenu) and
+    # nsis_tauri_utils.dll SHA-1 75197fee3c6a814fe035788d1c34ead39349b860.
+    $map = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::Ordinal)
+    [void]$map.Add('System.dll', '8b4c47c4cf5e76ec57dd5a050d5acd832a0d532ee875d7b44f6cdaf68f90d37c')
+    [void]$map.Add('nsDialogs.dll', 'b1350f487692057c8ffde75dcc55287a52a3272240d4d4912f24464b27551fc0')
+    [void]$map.Add('nsis_tauri_utils.dll', '5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709')
+    [void]$map.Add('StartMenu.dll', 'fe330320459637d8dd2b5d84d07925c38ec264152ffd3b1760a4d44d76536caa')
+    [void]$map.Add('NSISdl.dll', 'ddf40229dd9d6b268902d8dea88c8a04aacf1af218dd29f6dcd35babc54ac08d')
+    return ,$map
+}
+
+function Get-NsisUninstallBanner {
+    return 'Nullsoft Install System v3.11'
+}
+
+function Get-NsisUninstallMinBytes {
+    return 61440
+}
+
+function Get-NsisUninstallMaxBytes {
+    return 204800
+}
+
+function Test-FileContainsAscii {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Needle
+    )
+    $hay = [System.IO.File]::ReadAllBytes($Path)
+    $needleBytes = [System.Text.Encoding]::ASCII.GetBytes($Needle)
+    if ($needleBytes.Length -eq 0 -or $hay.Length -lt $needleBytes.Length) {
+        return $false
+    }
+    $limit = $hay.Length - $needleBytes.Length
+    for ($i = 0; $i -le $limit; $i++) {
+        $match = $true
+        for ($j = 0; $j -lt $needleBytes.Length; $j++) {
+            if ($hay[$i + $j] -ne $needleBytes[$j]) {
+                $match = $false
+                break
+            }
+        }
+        if ($match) { return $true }
+    }
+    return $false
+}
+
+function Assert-SignerThumbprint {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Actual,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Expected
+    )
+    $right = $Expected.Trim().ToUpperInvariant()
+    if ($right -notmatch '^[0-9A-F]{40}$') {
+        throw 'SIGNER_THUMBPRINT is missing or not 40 hex characters. Refusing to sign.'
+    }
+    $left = $Actual.Trim().ToUpperInvariant()
+    if ($left -notmatch '^[0-9A-F]{40}$') {
+        throw 'The file has no signer thumbprint. Refusing to continue.'
+    }
+    if (-not [string]::Equals($left, $right, [StringComparison]::Ordinal)) {
+        throw "The signer thumbprint $left is not the certificate from the binary sign job ($right)."
+    }
+}
+
+function Assert-PayloadEntry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Sha256,
+        [Parameter(Mandatory = $true)][long]$ByteLength,
+        [Parameter(Mandatory = $true)][ValidateSet('msi', 'nsis')][string]$Kind,
+        [Parameter(Mandatory = $true)]$SignedHashes,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$SignerThumbprint,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ActualThumbprint,
+        [Parameter(Mandatory = $true)][bool]$BannerPresent
+    )
+    $hash = $Sha256.ToLowerInvariant()
+    if ($SignedHashes.ContainsKey($Name)) {
+        $expected = [string]$SignedHashes[$Name]
+        if (-not [string]::Equals($hash, $expected, [StringComparison]::Ordinal)) {
+            throw "Refusing to sign. $Name does not match the hash from the binary sign job."
+        }
+        Assert-SignerThumbprint -Actual $ActualThumbprint -Expected $SignerThumbprint
+        return 'signed-binary'
+    }
+    $plugins = Get-NsisPluginAllowList
+    if ($plugins.ContainsKey($Name)) {
+        if (-not [string]::Equals($hash, [string]$plugins[$Name], [StringComparison]::Ordinal)) {
+            throw "Refusing to sign. $Name is not the pinned NSIS plugin."
+        }
+        return 'plugin'
+    }
+    if ([string]::Equals($Name, 'uninstall.exe', [StringComparison]::Ordinal)) {
+        if ($Kind -ne 'nsis') {
+            throw 'Refusing to sign. uninstall.exe is not part of the MSI payload.'
+        }
+        $min = Get-NsisUninstallMinBytes
+        $max = Get-NsisUninstallMaxBytes
+        if ($ByteLength -lt $min -or $ByteLength -gt $max) {
+            throw "Refusing to sign. uninstall.exe is $ByteLength bytes, outside $min..$max."
+        }
+        if (-not $BannerPresent) {
+            throw 'Refusing to sign. uninstall.exe does not contain the NSIS 3.11 banner.'
+        }
+        return 'uninstall'
+    }
+    throw "Refusing to sign. $Name is an unexpected executable in the $Kind installer."
+}
+
+function Assert-InstallerPayload {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExtractDirectory,
+        [Parameter(Mandatory = $true)][ValidateSet('msi', 'nsis')][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$SignedManifest,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$SignerThumbprint,
+        [Parameter(Mandatory = $true)][scriptblock]$ReadThumbprint
+    )
+    $signed = Get-HashManifestMap -Manifest $SignedManifest
+    foreach ($required in (Get-RequiredExecutableNames)) {
+        if (-not $signed.ContainsKey($required)) {
+            throw "The binary sign job did not hash $required. Refusing to sign the installers."
+        }
+    }
+    $binaries = @(Get-ChildItem -LiteralPath $ExtractDirectory -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+        $null -ne $_ -and ($_.Extension.ToLowerInvariant() -eq '.exe' -or $_.Extension.ToLowerInvariant() -eq '.dll')
+    })
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::Ordinal)
+    $uninstallCount = 0
+    foreach ($file in $binaries) {
+        $banner = $false
+        if ([string]::Equals($file.Name, 'uninstall.exe', [StringComparison]::Ordinal)) {
+            $uninstallCount++
+            $min = [int64](Get-NsisUninstallMinBytes)
+            $max = [int64](Get-NsisUninstallMaxBytes)
+            if ($file.Length -ge $min -and $file.Length -le $max) {
+                $hasVersion = Test-FileContainsAscii -Path $file.FullName -Needle (Get-NsisUninstallBanner)
+                $hasHead = Test-FileContainsAscii -Path $file.FullName -Needle 'Nullsoft.NSIS.exehead'
+                $banner = $hasVersion -and $hasHead
+            }
+        }
+        $thumb = ''
+        if ($signed.ContainsKey($file.Name)) {
+            $thumb = [string](& $ReadThumbprint $file.FullName)
+        }
+        [void](Assert-PayloadEntry -Name $file.Name -Sha256 (Get-FileSha256Hex -Path $file.FullName) -ByteLength ([int64]$file.Length) -Kind $Kind -SignedHashes $signed -SignerThumbprint $SignerThumbprint -ActualThumbprint $thumb -BannerPresent $banner)
+        if (-not $seen.ContainsKey($file.Name)) {
+            $seen[$file.Name] = 0
+        }
+        $seen[$file.Name] = $seen[$file.Name] + 1
+    }
+    if ($Kind -eq 'nsis' -and $uninstallCount -ne 1) {
+        throw "Refusing to sign. The NSIS installer must contain exactly one uninstall.exe (found $uninstallCount)."
+    }
+    if ($Kind -eq 'msi' -and $uninstallCount -ne 0) {
+        throw 'Refusing to sign. The MSI extract must not contain uninstall.exe.'
+    }
+    foreach ($required in (Get-RequiredExecutableNames)) {
+        $count = 0
+        if ($seen.ContainsKey($required)) { $count = $seen[$required] }
+        if ($count -lt 1) {
+            throw "Refusing to sign. The $Kind extract does not contain $required."
         }
     }
 }
@@ -623,6 +899,41 @@ function Find-SignTool {
     return $best.FullName
 }
 
+function Get-AuthenticodeSignerThumbprint {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not $IsWindows) {
+        throw 'Authenticode thumbprints are read on Windows only.'
+    }
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    $cert = $null
+    if ($null -ne $sig) { $cert = $sig.SignerCertificate }
+    if ($null -eq $cert -or [string]::IsNullOrWhiteSpace([string]$cert.Thumbprint)) {
+        throw "No Authenticode signer thumbprint on $(Split-Path -Leaf $Path)."
+    }
+    return ([string]$cert.Thumbprint).ToUpperInvariant()
+}
+
+function Select-AuthenticodeResultsForLabel {
+    param(
+        [Parameter(Mandatory = $true)][bool]$Signed,
+        [object[]]$Results
+    )
+    $rows = @($Results | Where-Object { $null -ne $_ })
+    if ($Signed) {
+        foreach ($row in $rows) { Write-Output $row }
+        return
+    }
+    foreach ($result in $rows) {
+        $name = [string]$result.Name
+        foreach ($requiredName in (Get-RequiredExecutableNames)) {
+            if ([string]::Equals($name, $requiredName, [StringComparison]::Ordinal)) {
+                Write-Output $result
+                break
+            }
+        }
+    }
+}
+
 function Assert-AuthenticodeResults {
     param(
         [Parameter(Mandatory = $true)][bool]$Signed,
@@ -673,9 +984,9 @@ function New-ReleaseSummary {
         $parts.Add('SIGNING_ENABLED is true and this run is a v* tag push.')
         $parts.Add('cfw-zero-touch.exe and cfw-flash.exe were compiled with no certificate in the environment.')
         $parts.Add('A separate job checked the compile hashes, signed those executables, and did not run npm or cargo.')
-        $parts.Add('The installers were bundled with no certificate, then another job checked their hashes and signed them.')
-        $parts.Add('msiexec /a extracted the MSI and signtool verify /pa checked every .exe inside.')
-        $parts.Add('Certificate material was read only in the sign jobs, from the release environment.')
+        $parts.Add('The installers were bundled with no certificate. That job keeps a Rust toolchain because tauri bundle runs cargo metadata. It does not compile the app again.')
+        $parts.Add('Before the installers were signed, the sign job extracted the MSI with msiexec /a and the setup executable with pinned 7-Zip. cfw-zero-touch.exe and cfw-flash.exe inside both matched the signed-binary hashes byte for byte, and their signer thumbprint matched that certificate. Unexpected executables and libraries were refused.')
+        $parts.Add('Certificate material was read only in the sign jobs, from the release environment, and only after that inspection.')
         $parts.Add('The imported certificate was removed by thumbprint, and its key container was deleted.')
         if (-not [string]::IsNullOrWhiteSpace($VerifyNote)) { $parts.Add($VerifyNote) }
         $parts.Add('A tag push opens a draft GitHub release. You publish that draft from the releases page.')
@@ -755,7 +1066,7 @@ signtool verify /pa "C:\cfw-msi-extract\path\to\cfw-zero-touch.exe"
 signtool verify /pa "C:\cfw-msi-extract\path\to\cfw-flash.exe"
 ```
 
-Search `C:\cfw-msi-extract` for every `.exe` and run the same check. An unsigned build fails each of them. A signed build passes each of them.
+Search `C:\cfw-msi-extract` for `cfw-zero-touch.exe` and `cfw-flash.exe` and run the same check. An unsigned build fails those two. A signed build passes them. The sign job also extracts the NSIS setup with pinned 7-Zip and checks that both files match the bytes that were signed, and that the signer thumbprint is the certificate from that job.
 
 `SIGNING.txt` says either `unsigned` or `signed`.
 
