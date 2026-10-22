@@ -107,7 +107,7 @@ jobs:
           SIGN_STEP_OUTCOME: ${{ steps.sign.outcome }}
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode build
       # actions/upload-artifact v4.6.2
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-release
           path: release/
@@ -146,7 +146,7 @@ jobs:
           SIGNING_ENABLED: 'false'
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode compile
       # actions/upload-artifact v4.6.2
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-binaries
           path: release/binaries
@@ -207,7 +207,7 @@ jobs:
           AZURE_DLIB_SHA256: ${{ vars.AZURE_DLIB_SHA256 }}
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode sign-binaries
       # actions/upload-artifact v4.6.2
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-binaries-signed
           path: release/binaries
@@ -261,7 +261,7 @@ jobs:
           EXPECTED_HASHES: ${{ needs.sign-binaries.outputs.hashes }}
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode bundle
       # actions/upload-artifact v4.6.2
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-installers
           path: release/installers
@@ -323,7 +323,7 @@ jobs:
           AZURE_DLIB_SHA256: ${{ vars.AZURE_DLIB_SHA256 }}
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode sign-installers
       # actions/upload-artifact v4.6.2
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-release
           path: release/
