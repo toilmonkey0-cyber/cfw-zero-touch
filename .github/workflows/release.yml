@@ -57,7 +57,7 @@ jobs:
           echo "SIGNING_METHOD must be empty, pfx, or azure. Refusing to sign."
           exit 1
       # actions/checkout v4.2.2. Tag pushes only, so a dry run does not need the tree.
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         with:
           persist-credentials: false
@@ -80,7 +80,7 @@ jobs:
       contents: read
     steps:
       # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # dtolnay/rust-toolchain. 1.99.1 is the stable rustc CI resolved on 2026-10-21.
@@ -126,7 +126,7 @@ jobs:
       hashes: ${{ steps.compile.outputs.hashes }}
     steps:
       # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # dtolnay/rust-toolchain. 1.99.1 is the stable rustc CI resolved on 2026-10-21.
@@ -167,7 +167,7 @@ jobs:
       thumbprint: ${{ steps.pfx.outputs.thumbprint }}${{ steps.azure.outputs.thumbprint }}
     steps:
       # actions/checkout v4.2.2. scripts/ only. No toolchain and no dependencies.
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: scripts
@@ -234,7 +234,7 @@ jobs:
       hashes: ${{ steps.bundle.outputs.hashes }}
     steps:
       # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # tauri bundle calls cargo metadata to locate the app. It does not compile Rust again.
@@ -279,7 +279,7 @@ jobs:
       contents: read
     steps:
       # actions/checkout v4.2.2. scripts/ only. No toolchain and no dependencies.
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: scripts

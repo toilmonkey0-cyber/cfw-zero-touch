@@ -9,7 +9,7 @@ jobs:
     runs-on: windows-latest
     steps:
       # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # dtolnay/rust-toolchain. Pin matches .github/workflows/release.yml (stable on 2026-10-21).
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -29,7 +29,7 @@ jobs:
     runs-on: windows-latest
     steps:
       # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Release scaffold self-test
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode self-test
@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # EmbarkStudios/cargo-deny-action v2.1.1 (cargo-deny 0.20.2). Docker action, so this job is Linux.
       - name: cargo deny (warning only)
         continue-on-error: true
@@ -65,7 +65,7 @@ jobs:
     runs-on: windows-latest
     steps:
       # actions/checkout v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # dtolnay/rust-toolchain. Pin matches .github/workflows/release.yml (stable on 2026-10-21).
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
