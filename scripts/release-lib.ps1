@@ -13,6 +13,77 @@ function Get-CodeSignThumbFile {
     return (Join-Path (Get-WorkDirectory) 'cfw-codesign.thumbs')
 }
 
+function Get-CodeSignKeyFile {
+    return (Join-Path (Get-WorkDirectory) 'cfw-codesign.keys')
+}
+
+function Get-CertificateKeyContainerName {
+    param($Cert)
+    if ($null -eq $Cert) { return $null }
+    $getters = @(
+        { param($Item) [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Item) },
+        { param($Item) [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($Item) }
+    )
+    foreach ($getter in $getters) {
+        $key = $null
+        try {
+            $key = & $getter $Cert
+        } catch {
+            continue
+        }
+        if ($null -eq $key) { continue }
+        try {
+            $property = $key.PSObject.Properties['Key']
+            if ($null -ne $property -and $null -ne $property.Value) {
+                $unique = ([string]$property.Value.UniqueName).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($unique)) { return $unique }
+            }
+        } finally {
+            $key.Dispose()
+        }
+    }
+    return $null
+}
+
+function Save-ImportedKeyContainer {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $trimmed = $Name.Trim()
+    if ($trimmed -notmatch '^[A-Za-z0-9._\{\}-]{1,200}$') {
+        throw 'The imported key container name was unexpected. Refusing to keep it.'
+    }
+    $path = Get-CodeSignKeyFile
+    $existing = ''
+    if (Test-Path -LiteralPath $path) {
+        $existing = [System.IO.File]::ReadAllText($path)
+    }
+    if ($existing -notmatch ("(?m)^" + [regex]::Escape($trimmed) + "$")) {
+        Write-Utf8Text -Path $path -Text ($existing + $trimmed + "`n")
+    }
+}
+
+function Remove-ImportedKeyContainers {
+    $path = Get-CodeSignKeyFile
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    if ($IsWindows) {
+        $lines = @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
+        $provider = [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
+        foreach ($line in $lines) {
+            $name = ([string]$line).Trim()
+            if ($name -notmatch '^[A-Za-z0-9._\{\}-]{1,200}$') { continue }
+            if ([System.Security.Cryptography.CngKey]::Exists($name, $provider)) {
+                $key = [System.Security.Cryptography.CngKey]::Open($name, $provider)
+                try {
+                    $key.Delete()
+                    Write-Host "Removed imported code-signing key container"
+                } finally {
+                    $key.Dispose()
+                }
+            }
+        }
+    }
+    Remove-Item -LiteralPath $path -Force
+}
+
 function Save-ImportedCertificateThumbprints {
     param([Parameter(Mandatory = $true)]$Imported)
     $thumbs = New-Object System.Collections.Generic.List[string]
@@ -27,7 +98,7 @@ function Save-ImportedCertificateThumbprints {
     Write-Utf8Text -Path (Get-CodeSignThumbFile) -Text (($thumbs.ToArray() -join "`n") + "`n")
 }
 
-function Remove-ImportedCodeSigningCertificate {
+function Remove-ImportedCertificateFromStore {
     $path = Get-CodeSignThumbFile
     if (-not (Test-Path -LiteralPath $path)) { return }
     $lines = @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
@@ -63,6 +134,14 @@ function Remove-ImportedCodeSigningCertificate {
     }
     if ($opened -or -not $IsWindows) {
         Remove-Item -LiteralPath $path -Force
+    }
+}
+
+function Remove-ImportedCodeSigningCertificate {
+    try {
+        Remove-ImportedCertificateFromStore
+    } finally {
+        Remove-ImportedKeyContainers
     }
 }
 
@@ -383,13 +462,140 @@ function Write-ReleaseLabelAndSums {
     Write-Sha256Sums -Directory $Directory
 }
 
-function Find-SignTool {
-    $override = $env:TAURI_WINDOWS_SIGNTOOL_PATH
-    if (-not [string]::IsNullOrWhiteSpace($override)) {
-        if (Test-Path -LiteralPath $override) {
-            return (Resolve-Path -LiteralPath $override).Path
+function Get-RequiredExecutableNames {
+    # The cargo bins. The installer display name is "CFW Card Studio"; the file
+    # next to cfw-flash.exe is cfw-zero-touch.exe.
+    return @('cfw-zero-touch.exe', 'cfw-flash.exe')
+}
+
+function Assert-ProductExecutableNames {
+    param([Parameter(Mandatory = $true)][string[]]$Names)
+    $present = @($Names | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    foreach ($required in (Get-RequiredExecutableNames)) {
+        if ($present -notcontains $required) {
+            throw "The release executables must include $required."
         }
-        throw 'TAURI_WINDOWS_SIGNTOOL_PATH is set, and that file was not found.'
+    }
+}
+
+function Get-FileSha256Hex {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $hash = $sha.ComputeHash($stream)
+        } finally {
+            $stream.Dispose()
+        }
+        return ([System.BitConverter]::ToString($hash)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Format-HashManifest {
+    param([Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Files)
+    $sorted = @($Files | Where-Object { $null -ne $_ } | Sort-Object Name)
+    if ($sorted.Count -lt 1 -or $null -eq $sorted[0]) {
+        throw 'There are no files to hash.'
+    }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($file in $sorted) {
+        if ($null -eq $file) { continue }
+        $hex = Get-FileSha256Hex -Path $file.FullName
+        $lines.Add("$hex  $($file.Name)")
+    }
+    return ($lines.ToArray() -join "`n") + "`n"
+}
+
+function ConvertTo-HashManifestBase64 {
+    param([Parameter(Mandatory = $true)][string]$Manifest)
+    return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Manifest))
+}
+
+function ConvertFrom-HashManifestBase64 {
+    param([Parameter(Mandatory = $true)][string]$Encoded)
+    $compact = $Encoded -replace '\s', ''
+    try {
+        $bytes = [Convert]::FromBase64String($compact)
+    } catch {
+        throw 'EXPECTED_HASHES is not valid base64. Refusing to sign.'
+    }
+    return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Assert-FilesMatchManifest {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Manifest,
+        [Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Files
+    )
+    $expected = @{}
+    foreach ($line in ($Manifest -split "`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -notmatch '^([0-9a-f]{64})  (.+)$') {
+            throw 'The hash list from the previous job is malformed. Refusing to continue.'
+        }
+        $expected[$Matches[2]] = $Matches[1]
+    }
+    if ($expected.Count -lt 1) {
+        throw 'The previous job sent no file hashes. Refusing to continue.'
+    }
+    $actual = @($Files | Where-Object { $null -ne $_ })
+    if ($actual.Count -ne $expected.Count) {
+        throw "Refusing to continue. The previous job hashed $($expected.Count) files and this job has $($actual.Count)."
+    }
+    foreach ($file in $actual) {
+        if (-not $expected.ContainsKey($file.Name)) {
+            throw "Refusing to continue. $($file.Name) was not in the previous job's hash list."
+        }
+        $hash = Get-FileSha256Hex -Path $file.FullName
+        if ($hash -ne $expected[$file.Name]) {
+            throw "Refusing to continue. $($file.Name) does not match the hash from the previous job."
+        }
+    }
+}
+
+function Write-GitHubOutputValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+    if ([string]::IsNullOrWhiteSpace($env:GITHUB_OUTPUT)) { return }
+    if ($Name -notmatch '^[A-Za-z0-9_-]+$' -or $Value.Contains("`n") -or $Value.Contains("`r")) {
+        throw 'Refusing to write a GitHub output that is not a single line.'
+    }
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "$Name=$Value`n", $utf8)
+}
+
+function Get-TopLevelExecutables {
+    param([Parameter(Mandatory = $true)][string]$Directory)
+    if (-not (Test-Path -LiteralPath $Directory)) {
+        throw "No executables were found in $Directory."
+    }
+    $list = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $found = Get-ChildItem -LiteralPath $Directory -Filter *.exe -File -ErrorAction SilentlyContinue
+    foreach ($file in @($found)) {
+        if ($null -ne $file) { $list.Add($file) }
+    }
+    foreach ($file in $list) {
+        Write-Output $file
+    }
+}
+
+function Find-SignTool {
+    # On GitHub Actions, ignore TAURI_WINDOWS_SIGNTOOL_PATH and PATH. A build
+    # step must not be able to point signtool at a stand-in.
+    $onActions = $env:GITHUB_ACTIONS -eq 'true'
+    if (-not $onActions) {
+        $override = $env:TAURI_WINDOWS_SIGNTOOL_PATH
+        if (-not [string]::IsNullOrWhiteSpace($override)) {
+            if (Test-Path -LiteralPath $override) {
+                return (Resolve-Path -LiteralPath $override).Path
+            }
+            throw 'TAURI_WINDOWS_SIGNTOOL_PATH is set, and that file was not found.'
+        }
     }
     $roots = New-Object System.Collections.Generic.List[string]
     $pf86 = ${env:ProgramFiles(x86)}
@@ -465,10 +671,12 @@ function New-ReleaseSummary {
     if ($Signed) {
         $heading = 'This build is SIGNED.'
         $parts.Add('SIGNING_ENABLED is true and this run is a v* tag push.')
-        $parts.Add('The installer was built with no certificate in the environment.')
-        $parts.Add('The Sign Windows binaries step then signed the finished .exe and .msi.')
-        $parts.Add('Certificate material was read only in that step, from the release environment.')
-        $parts.Add('The imported certificate was removed from the runner by thumbprint.')
+        $parts.Add('cfw-zero-touch.exe and cfw-flash.exe were compiled with no certificate in the environment.')
+        $parts.Add('A separate job checked the compile hashes, signed those executables, and did not run npm or cargo.')
+        $parts.Add('The installers were bundled with no certificate, then another job checked their hashes and signed them.')
+        $parts.Add('msiexec /a extracted the MSI and signtool verify /pa checked every .exe inside.')
+        $parts.Add('Certificate material was read only in the sign jobs, from the release environment.')
+        $parts.Add('The imported certificate was removed by thumbprint, and its key container was deleted.')
         if (-not [string]::IsNullOrWhiteSpace($VerifyNote)) { $parts.Add($VerifyNote) }
         $parts.Add('A tag push opens a draft GitHub release. You publish that draft from the releases page.')
     } else {
@@ -538,6 +746,16 @@ signtool verify /pa "the-setup.msi"
 ```
 
 Use the real file names from `SHA256SUMS`. An unsigned file fails this check. A signed file reports that it was successfully verified. Check the setup `.exe` and the `.msi`.
+
+The installers also carry `cfw-zero-touch.exe` (the app; the window title is CFW Card Studio) and `cfw-flash.exe` (the admin helper). Extract the MSI and check every `.exe` inside:
+
+```bat
+msiexec /a "the-setup.msi" /qn TARGETDIR=C:\cfw-msi-extract\
+signtool verify /pa "C:\cfw-msi-extract\path\to\cfw-zero-touch.exe"
+signtool verify /pa "C:\cfw-msi-extract\path\to\cfw-flash.exe"
+```
+
+Search `C:\cfw-msi-extract` for every `.exe` and run the same check. An unsigned build fails each of them. A signed build passes each of them.
 
 `SIGNING.txt` says either `unsigned` or `signed`.
 

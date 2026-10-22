@@ -1,6 +1,6 @@
-# Signs one finished installer (.exe or .msi). The release workflow calls this
-# from the sign step only, after tauri build has finished, and only when
-# SIGNING_ENABLED is exactly true. Any other value refuses to sign.
+# Signs one finished file (.exe or .msi). A sign job calls this only after
+# the previous job's hashes match, and only when SIGNING_ENABLED is exactly
+# true. Any other value refuses to sign.
 # https://v2.tauri.app/distribute/sign/windows/
 
 param(
@@ -36,6 +36,14 @@ function Import-PfxForSigning {
     }
 
     Save-ImportedCertificateThumbprints -Imported $imported
+    foreach ($cert in @($imported)) {
+        if ($null -eq $cert -or -not $cert.HasPrivateKey) { continue }
+        $container = Get-CertificateKeyContainerName -Cert $cert
+        if ([string]::IsNullOrWhiteSpace($container)) {
+            throw 'The imported certificate did not expose a key container. Refusing to leave a private key we cannot delete.'
+        }
+        Save-ImportedKeyContainer -Name $container
+    }
     $leaf = @($imported) | Where-Object { $null -ne $_ -and $_.HasPrivateKey } | Select-Object -First 1
     if ($null -eq $leaf -or [string]::IsNullOrWhiteSpace($leaf.Thumbprint)) {
         throw 'The PFX did not contain a certificate with a private key.'
@@ -75,6 +83,9 @@ try {
 
     $tool = Find-SignTool
     if ([string]::IsNullOrWhiteSpace($tool)) {
+        if ($env:GITHUB_ACTIONS -eq 'true') {
+            throw 'signtool.exe was not found under the Windows SDK. This job ignores TAURI_WINDOWS_SIGNTOOL_PATH and PATH.'
+        }
         throw 'signtool.exe was not found. Install the Windows SDK or set TAURI_WINDOWS_SIGNTOOL_PATH.'
     }
 

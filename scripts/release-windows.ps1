@@ -2,7 +2,7 @@
 # Signing stays off unless SIGNING_ENABLED is exactly true.
 
 param(
-    [ValidateSet('build', 'stage', 'sign', 'self-test')]
+    [ValidateSet('build', 'compile', 'sign-binaries', 'bundle', 'sign-installers', 'self-test')]
     [string]$Mode = 'build'
 )
 
@@ -64,12 +64,22 @@ function Get-ReleaseVersion {
 }
 
 function Invoke-TauriBuild {
+    param([string[]]$Arguments)
     Assert-BuildHasNoSigningSecrets
     if ($env:SIGNING_ENABLED -eq 'true') {
-        throw 'Refusing to compile while SIGNING_ENABLED is true. Signing is a later step, after the installers exist.'
+        throw 'Refusing to compile while SIGNING_ENABLED is true. Signing is a later job, after the executables exist.'
     }
-    Write-Output 'Building the installer with no certificate in the environment.'
-    & npm run tauri build
+    $extra = @($Arguments | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($extra -contains '--no-bundle') {
+        Write-Output 'Compiling with tauri build --no-bundle. No certificate is in the environment.'
+    } else {
+        Write-Output 'Building the unsigned installer with no certificate in the environment.'
+    }
+    if ($extra.Count -gt 0) {
+        & npm run tauri build -- @extra
+    } else {
+        & npm run tauri build
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "tauri build exited $LASTEXITCODE"
     }
@@ -94,6 +104,15 @@ function Publish-ReleaseDirectory {
             $verifyNote = 'signtool verify /pa passed for every shipped .exe and .msi.'
         } else {
             $verifyNote = 'signtool verify /pa failed for the shipped installers, which is what an unsigned build should do.'
+        }
+    }
+    $inner = Assert-MsiInnerSignatures -Directory $Destination -Signed $Signed -SignTool $tool -OnActions $onActions
+    if ($inner -eq 'checked') {
+        $innerNote = 'msiexec /a extracted the MSI. signtool verify /pa was run on every .exe inside, including cfw-zero-touch.exe and cfw-flash.exe.'
+        if ([string]::IsNullOrWhiteSpace($verifyNote)) {
+            $verifyNote = $innerNote
+        } else {
+            $verifyNote = $verifyNote + ' ' + $innerNote
         }
     }
 
@@ -131,14 +150,226 @@ function Invoke-ReleaseBuild {
     Publish-ReleaseDirectory -Destination $destination -Signed $false -Version $version
 }
 
-function Invoke-StageBuild {
+function Copy-FilesToDirectory {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Files,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $Destination | Out-Null
+    foreach ($file in @($Files)) {
+        if ($null -eq $file) { continue }
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $Destination $file.Name)
+    }
+}
+
+function Get-ExpectedManifestText {
+    if ([string]::IsNullOrWhiteSpace($env:EXPECTED_HASHES)) {
+        throw 'EXPECTED_HASHES is empty. The previous job must pass file hashes. Refusing to continue.'
+    }
+    return ConvertFrom-HashManifestBase64 -Encoded $env:EXPECTED_HASHES
+}
+
+function Invoke-CompileBinaries {
     $version = Get-ReleaseVersion
     Write-Output "Application version $version"
-    Invoke-TauriBuild
-    $bundle = Join-Path $Root 'src-tauri/target/release/bundle'
-    $destination = Join-Path $Root 'release'
+    Invoke-TauriBuild -Arguments @('--no-bundle')
+    $release = Join-Path $Root 'src-tauri/target/release'
+    $exes = @(Get-TopLevelExecutables -Directory $release)
+    Assert-ProductExecutableNames -Names @($exes | ForEach-Object { $_.Name })
+    $destination = Join-Path $Root 'release/binaries'
+    Copy-FilesToDirectory -Files $exes -Destination $destination
+    $copied = @(Get-TopLevelExecutables -Directory $destination)
+    $manifest = Format-HashManifest -Files $copied
+    Write-GitHubOutputValue -Name 'hashes' -Value (ConvertTo-HashManifestBase64 -Manifest $manifest)
+    Write-Output 'Compiled the executables. No certificate was read. Bundling and signing are later jobs.'
+}
+
+function Invoke-BundleInstallers {
+    $version = Get-ReleaseVersion
+    Write-Output "Application version $version"
+    Assert-BuildHasNoSigningSecrets
+    if ($env:SIGNING_ENABLED -eq 'true') {
+        throw 'Refusing to bundle while SIGNING_ENABLED is true. Signing is a separate job.'
+    }
+    $release = Join-Path $Root 'src-tauri/target/release'
+    $before = @(Get-TopLevelExecutables -Directory $release)
+    Assert-ProductExecutableNames -Names @($before | ForEach-Object { $_.Name })
+    Assert-FilesMatchManifest -Manifest (Get-ExpectedManifestText) -Files $before
+    $beforeManifest = Format-HashManifest -Files $before
+
+    Write-Output 'Building the frontend. This step does not compile Rust and has no certificate.'
+    & npm run build
+    if ($LASTEXITCODE -ne 0) {
+        throw "npm run build exited $LASTEXITCODE"
+    }
+    Write-Output 'Bundling the installers without rewriting the signed executables.'
+    & npm run tauri bundle -- --no-binary-patching --no-sign
+    if ($LASTEXITCODE -ne 0) {
+        throw "tauri bundle exited $LASTEXITCODE"
+    }
+    $after = @(Get-TopLevelExecutables -Directory $release)
+    Assert-FilesMatchManifest -Manifest $beforeManifest -Files $after
+
+    $bundle = Join-Path $release 'bundle'
+    $destination = Join-Path $Root 'release/installers'
     Stage-Installers -BundleRoot $bundle -Destination $destination
-    Write-Output 'Staged the installer. No certificate was read. Signing is a separate step.'
+    $installers = @(Get-StagedInstallers -Directory $destination)
+    $manifest = Format-HashManifest -Files $installers
+    Write-GitHubOutputValue -Name 'hashes' -Value (ConvertTo-HashManifestBase64 -Manifest $manifest)
+    Write-Output 'Bundled the installers. No certificate was read.'
+}
+
+function Invoke-MsiAdminExtract {
+    param(
+        [Parameter(Mandatory = $true)][string]$MsiPath,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    if (-not $IsWindows) {
+        throw 'msiexec /a runs on Windows only.'
+    }
+    $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+    if (-not (Test-Path -LiteralPath $msiexec)) {
+        throw 'msiexec.exe was not found in System32. Refusing to use a copy from PATH.'
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $Destination | Out-Null
+    $target = (Resolve-Path -LiteralPath $Destination).Path
+    if (-not $target.EndsWith('\')) { $target = $target + '\' }
+    $msi = (Resolve-Path -LiteralPath $MsiPath).Path
+    $proc = Start-Process -FilePath $msiexec -ArgumentList @('/a', $msi, '/qn', "TARGETDIR=$target") -Wait -PassThru -NoNewWindow
+    if ($proc.ExitCode -ne 0) {
+        throw "msiexec /a failed for $(Split-Path -Leaf $msi) with exit $($proc.ExitCode)."
+    }
+}
+
+function Assert-MsiInnerSignatures {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][bool]$Signed,
+        [string]$SignTool,
+        [Parameter(Mandatory = $true)][bool]$OnActions
+    )
+    if (-not $IsWindows) {
+        if ($OnActions) {
+            throw 'Refusing to label this build. The MSI extract runs on Windows.'
+        }
+        return 'skipped'
+    }
+    $msis = @(Get-ChildItem -LiteralPath $Directory -Filter *.msi -File -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+    if ($msis.Count -lt 1 -or $null -eq $msis[0]) {
+        throw 'There was no .msi to extract with msiexec /a.'
+    }
+    foreach ($msi in $msis) {
+        $extractRoot = Join-Path $env:SystemDrive 'cfw-msi-extract'
+        if (-not (Test-Path -LiteralPath $extractRoot)) {
+            New-Item -ItemType Directory -Path $extractRoot | Out-Null
+        }
+        $extract = Join-Path $extractRoot ([guid]::NewGuid().ToString('n'))
+        try {
+            Invoke-MsiAdminExtract -MsiPath $msi.FullName -Destination $extract
+            $exes = @(Get-ChildItem -LiteralPath $extract -Filter *.exe -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $null -ne $_ })
+            if ($exes.Count -lt 1 -or $null -eq $exes[0]) {
+                throw "msiexec /a extracted no .exe files from $($msi.Name)."
+            }
+            Assert-ProductExecutableNames -Names @($exes | ForEach-Object { $_.Name })
+            if ([string]::IsNullOrWhiteSpace($SignTool)) {
+                throw 'signtool.exe was not found, so the executables inside the installer were not checked.'
+            }
+            $results = New-Object System.Collections.Generic.List[object]
+            foreach ($exe in $exes) {
+                & $SignTool verify /pa $exe.FullName
+                $results.Add([pscustomobject]@{
+                    Name     = $exe.Name
+                    ExitCode = [int]$LASTEXITCODE
+                })
+            }
+            Assert-AuthenticodeResults -Signed $Signed -FoundSignTool $true -RunningOnActions $OnActions -Results @($results.ToArray())
+        } finally {
+            if (Test-Path -LiteralPath $extract) {
+                Remove-Item -LiteralPath $extract -Recurse -Force
+            }
+        }
+    }
+    return 'checked'
+}
+
+function Invoke-SignChildFiles {
+    param([Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Files)
+    $signScript = Join-Path $PSScriptRoot 'sign-windows.ps1'
+    $signed = @($Files | Where-Object { $null -ne $_ })
+    if ($signed.Count -lt 1 -or $null -eq $signed[0]) {
+        throw 'There was no file to sign.'
+    }
+    foreach ($file in $signed) {
+        & pwsh -NoProfile -ExecutionPolicy Bypass -File $signScript -File $file.FullName
+        if ($LASTEXITCODE -ne 0) {
+            throw "signing failed for $($file.Name)"
+        }
+    }
+}
+
+function Invoke-SignBinaries {
+    try {
+        $method = Get-SigningMethod
+        if ($method -eq 'off') {
+            throw 'SIGNING_ENABLED is not true. Refusing to sign.'
+        }
+        $destination = Join-Path $Root 'release/binaries'
+        $exes = @(Get-TopLevelExecutables -Directory $destination)
+        Assert-ProductExecutableNames -Names @($exes | ForEach-Object { $_.Name })
+        Assert-FilesMatchManifest -Manifest (Get-ExpectedManifestText) -Files $exes
+        Assert-SigningMaterial -Method $method
+        if ($method -eq 'azure') {
+            Install-AzureDlib
+        }
+        Invoke-SignChildFiles -Files $exes
+        $signed = @(Get-TopLevelExecutables -Directory $destination)
+        $manifest = Format-HashManifest -Files $signed
+        Write-GitHubOutputValue -Name 'hashes' -Value (ConvertTo-HashManifestBase64 -Manifest $manifest)
+        Write-Output 'Signed cfw-zero-touch.exe and cfw-flash.exe. The installers are bundled by a later job.'
+    } finally {
+        Remove-ImportedCodeSigningCertificate
+    }
+}
+
+function Get-SignReleaseVersion {
+    if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v(\d+\.\d+\.\d+)$') {
+        return $Matches[1]
+    }
+    throw 'The installer sign job only runs for a v* tag.'
+}
+
+function Invoke-SignInstallers {
+    try {
+        $version = Get-SignReleaseVersion
+        Write-Output "Application version $version"
+        $method = Get-SigningMethod
+        if ($method -eq 'off') {
+            throw 'SIGNING_ENABLED is not true. Refusing to sign.'
+        }
+        $destination = Join-Path $Root 'release'
+        $files = @(Get-StagedInstallers -Directory $destination)
+        $msi = @($files | Where-Object { $null -ne $_ -and $_.Extension -eq '.msi' })
+        $exe = @($files | Where-Object { $null -ne $_ -and $_.Extension -eq '.exe' })
+        if ($msi.Count -lt 1 -or $null -eq $msi[0] -or $exe.Count -lt 1 -or $null -eq $exe[0]) {
+            throw 'The installer sign job needs a finished .msi and .exe. Refusing to label this build signed.'
+        }
+        Assert-FilesMatchManifest -Manifest (Get-ExpectedManifestText) -Files $files
+        Assert-SigningMaterial -Method $method
+        if ($method -eq 'azure') {
+            Install-AzureDlib
+        }
+        Invoke-SignChildFiles -Files $files
+        Write-ReleaseLabelAndSums -Directory $destination -Signed $true
+        Publish-ReleaseDirectory -Destination $destination -Signed $true -Version $version
+    } finally {
+        Remove-ImportedCodeSigningCertificate
+    }
 }
 
 function Get-StagedInstallers {
@@ -151,43 +382,6 @@ function Get-StagedInstallers {
         if ($ext -eq '.exe' -or $ext -eq '.msi') {
             Write-Output $file
         }
-    }
-}
-
-function Invoke-SignRelease {
-    $version = Get-ReleaseVersion
-    Write-Output "Application version $version"
-    try {
-        $method = Get-SigningMethod
-        if ($method -eq 'off') {
-            throw 'SIGNING_ENABLED is not true. Refusing to sign.'
-        }
-        Assert-SigningMaterial -Method $method
-        if ($method -eq 'azure') {
-            Install-AzureDlib
-        }
-
-        $destination = Join-Path $Root 'release'
-        $files = @(Get-StagedInstallers -Directory $destination)
-        $msi = @($files | Where-Object { $null -ne $_ -and $_.Extension -eq '.msi' })
-        $exe = @($files | Where-Object { $null -ne $_ -and $_.Extension -eq '.exe' })
-        if ($msi.Count -lt 1 -or $null -eq $msi[0] -or $exe.Count -lt 1 -or $null -eq $exe[0]) {
-            throw 'The sign step needs a finished .msi and .exe from the build step. Refusing to label this build signed.'
-        }
-
-        $signScript = Join-Path $PSScriptRoot 'sign-windows.ps1'
-        foreach ($file in $files) {
-            if ($null -eq $file) { continue }
-            & pwsh -NoProfile -ExecutionPolicy Bypass -File $signScript -File $file.FullName
-            if ($LASTEXITCODE -ne 0) {
-                throw "signing failed for $($file.Name)"
-            }
-        }
-
-        Write-ReleaseLabelAndSums -Directory $destination -Signed $true
-        Publish-ReleaseDirectory -Destination $destination -Signed $true -Version $version
-    } finally {
-        Remove-ImportedCodeSigningCertificate
     }
 }
 
@@ -276,11 +470,11 @@ function Assert-ReleaseWorkflowShape {
             $step = $Matches[1].Trim()
         }
         if ($line -match 'secrets\.') {
-            if ($job -ne 'signed') {
-                throw "self-test failed: signing secret referenced outside the signed job: $line"
+            if ($job -ne 'sign-binaries' -and $job -ne 'sign-installers') {
+                throw "self-test failed: signing secret referenced outside a sign job: $line"
             }
-            if ($step -notmatch '^Sign Windows binaries') {
-                throw "self-test failed: signing secret referenced outside the sign step: $line"
+            if ($step -notmatch '^Sign ') {
+                throw "self-test failed: signing secret referenced outside a sign step: $line"
             }
             $secretCount++
         }
@@ -291,30 +485,56 @@ function Assert-ReleaseWorkflowShape {
             $writeCount++
         }
         if ($line -match 'environment:\s*release\s*$') {
-            if ($job -ne 'signed') {
-                throw "self-test failed: the release environment is only for the signed job: $line"
+            if ($job -ne 'sign-binaries' -and $job -ne 'sign-installers') {
+                throw "self-test failed: the release environment is only for a sign job: $line"
             }
             $environmentCount++
         }
     }
-    Assert-That ($secretCount -ge 1) 'the signed job should reference signing secrets'
+    Assert-That ($secretCount -ge 1) 'a sign job should reference signing secrets'
     Assert-That ($writeCount -eq 1) 'contents: write should appear once'
-    Assert-That ($environmentCount -eq 1) 'environment: release should appear once'
-    $signedIf = [string]$jobIf['signed']
-    Assert-That ($signedIf -match "github.event_name == 'push'") 'the signed job must require a push'
-    Assert-That ($signedIf -match "startsWith\(github.ref, 'refs/tags/v'\)") 'the signed job must require a v* tag'
-    Assert-That ($signedIf -match "vars.SIGNING_ENABLED == 'true'") 'the signed job must require the signing switch'
+    Assert-That ($environmentCount -eq 2) 'environment: release should appear on both sign jobs'
+    $compileIf = [string]$jobIf['compile']
+    Assert-That ($compileIf -match "github.event_name == 'push'") 'the compile job must require a push'
+    Assert-That ($compileIf -match "startsWith\(github.ref, 'refs/tags/v'\)") 'the compile job must require a v* tag'
+    Assert-That ($compileIf -match "vars.SIGNING_ENABLED == 'true'") 'the compile job must require the signing switch'
     $unsignedIf = [string]$jobIf['unsigned']
     Assert-That ($unsignedIf -match "github.event_name != 'push'") 'a manual run still builds when signing is on'
     Assert-That ($unsignedIf -match "!startsWith\(github.ref, 'refs/tags/v'\)") 'a non-tag ref still builds unsigned'
     $releaseBody = [string]($jobBody['release'] -join "`n")
     Assert-That ($releaseBody -match 'GH_REPO:') 'the release job should set GH_REPO'
     Assert-That (-not ($releaseBody -match 'actions/checkout')) 'the release job should not check out the repository'
-    $signedBody = [string]($jobBody['signed'] -join "`n")
-    Assert-That ($signedBody -match '-Mode stage') 'the signed job should build before it signs'
-    Assert-That ($signedBody -match '-Mode sign') 'the signed job should sign in its own step'
-    Assert-That ($signedBody -match 'Remove-ImportedCodeSigningCertificate') 'the signed job should remove the imported certificate'
-    Assert-That ($signedBody -match 'if: always\(\)') 'certificate cleanup should run even when signing fails'
+    Assert-That ($releaseBody -match 'needs.sign-installers.result') 'the release job should wait for the installer sign job'
+    foreach ($quiet in @('guard', 'unsigned', 'compile', 'bundle', 'release')) {
+        $body = [string]($jobBody[$quiet] -join "`n")
+        Assert-That (-not ($body -match 'environment:\s*release')) "$quiet must not use the release environment"
+    }
+    foreach ($signJob in @('sign-binaries', 'sign-installers')) {
+        $body = [string]($jobBody[$signJob] -join "`n")
+        Assert-That ($body -match 'sparse-checkout:\s*scripts') "$signJob should check out scripts only"
+        Assert-That ($body -match 'persist-credentials:\s*false') "$signJob should not persist checkout credentials"
+        Assert-That ($body -match 'EXPECTED_HASHES:') "$signJob should receive the previous job's hashes"
+        Assert-That ($body -match 'Remove-ImportedCodeSigningCertificate') "$signJob should remove the imported certificate"
+        Assert-That ($body -match 'if: always\(\)') "$signJob should clean up even when signing fails"
+        Assert-That (-not ($body -match '\bnpm\b')) "$signJob must not run npm"
+        Assert-That (-not ($body -match '\bcargo\b')) "$signJob must not run cargo"
+        Assert-That (-not ($body -match 'rust-toolchain')) "$signJob must not install a Rust toolchain"
+    }
+    $compileBody = [string]($jobBody['compile'] -join "`n")
+    Assert-That ($compileBody -match '-Mode compile') 'the compile job should compile without bundling'
+    Assert-That ($compileBody -match 'steps.compile.outputs.hashes') 'the compile job should publish file hashes'
+    $bundleBody = [string]($jobBody['bundle'] -join "`n")
+    Assert-That ($bundleBody -match '-Mode bundle') 'the bundle job should bundle without signing'
+    Assert-That ($bundleBody -match 'needs.sign-binaries.outputs.hashes') 'the bundle job should check the signed executable hashes'
+    $signBinaries = [string]($jobBody['sign-binaries'] -join "`n")
+    Assert-That ($signBinaries -match '-Mode sign-binaries') 'the binary sign job should only sign executables'
+    Assert-That ($signBinaries -match 'needs.compile.outputs.hashes') 'the binary sign job should verify the compile hashes'
+    $signInstallers = [string]($jobBody['sign-installers'] -join "`n")
+    Assert-That ($signInstallers -match '-Mode sign-installers') 'the installer sign job should sign the finished installers'
+    Assert-That ($signInstallers -match 'needs.bundle.outputs.hashes') 'the installer sign job should verify the bundle hashes'
+    $unsignedBody = [string]($jobBody['unsigned'] -join "`n")
+    Assert-That ($unsignedBody -match '-Mode build') 'the unsigned job should still build a labelled installer'
+    Assert-That ($unsignedBody -notmatch 'environment:\s*release') 'the unsigned job must not use the release environment'
     $text = [System.IO.File]::ReadAllText($Path)
     Assert-That (-not ($text -match 'pull_request')) 'the release workflow must not mention a pull request trigger'
     Assert-That ($text -match '--draft') 'the release command must pass --draft'
@@ -322,7 +542,7 @@ function Assert-ReleaseWorkflowShape {
     Assert-That ($text -match '--latest=false') 'the release command must pass --latest=false'
     Assert-That (-not ($text -match '--prerelease')) 'the release command must not mark a prerelease'
     Assert-That ($text -match 'dry_run') 'workflow_dispatch should expose dry_run'
-    Assert-That ($text -match "SIGNING_ENABLED: 'false'") 'the unsigned job should force signing off'
+    Assert-That ($text -match "SIGNING_ENABLED: 'false'") 'the build jobs should force signing off'
 }
 
 function Invoke-ReleaseSelfTest {
@@ -398,6 +618,9 @@ function Invoke-ReleaseSelfTest {
         $notes = New-ReleaseNotes -Heading 'CFW Card Studio v0.2.0' -Signed $false -SumsText $sumText
         Assert-That ($notes.Contains('This build is UNSIGNED')) 'unsigned notes should say UNSIGNED'
         Assert-That ($notes.Contains('signtool verify /pa')) 'notes should show how to verify'
+        Assert-That ($notes.Contains('msiexec /a')) 'notes should show the MSI extract'
+        Assert-That ($notes.Contains('cfw-zero-touch.exe')) 'notes should name the app executable'
+        Assert-That ($notes.Contains('cfw-flash.exe')) 'notes should name the admin helper'
         Assert-That ($notes.Contains('sha256sum -c SHA256SUMS')) 'notes should show the checksum check'
         Assert-That ($notes.Contains($known)) 'notes should include the hashes'
         $signedNotes = New-ReleaseNotes -Heading 'CFW Card Studio v0.2.0' -Signed $true -SumsText $sumText
@@ -409,9 +632,19 @@ function Invoke-ReleaseSelfTest {
         Write-Utf8Text -Path $thumbFile -Text (("AB" * 20) + "`n")
         Remove-ImportedCodeSigningCertificate
         Assert-That (-not (Test-Path -LiteralPath $thumbFile)) 'cleanup should delete the thumbprint file'
+        $keyFile = Get-CodeSignKeyFile
+        if (Test-Path -LiteralPath $keyFile) { Remove-Item -LiteralPath $keyFile -Force }
+        Save-ImportedKeyContainer -Name 'cfw-test-key-does-not-exist'
+        Assert-That (Test-Path -LiteralPath $keyFile) 'the key container name should be recorded'
+        $badKey = $false
+        try { Save-ImportedKeyContainer -Name '..\Windows\key' } catch { $badKey = $true }
+        Assert-That $badKey 'a path-like key container name should be refused'
+        Remove-ImportedCodeSigningCertificate
+        Assert-That (-not (Test-Path -LiteralPath $keyFile)) 'cleanup should delete the key container file'
         $signSource = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'sign-windows.ps1'))
         Assert-That ($signSource -match 'finally') 'sign-windows should clean up on every exit'
         Assert-That ($signSource -match 'Remove-ImportedCodeSigningCertificate') 'sign-windows should remove the imported certificate'
+        Assert-That ($signSource -match 'Get-CertificateKeyContainerName') 'sign-windows should record the key container'
         $checks++
 
         $unsignedSummary = New-ReleaseSummary -Signed $false -FileNames @($exeName) -VerifyNote 'signtool verify /pa failed for the shipped installers, which is what an unsigned build should do.' -SignStepOutcome 'skipped'
@@ -510,6 +743,66 @@ function Invoke-ReleaseSelfTest {
     Assert-That ($missingAzure.Text -match 'AZURE_DLIB_SHA256') 'the azure error should require the dlib pin'
     $checks++
 
+    $hashDir = Join-Path ([System.IO.Path]::GetTempPath()) ("cfw-hash-" + [guid]::NewGuid().ToString('n'))
+    New-Item -ItemType Directory -Path $hashDir | Out-Null
+    try {
+        $app = Join-Path $hashDir 'cfw-zero-touch.exe'
+        $flash = Join-Path $hashDir 'cfw-flash.exe'
+        [System.IO.File]::WriteAllBytes($app, [Text.Encoding]::ASCII.GetBytes('app'))
+        [System.IO.File]::WriteAllBytes($flash, [Text.Encoding]::ASCII.GetBytes('flash'))
+        $hashFiles = @(Get-ChildItem -LiteralPath $hashDir -Filter *.exe -File)
+        Assert-ProductExecutableNames -Names @($hashFiles | ForEach-Object { $_.Name })
+        $missingName = $false
+        try { Assert-ProductExecutableNames -Names @('cfw-zero-touch.exe') } catch { $missingName = $true }
+        Assert-That $missingName 'a release without cfw-flash.exe should be refused'
+        $manifest = Format-HashManifest -Files $hashFiles
+        Assert-FilesMatchManifest -Manifest $manifest -Files $hashFiles
+        [System.IO.File]::WriteAllBytes($app, [Text.Encoding]::ASCII.GetBytes('tampered'))
+        $tampered = @(Get-ChildItem -LiteralPath $hashDir -Filter *.exe -File)
+        $mismatch = $false
+        try { Assert-FilesMatchManifest -Manifest $manifest -Files $tampered } catch { $mismatch = $true }
+        Assert-That $mismatch 'a sign job should refuse files that do not match the build hashes'
+        $roundTrip = ConvertFrom-HashManifestBase64 -Encoded (ConvertTo-HashManifestBase64 -Manifest $manifest)
+        Assert-That ($roundTrip -eq $manifest) 'hash manifests should survive the job output encoding'
+    } finally {
+        if (Test-Path -LiteralPath $hashDir) { Remove-Item -LiteralPath $hashDir -Recurse -Force }
+    }
+    $savedActions = [Environment]::GetEnvironmentVariable('GITHUB_ACTIONS')
+    $savedTool = [Environment]::GetEnvironmentVariable('TAURI_WINDOWS_SIGNTOOL_PATH')
+    $savedPath = [Environment]::GetEnvironmentVariable('PATH')
+    $toolDir = Join-Path ([System.IO.Path]::GetTempPath()) ("cfw-signtool-" + [guid]::NewGuid().ToString('n'))
+    New-Item -ItemType Directory -Path $toolDir | Out-Null
+    try {
+        $fake = Join-Path $toolDir 'signtool.exe'
+        [System.IO.File]::WriteAllBytes($fake, [byte[]](1, 2, 3))
+        $fakeFull = (Resolve-Path -LiteralPath $fake).Path
+        [Environment]::SetEnvironmentVariable('GITHUB_ACTIONS', $null)
+        [Environment]::SetEnvironmentVariable('TAURI_WINDOWS_SIGNTOOL_PATH', $fakeFull)
+        $localTool = Find-SignTool
+        Assert-That ($localTool -eq $fakeFull) 'a local override is used when this is not GitHub Actions'
+        [Environment]::SetEnvironmentVariable('GITHUB_ACTIONS', 'true')
+        [Environment]::SetEnvironmentVariable('PATH', ($toolDir + [System.IO.Path]::PathSeparator + $savedPath))
+        $actionsTool = Find-SignTool
+        Assert-That ($actionsTool -ne $fakeFull) 'GitHub Actions must ignore TAURI_WINDOWS_SIGNTOOL_PATH and PATH'
+        if (-not [string]::IsNullOrWhiteSpace($actionsTool)) {
+            Assert-That ($actionsTool -match 'Windows Kits') 'GitHub Actions must take signtool from the Windows SDK'
+        }
+    } finally {
+        [Environment]::SetEnvironmentVariable('GITHUB_ACTIONS', $savedActions)
+        [Environment]::SetEnvironmentVariable('TAURI_WINDOWS_SIGNTOOL_PATH', $savedTool)
+        [Environment]::SetEnvironmentVariable('PATH', $savedPath)
+        if (Test-Path -LiteralPath $toolDir) { Remove-Item -LiteralPath $toolDir -Recurse -Force }
+    }
+    $releaseSource = [System.IO.File]::ReadAllText($PSCommandPath)
+    Assert-That ($releaseSource -match 'tauri build -- @extra') 'compile mode should be able to pass --no-bundle'
+    Assert-That ($releaseSource -match '--no-bundle') 'the compile path should skip bundling'
+    Assert-That ($releaseSource -match '--no-binary-patching') 'bundling should not rewrite a signed executable'
+    Assert-That ($releaseSource -match 'System32\\msiexec\.exe') 'the MSI extract should use msiexec from System32'
+    Assert-That ($releaseSource -match "'/a'") 'the MSI extract should be an administrative install'
+    Assert-That ($releaseSource -match 'cfw-zero-touch\.exe') 'verification should require the app executable'
+    Assert-That ($releaseSource -match 'cfw-flash\.exe') 'verification should require the admin helper'
+    $checks++
+
     Assert-ReleaseWorkflowShape -Path (Join-Path $Root '.github/workflows/release.yml')
     $ci = [System.IO.File]::ReadAllText((Join-Path $Root '.github/workflows/ci.yml'))
     Assert-That (-not ($ci -match 'WINDOWS_CERTIFICATE')) 'the pull-request CI workflow must not name the signing certificate'
@@ -545,13 +838,23 @@ if ($Mode -eq 'self-test') {
     return
 }
 
-if ($Mode -eq 'stage') {
-    Invoke-StageBuild
+if ($Mode -eq 'compile') {
+    Invoke-CompileBinaries
     return
 }
 
-if ($Mode -eq 'sign') {
-    Invoke-SignRelease
+if ($Mode -eq 'sign-binaries') {
+    Invoke-SignBinaries
+    return
+}
+
+if ($Mode -eq 'bundle') {
+    Invoke-BundleInstallers
+    return
+}
+
+if ($Mode -eq 'sign-installers') {
+    Invoke-SignInstallers
     return
 }
 

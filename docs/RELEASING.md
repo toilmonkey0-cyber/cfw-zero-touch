@@ -35,7 +35,7 @@ The dry run builds the installer and uploads `SHA256SUMS` as an Actions artifact
 
 You need write access to start it. When it finishes, open the run and download the `windows-release` artifact. It contains the `.msi`, the setup `.exe`, `SHA256SUMS`, `SIGNING.txt`, and `RELEASE_NOTES.md`.
 
-A dispatch always runs **Windows installer (unsigned)**, including when `SIGNING_ENABLED` is already `true`. The signed job also requires a push of a `v*` tag, so **Run workflow** never asks the `release` environment for a certificate. The summary says **This build is UNSIGNED.** The step **Sign Windows binaries** is skipped.
+A dispatch always runs **Windows installer (unsigned)**, including when `SIGNING_ENABLED` is already `true`. The compile job also requires a push of a `v*` tag, so **Run workflow** never asks the `release` environment for a certificate. The summary says **This build is UNSIGNED.** The step **Sign Windows binaries** is skipped.
 
 Clearing **dry_run** fails the run on purpose. A dispatch is only a rehearsal. Push a tag when you want a draft.
 
@@ -43,7 +43,7 @@ Clearing **dry_run** fails the run on purpose. A dispatch is only a rehearsal. P
 
 GitHub starts **Run workflow** for someone with write access. A pull request does not start it.
 
-This workflow also has no pull-request trigger. A pull request runs the workflow file from the pull-request branch. That branch could be edited to print secrets after an environment approval. Signing secrets are named only in the signed job, and a pull request never starts that job.
+This workflow also has no pull-request trigger. A pull request runs the workflow file from the pull-request branch. That branch could be edited to print secrets after an environment approval. Signing secrets are named only in the two sign jobs, and a pull request never starts those jobs.
 
 The pull-request check `windows-installer` in `.github/workflows/ci.yml` still builds an unsigned installer. That artifact is separate from a release. The `frontend` job runs `scripts/release-windows.ps1 -Mode self-test`, which checks the checksum file, the unsigned label, and the rules in the release workflow.
 
@@ -82,7 +82,8 @@ While it is off, and also on every **Run workflow** dispatch:
 - The **Sign Windows binaries** step is skipped.
 - No certificate secret is read.
 - `SIGNING.txt` contains `unsigned`.
-- `signtool verify /pa` fails, and the job summary says so.
+- `signtool verify /pa` fails on the setup `.exe` and the `.msi`, and the job summary says so.
+- The job extracts the MSI with `msiexec /a` and runs `signtool verify /pa` on every `.exe` inside. Those fail too, which is what an unsigned build should do. The extract has to contain `cfw-zero-touch.exe` and `cfw-flash.exe`.
 
 ## Turn signing on later
 
@@ -102,13 +103,13 @@ These switches live on the GitHub website. A workflow file cannot turn them on.
 6. Under **Deployment branches and tags**, choose selected tags and add the pattern `v*`. A branch dry run then cannot use the signing secrets.
 7. Save.
 
-If a signed job has already run, GitHub may have created `release` with none of these rules. Delete that environment and create it again with the reviewers and the tag rule before you add secrets.
+If a sign job has already run, GitHub may have created `release` with none of these rules. Delete that environment and create it again with the reviewers and the tag rule before you add secrets.
 
 Put signing secrets on this environment. Leave **Repository secrets** empty of certificates, passwords, and Azure client secrets. A repository secret can be read by any workflow job that names it. An environment secret is handed only to a job that names the environment. Keep them at environment level.
 
 ### Limit who can push a v* tag
 
-The signed job runs when someone pushes a tag named `v*`. Add a tag ruleset so only admins can create or move those tags. Do this on the GitHub website. This repository change does not edit those settings for you.
+The compile job runs when someone pushes a tag named `v*` and signing is on. The two sign jobs then wait on the `release` environment. Add a tag ruleset so only admins can create or move those tags. Do this on the GitHub website. This repository change does not edit those settings for you.
 
 1. Open the repository **Settings**.
 2. Open **Rules**, then **Rulesets**.
@@ -154,11 +155,11 @@ Set environment **secrets** on `release`:
 | `AZURE_CERT_PROFILE_NAME` | Certificate profile name |
 | `AZURE_ENDPOINT` | The regional `https://` endpoint from the portal |
 
-The sign step writes a metadata file on the runner from the account name, profile, and endpoint. The client secret stays in that step's environment for `signtool`. It is not written into the repo, not written into that metadata file, and not present while `npm ci` or `tauri build` runs.
+Each sign job writes a metadata file on the runner from the account name, profile, and endpoint. The client secret stays in that job's environment for `signtool`. It is not written into the repo, and it is not written into that metadata file. The compile job and the bundle job have no certificate variables, and they do not use the `release` environment.
 
-After the installer exists, the sign step calls `signtool sign /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib <dlib> /dmdf <metadata>` on the finished setup `.exe` and the `.msi`.
+The binary sign job calls `signtool sign /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib <dlib> /dmdf <metadata>` on `cfw-zero-touch.exe` and `cfw-flash.exe`. After the installers are bundled, the installer sign job runs the same command on the finished setup `.exe` and the `.msi`.
 
-Set `SIGNING_ENABLED` to `true` last. The next `v*` tag waits for the environment reviewer, builds the installer with no certificate, then signs. If any of those values is missing, the sign step fails and does not upload an installer labelled signed.
+Set `SIGNING_ENABLED` to `true` last. The next `v*` tag compiles with no certificate, waits for a reviewer, signs the executables, bundles, waits for a reviewer again, and signs the installers. If any of those values is missing, the sign job fails and does not upload an installer labelled signed.
 
 ### An OV or EV certificate
 
@@ -187,29 +188,34 @@ Put these secrets on the `release` environment:
 
 GitHub limits how large a secret can be. **VERIFY** the current limit (it has been 48 KB). The base64 has to fit. Azure Artifact Signing avoids putting the certificate in a secret, which is the better fit when the `.pfx` is huge or the CA will not export one.
 
-The sign step imports the `.pfx` into the runner's user certificate store, deletes the `.pfx` file, and signs the finished setup `.exe` and `.msi` with the certificate thumbprint. The password is not passed on the `signtool` command line. When that step ends, including when signing fails, the script removes the imported certificate from `Cert:\CurrentUser\My` by thumbprint. The last step of the signed job does that removal again if the thumbprint file is still there, including when an earlier step failed.
+Each sign job imports the `.pfx` into the runner's user certificate store, deletes the `.pfx` file, and signs with the certificate thumbprint. The password is not passed on the `signtool` command line. When that step ends, including when signing fails, the script removes the imported certificate from `Cert:\CurrentUser\My` by thumbprint and deletes the CNG key container that held the private key. The last step of each sign job does that removal again if the thumbprint file or the key-container file is still there, including when an earlier step failed.
+
+An ephemeral key was the other way to avoid leaving the private key on the runner. `signtool` is a separate process, and it can only see a key the certificate store still has, so the import keeps the key for the length of the sign step and the cleanup deletes the container afterwards.
 
 Use GitHub-hosted runners only. This workflow already selects `windows-latest` and `ubuntu-latest`. A self-hosted runner keeps the user profile between jobs, so a certificate that survived the cleanup would remain on that machine. Do not point this workflow at a self-hosted runner.
 
 The timestamp server defaults to `http://timestamp.digicert.com`. **VERIFY** the timestamp URL your CA documents, and set the repository variable `WINDOWS_TIMESTAMP_URL` if theirs is different. It has to start with `http://` or `https://`.
 
-`scripts/sign-windows.ps1` calls `signtool sign /fd SHA256 /sha1 <thumbprint> /tr <timestamp> /td SHA256` on each finished installer. The build does not pass a Tauri `signCommand`, so the compiler never sees the certificate.
+`scripts/sign-windows.ps1` calls `signtool sign /fd SHA256 /sha1 <thumbprint> /tr <timestamp> /td SHA256` on each file. On GitHub Actions, `signtool.exe` is taken from the Windows SDK under `Windows Kits\10`. `TAURI_WINDOWS_SIGNTOOL_PATH` and `PATH` are ignored there, so a build step cannot point the sign job at a stand-in. The workflow does not set a Tauri `signCommand`, so the compiler never sees the certificate.
 
 Set `SIGNING_ENABLED` to `true` last.
 
 ### What the switch changes
 
-`SIGNING_ENABLED=true` does not by itself select the signed job. The signed job also requires a push of a `v*` tag. A **Run workflow** dispatch stays on the unsigned job and skips signing.
+`SIGNING_ENABLED=true` does not by itself select the signed path. The compile job also requires a push of a `v*` tag. A **Run workflow** dispatch stays on the unsigned job and skips signing.
 
-On a `v*` tag with the switch on, **Windows installer (signed)** runs. That job uses the `release` environment, so GitHub waits for the reviewer you configured. The unsigned job is skipped.
+On a `v*` tag with the switch on, the unsigned job is skipped. Four jobs run instead:
 
-The signed job installs dependencies and builds the installer first. That build sets `SIGNING_ENABLED` to `false` and has no certificate variables. `npm ci` and `npm run tauri build` do not see the certificate or the password.
+1. **Compile Windows binaries** has no `release` environment and no certificate. It runs `npm run tauri build -- --no-bundle`, copies `cfw-zero-touch.exe` and `cfw-flash.exe` (and any other executable beside them in `src-tauri/target/release`), and publishes the SHA-256 of those files as a job output.
+2. **Sign Windows binaries** uses the `release` environment, so GitHub waits for the reviewer. It checks out `scripts/` only, with credentials persistence off. It does not run `npm` or `cargo`. It downloads the unsigned executables, refuses to continue if their hashes differ from the compile job's output, and only then signs them. It publishes the hashes of the signed executables.
+3. **Bundle Windows installers** has no `release` environment and no certificate. It puts the signed executables back into `src-tauri/target/release`, checks those hashes, and runs `npm run tauri bundle -- --no-binary-patching --no-sign`. `--no-binary-patching` needs the Tauri CLI at 2.12.2. Tauri otherwise rewrites `cfw-zero-touch.exe` once per installer type (MSI, then NSIS), which strips an Authenticode signature. This app does not use the updater, so that per-installer patch is not required. The bundle job hashes the executables again afterwards and stops if the bytes changed. It publishes the hashes of the unsigned setup `.exe` and `.msi`.
+4. **Sign Windows installers** uses the `release` environment again, so GitHub asks for approval a second time. It checks out `scripts/` only, downloads the installers, checks their hashes, and signs the setup `.exe` and the `.msi`. `SHA256SUMS` is written after that, so the hashes match the signed installers.
 
-The next step is the only one that receives the secrets. It signs the finished setup `.exe` and the `.msi`. It does not compile again. It removes the imported certificate by thumbprint when it finishes, and the job removes it again at the end. `SHA256SUMS` is written after signing, so the hashes match the signed files.
+Approve both waits. The bundle job between them never receives the certificate.
 
-`SIGNING_METHOD=azure` runs the Azure sign step. `pfx`, or an empty method, runs the `.pfx` sign step. A different spelling fails the guard on a tag push before the build.
+`SIGNING_METHOD=azure` runs the Azure sign step in each sign job. `pfx`, or an empty method, runs the `.pfx` sign step. A different spelling fails the guard on a tag push before the compile.
 
-After signing, the job runs `signtool verify /pa` on every shipped `.exe` and `.msi`. A failure there fails the job, so a broken signature is not uploaded as a signed build.
+After the installers are signed, the job runs `signtool verify /pa` on the setup `.exe` and the `.msi`. It then extracts the MSI with `msiexec /a` (the copy in `System32`, so `PATH` cannot substitute another `msiexec`) and runs `signtool verify /pa` on every `.exe` inside. `cfw-zero-touch.exe` and `cfw-flash.exe` have to be in that extract. A failure there fails the job, so a broken signature is not uploaded as a signed build. The unsigned path runs the same extract and requires those checks to fail.
 
 ## Check a file you downloaded
 
@@ -250,10 +256,20 @@ signtool verify /pa "the-setup.msi"
 
 An unsigned file fails this command. That failure is what you want while signing is off, and the release job records it. A signed file should report that it was successfully verified. Check the setup `.exe` and the `.msi`, because each one has its own signature.
 
+Also extract the MSI and check the programs it installs. The app file is `cfw-zero-touch.exe`. The window title is CFW Card Studio. The admin helper beside it is `cfw-flash.exe`.
+
+```bat
+msiexec /a "the-setup.msi" /qn TARGETDIR=C:\cfw-msi-extract\
+signtool verify /pa "C:\cfw-msi-extract\path\to\cfw-zero-touch.exe"
+signtool verify /pa "C:\cfw-msi-extract\path\to\cfw-flash.exe"
+```
+
+Search the extract and run `signtool verify /pa` on every `.exe`. An unsigned build fails each of them. A signed build passes each of them. Signing only the outer setup file leaves these two unsigned, which is why the tag pipeline signs them before it bundles.
+
 ## What you do yourself
 
 - Publish the draft, from the releases page, after the checks above.
 - Choose a signing vendor and pay them, later, after you **VERIFY** the price.
-- Approve the `release` environment when a signed tag build is waiting.
+- Approve the `release` environment twice when a signed tag build is waiting: once for the executables, and once for the installers.
 
 The workflow builds, checksums, and opens the draft. With the switch off, it labels the build unsigned and skips signing.

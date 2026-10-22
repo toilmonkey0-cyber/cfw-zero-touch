@@ -7,11 +7,10 @@ name: Release
 #
 # Signing stays off unless the repository variable SIGNING_ENABLED is
 # exactly true AND this run is a push of a v* tag. A workflow_dispatch
-# dry run always builds unsigned. Certificate material is read only by
-# the sign step of the signed job, after the installer exists, and only
-# from the release environment. This file has no trigger for pull
-# requests or forks: a pull request would execute the workflow from the
-# untrusted branch.
+# dry run always builds unsigned. On a signed tag, compile and bundle
+# never receive the release environment. Two later jobs check out
+# scripts/ only, verify the previous job's hashes, and sign. This file
+# has no trigger for pull requests or forks.
 
 on:
   push:
@@ -67,6 +66,8 @@ jobs:
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       # dtolnay/rust-toolchain. 1.99.1 is the stable rustc CI resolved on 2026-10-21.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -98,18 +99,21 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  signed:
-    name: Windows installer (signed)
+  compile:
+    name: Compile Windows binaries
     needs: guard
     if: vars.SIGNING_ENABLED == 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     timeout-minutes: 90
-    environment: release
     permissions:
       contents: read
+    outputs:
+      hashes: ${{ steps.compile.outputs.hashes }}
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       # dtolnay/rust-toolchain. 1.99.1 is the stable rustc CI resolved on 2026-10-21.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -120,29 +124,63 @@ jobs:
           node-version: 24
       - name: Install frontend dependencies
         run: npm ci
-      - name: Build Windows installer
+      - name: Compile without bundling
+        id: compile
         shell: pwsh
         env:
           SIGNING_ENABLED: 'false'
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode stage
-      - name: Sign Windows binaries
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode compile
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-binaries
+          path: release/binaries
+          if-no-files-found: error
+          retention-days: 14
+
+  sign-binaries:
+    name: Sign Windows binaries
+    needs: compile
+    if: needs.compile.result == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      hashes: ${{ steps.pfx.outputs.hashes }}${{ steps.azure.outputs.hashes }}
+    steps:
+      # actions/checkout v4.2.2. scripts/ only. No toolchain and no dependencies.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: true
+      # actions/download-artifact v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-binaries
+          path: release/binaries
+      - name: Sign release executables
         id: pfx
         if: vars.SIGNING_METHOD == '' || vars.SIGNING_METHOD == 'pfx'
         shell: pwsh
         env:
           SIGNING_ENABLED: 'true'
           SIGNING_METHOD: pfx
+          EXPECTED_HASHES: ${{ needs.compile.outputs.hashes }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
           WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode sign
-      - name: Sign Windows binaries with Azure Artifact Signing
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode sign-binaries
+      - name: Sign release executables with Azure Artifact Signing
         id: azure
         if: vars.SIGNING_METHOD == 'azure'
         shell: pwsh
         env:
           SIGNING_ENABLED: 'true'
           SIGNING_METHOD: azure
+          EXPECTED_HASHES: ${{ needs.compile.outputs.hashes }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -151,7 +189,118 @@ jobs:
           AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
           AZURE_DLIB_URL: ${{ vars.AZURE_DLIB_URL }}
           AZURE_DLIB_SHA256: ${{ vars.AZURE_DLIB_SHA256 }}
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode sign
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode sign-binaries
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-binaries-signed
+          path: release/binaries
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove imported code-signing certificate
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath ./scripts/release-lib.ps1)) { exit 0 }
+          . ./scripts/release-lib.ps1
+          Remove-ImportedCodeSigningCertificate
+
+  bundle:
+    name: Bundle Windows installers
+    needs: sign-binaries
+    if: needs.sign-binaries.result == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      hashes: ${{ steps.bundle.outputs.hashes }}
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      # dtolnay/rust-toolchain. 1.99.1 is the stable rustc CI resolved on 2026-10-21.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.99.1
+      # actions/setup-node v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Install frontend dependencies
+        run: npm ci
+      # actions/download-artifact v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-binaries-signed
+          path: src-tauri/target/release
+      - name: Bundle signed executables
+        id: bundle
+        shell: pwsh
+        env:
+          SIGNING_ENABLED: 'false'
+          EXPECTED_HASHES: ${{ needs.sign-binaries.outputs.hashes }}
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode bundle
+      # actions/upload-artifact v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-installers
+          path: release/installers
+          if-no-files-found: error
+          retention-days: 14
+
+  sign-installers:
+    name: Sign Windows installers
+    needs: bundle
+    if: needs.bundle.result == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4.2.2. scripts/ only. No toolchain and no dependencies.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: true
+      # actions/download-artifact v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-installers
+          path: release
+      - name: Sign Windows installers
+        id: pfx
+        if: vars.SIGNING_METHOD == '' || vars.SIGNING_METHOD == 'pfx'
+        shell: pwsh
+        env:
+          SIGNING_ENABLED: 'true'
+          SIGNING_METHOD: pfx
+          EXPECTED_HASHES: ${{ needs.bundle.outputs.hashes }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode sign-installers
+      - name: Sign Windows installers with Azure Artifact Signing
+        id: azure
+        if: vars.SIGNING_METHOD == 'azure'
+        shell: pwsh
+        env:
+          SIGNING_ENABLED: 'true'
+          SIGNING_METHOD: azure
+          EXPECTED_HASHES: ${{ needs.bundle.outputs.hashes }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_CODE_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT_NAME }}
+          AZURE_CERT_PROFILE_NAME: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_DLIB_URL: ${{ vars.AZURE_DLIB_URL }}
+          AZURE_DLIB_SHA256: ${{ vars.AZURE_DLIB_SHA256 }}
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-windows.ps1 -Mode sign-installers
       # actions/upload-artifact v4.6.2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -170,17 +319,17 @@ jobs:
 
   release:
     name: Draft GitHub release
-    needs: [unsigned, signed]
+    needs: [unsigned, sign-installers]
     if: >-
       always() &&
       !cancelled() &&
       github.event_name == 'push' &&
       startsWith(github.ref, 'refs/tags/v') &&
-      (needs.unsigned.result == 'success' || needs.signed.result == 'success') &&
+      (needs.unsigned.result == 'success' || needs.sign-installers.result == 'success') &&
       needs.unsigned.result != 'failure' &&
-      needs.signed.result != 'failure' &&
+      needs.sign-installers.result != 'failure' &&
       needs.unsigned.result != 'cancelled' &&
-      needs.signed.result != 'cancelled'
+      needs.sign-installers.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
