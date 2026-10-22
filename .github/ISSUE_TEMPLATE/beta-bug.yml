@@ -1,0 +1,112 @@
+name: Beta bug
+description: Report a problem found while following the beta tester checklist.
+title: "[Beta bug]: "
+labels: ["bug", "beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form when Card Studio did something wrong during the [tester checklist](https://github.com/toilmonkey0-cyber/cfw-zero-touch/blob/main/docs/beta/TESTER_CHECKLIST.md).
+
+        Critical means lost data, a card that will not boot and cannot be restored from the backup you made, or the wrong disk offered or written. Stop testing and send this report before you try another card.
+
+        Leave game files and the backup image off the issue. Attach `cfw-card-studio-support.zip` after you submit.
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: Critical is data loss, a bricked card, or the wrong disk touched. A bricked card will not boot, and the backup will not restore it.
+      options:
+        - "critical: data loss, bricked card, or wrong disk touched"
+        - "high: a test failed, and the backup can still restore the card"
+        - "medium: wrong or confusing result, and the card is fine"
+        - "low: wording or a small annoyance"
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: The model printed on the handheld.
+      placeholder: R36S
+    validations:
+      required: true
+  - type: input
+    id: board-rev
+    attributes:
+      label: Board revision
+      description: The board name if you already know it. Write unknown if you have not seen it.
+      placeholder: unknown
+    validations:
+      required: true
+  - type: textarea
+    id: card-details
+    attributes:
+      label: Card details
+      description: Brand, printed size, and the size the app showed. Say whether this was the stock card, the spare card, or a fake card.
+      placeholder: Spare SanDisk 64 GB, app showed 59.5 GB
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: Windows version
+      description: From Settings, System, About.
+      placeholder: Windows 11 23H2
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: The Card Studio line under the title on the start screen.
+      placeholder: Card Studio 0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: checklist-test
+    attributes:
+      label: Checklist test
+      description: Which test you were on when this happened.
+      options:
+        - Backup, restore, and boot
+        - Fake card, quick test
+        - Fake card, full test
+        - Same card recognized after reinsert
+        - Different card refused
+        - Flash cancelled before Windows approval
+        - Finished flash reports OVERWRITTEN
+        - Stock-card fingerprint
+        - Save support file
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and the exact words on screen. Leave game names out.
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        Choose **Save support file** in the app, then drag `cfw-card-studio-support.zip` onto this issue after you submit. The form cannot take the zip in this box.
+  - type: dropdown
+    id: support-file
+    attributes:
+      label: Support file
+      description: Say whether you saved the zip and will attach it after submitting.
+      options:
+        - I saved the zip and will attach it after submitting
+        - The zip did not save
+        - I did not run this step
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else that would help reproduce this. Disk number, reader model, and whether you had already closed the app are useful.
+    validations:
+      required: false

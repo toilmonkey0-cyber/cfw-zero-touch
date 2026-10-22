@@ -1,0 +1,172 @@
+name: Beta hardware report
+description: Report a real-card pass or fail from the beta tester checklist.
+title: "[Beta hardware]: "
+labels: ["beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form after the [tester checklist](https://github.com/toilmonkey0-cyber/cfw-zero-touch/blob/main/docs/beta/TESTER_CHECKLIST.md). One report per handheld and card pair is enough.
+
+        Leave game files out. Leave the backup `.img.gz` out. After you submit, drag `cfw-card-studio-support.zip` onto the issue.
+
+        For a broken card, lost files, or the wrong disk, also open a beta bug and set the severity to critical.
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: The model printed on the handheld.
+      placeholder: R36S
+    validations:
+      required: true
+  - type: input
+    id: board-rev
+    attributes:
+      label: Board revision
+      description: The board name if you already know it, such as G80CA-MB V1.3. Write unknown if you have not seen it.
+      placeholder: G80CA-MB V1.3
+    validations:
+      required: true
+  - type: textarea
+    id: card-details
+    attributes:
+      label: Card details
+      description: Brand and printed size for the stock card and the spare card. Add the size the app showed, and say which card was in the reader for each test.
+      placeholder: |
+        Stock: Samsung 64 GB, app showed 59.5 GB
+        Spare: SanDisk 64 GB, app showed 59.5 GB
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: Windows version
+      description: From Settings, System, About.
+      placeholder: Windows 11 23H2
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: The Card Studio line under the title on the start screen.
+      placeholder: Card Studio 0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: result-backup-restore-boot
+    attributes:
+      label: Backup, restore, and boot
+      description: Checklist section 1. Backup the stock card, restore onto the spare card, then boot to the game menu.
+      options:
+        - Pass
+        - Fail
+        - Did not run
+    validations:
+      required: true
+  - type: dropdown
+    id: result-fake-quick
+    attributes:
+      label: Fake card, quick test
+      description: Checklist section 2, Test a card. The sentence should say the card is fake and name both sizes.
+      options:
+        - Pass
+        - Fail
+        - Did not run
+    validations:
+      required: true
+  - type: dropdown
+    id: result-fake-full
+    attributes:
+      label: Fake card, full test
+      description: Checklist section 2, Full card test. This erases the fake card. Did not run is fine when you skipped it.
+      options:
+        - Pass
+        - Fail
+        - Did not run
+    validations:
+      required: true
+  - type: dropdown
+    id: result-same-card
+    attributes:
+      label: Same card recognized after reinsert
+      description: Checklist section 3. After boot, This card is back should say the disk number, serial, size, and partition table match.
+      options:
+        - Pass
+        - Fail
+        - Did not run
+    validations:
+      required: true
+  - type: dropdown
+    id: result-other-card
+    attributes:
+      label: Different card refused
+      description: Checklist section 3. A card that is not the spare should be refused, and copy should stay off.
+      options:
+        - Pass
+        - Fail
+        - Did not run
+    validations:
+      required: true
+  - type: dropdown
+    id: result-flash-cancel
+    attributes:
+      label: Flash cancelled before Windows approval
+      description: Checklist section 3, first pass. Declining the Windows prompt should keep the uppercase word OVERWRITTEN off the screen.
+      options:
+        - Pass
+        - Fail
+        - Did not run
+    validations:
+      required: true
+  - type: dropdown
+    id: result-flash-finished
+    attributes:
+      label: Finished flash reports OVERWRITTEN
+      description: Checklist section 3, second pass. A finished Flash OS of the spare card should include the uppercase word OVERWRITTEN.
+      options:
+        - Pass
+        - Fail
+        - Did not run
+    validations:
+      required: true
+  - type: textarea
+    id: fingerprint
+    attributes:
+      label: Stock-card fingerprint
+      description: Paste the PowerShell table from checklist section 4. Each row is a .dtb file name and its SHA-256 hash, from the BOOT drive. Write "not submitted" and the reason if BOOT never appeared.
+      placeholder: |
+        rk3326-evb-lp3-v12-linux.dtb
+        8c4b6b738bfd5af9638db9c6e9a3ac49884ca4b773c4053a31d1a934b69246b0
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        The form itself cannot take the zip. Choose **Save support file** in the app, save `cfw-card-studio-support.zip`, submit this issue, then drag the zip onto the issue. The zip leaves out game names, your folders, the license key, and email addresses.
+  - type: dropdown
+    id: support-file
+    attributes:
+      label: Support file
+      description: Say whether you saved the zip and will attach it after submitting.
+      options:
+        - I saved the zip and will attach it after submitting
+        - The zip did not save
+        - I did not run this step
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Exact words from any failed test, the SHA-256 the backup screen showed, and anything else a person should know. Leave game names out.
+      placeholder: Quick test said "This card is fake..."
+    validations:
+      required: false
+  - type: checkboxes
+    id: attachments-ack
+    attributes:
+      label: Before you submit
+      options:
+        - label: I left game files and the backup image off this report.
+          required: true
